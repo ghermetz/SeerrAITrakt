@@ -1,0 +1,21 @@
+#!/bin/bash
+# Re-tire SeerrAI (fork github.com/corruptmods/SeerrAI), vérifie que les fichiers
+# patchés n'ont pas changé en amont, reconstruit l'image patchée Trakt, puis la
+# publie sur le registre local (192.168.1.35:5555) pour que Komodo puisse la
+# sonder et la déployer automatiquement (stack "seerr", auto-update).
+#
+# Sources & doc : https://github.com/ghermetz/SeerIAtrakt
+set -e
+cd "$(dirname "$0")"
+podman pull ghcr.io/corruptmods/seerr-ai:latest
+for f in context features; do
+  podman run --rm --entrypoint cat ghcr.io/corruptmods/seerr-ai:latest /app/dist/lib/ai/$f.js > /tmp/$f.upstream.js
+  if ! cmp -s /tmp/$f.upstream.js $f.orig.js; then
+    echo "ATTENTION : $f.js a changé en amont, le patch doit être réadapté (diff /tmp/$f.upstream.js $f.orig.js)."; exit 1
+  fi
+done
+podman build -t localhost/seerr-ai-trakt:latest -f Containerfile .
+# Publication sur le registre local -> Komodo (auto-update) peut suivre le digest
+podman tag localhost/seerr-ai-trakt:latest 192.168.1.35:5555/seerr-ai-trakt:latest
+podman push 192.168.1.35:5555/seerr-ai-trakt:latest
+cd /home/ghermetz/podman/seerr && DOCKER_HOST=unix:///run/podman/podman.sock /usr/local/bin/docker-compose -p seerr up -d

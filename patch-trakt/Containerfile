@@ -1,0 +1,7 @@
+# SeerrAI + Trakt pour l'IA (patch local) :
+#  - context.js  : historique Trakt dans les goûts + ensemble "déjà vu" (Trakt complet + Jellyfin)
+#  - features.js : 20 titres d'historique au modèle, filtre "déjà vu" (recherche IA, Pick for the Room)
+# Rebuild après chaque MAJ de SeerrAI : sudo ~/seerr-trakt-patch/rebuild.sh
+FROM ghcr.io/corruptmods/seerr-ai:latest
+COPY --chown=node:node context.js /app/dist/lib/ai/context.js
+COPY --chown=node:node features.js /app/dist/lib/ai/features.js
