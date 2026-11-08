@@ -8,8 +8,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 /*
- * Collections the library has part of, as the health page lists them, with
- * TMDB stubbed.
+ * Partly owned collections, as the health page lists them, with TMDB stubbed.
  */
 
 setupTestDb();
@@ -18,8 +17,8 @@ const DAY = 24 * 60 * 60 * 1000;
 const released = (days: number) =>
   new Date(Date.now() - days * DAY).toISOString().slice(0, 10);
 const collectionOf: Record<number, { id: number; name: string } | undefined> = {
-  1: { id: 10, name: 'Insidious Collection' },
-  2: { id: 10, name: 'Insidious Collection' },
+  1: { id: 10, name: 'Vesperline Collection' },
+  2: { id: 10, name: 'Vesperline Collection' },
   5: { id: 20, name: 'Complete Collection' },
   7: undefined,
 };
@@ -28,7 +27,7 @@ const collections: Record<
   { name: string; parts: { id: number; release_date: string }[] }
 > = {
   10: {
-    name: 'Insidious Collection',
+    name: 'Vesperline Collection',
     parts: [
       { id: 1, release_date: released(3000) },
       { id: 2, release_date: released(2000) },
@@ -95,7 +94,7 @@ describe('collection gaps', () => {
       check!.items.map((item) => [item.title, item.detail, item.href]),
       [
         [
-          'Insidious Collection',
+          'Vesperline Collection',
           '2 of 3 in your library · 1 missing',
           '/collection/10',
         ],

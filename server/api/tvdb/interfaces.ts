@@ -148,12 +148,6 @@ export interface TvdbSeasonDetails {
   firstAired: string;
 }
 
-export interface TvdbEpisodeTranslation {
-  name: string;
-  overview: string;
-  language: string;
-}
-
 const TMDB_TO_TVDB_MAPPING: Record<string, string> & {
   [key in AvailableLocale]: string;
 } = {
@@ -215,9 +209,6 @@ export function convertTmdbLanguageToTvdbWithFallback(
   tmdbCode: string,
   fallback: string
 ): string {
-  // First try exact match
   const tvdbCode = convertTMDBToTVDB(tmdbCode);
-  if (tvdbCode) return tvdbCode;
-
-  return tvdbCode || fallback || 'eng'; // Default to English if no match found
+  return tvdbCode || fallback || 'eng';
 }

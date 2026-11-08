@@ -3,6 +3,7 @@ import RadarrAPI from '@server/api/servarr/radarr';
 import { MediaStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { radarrFileQuality } from '@server/lib/mediaQuality';
 import type {
   RunnableScanner,
   StatusBase,
@@ -110,10 +111,9 @@ class RadarrScanner
         }
       }
 
-      // Only run cleanup if all servers of this profile type have sync enabled.
-      // If any server is skipped, we can't distinguish truly orphaned media from
-      // media that exists on an unscanned server (e.g. separate instances for
-      // anime, regional content, or different languages).
+      // Clean up only if every server of this type syncs; otherwise orphaned
+      // media can't be told from media on an unscanned server (e.g. separate
+      // instances for anime, regional content or languages).
       const allStandardScanned = this.servers
         .filter((s) => !this.enable4kMovie || !s.is4k)
         .every((s) => s.syncEnabled);
@@ -179,6 +179,10 @@ class RadarrScanner
         title: radarrMovie.title,
         processing,
         hasFile: radarrMovie.hasFile,
+        // No file: nothing to show from Radarr.
+        quality: radarrMovie.hasFile
+          ? radarrFileQuality(radarrMovie.movieFile)
+          : null,
       });
     } catch (e) {
       this.log('Failed to process Radarr media', 'error', {

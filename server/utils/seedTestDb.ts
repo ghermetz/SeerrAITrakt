@@ -1,19 +1,28 @@
+import {
+  MediaRequestStatus,
+  MediaStatus,
+  MediaType,
+} from '@server/constants/media';
 import { UserType } from '@server/constants/user';
 import dataSource, { getRepository } from '@server/datasource';
+import AlbumRequest from '@server/entity/AlbumRequest';
+import Media from '@server/entity/Media';
+import { MediaRequest } from '@server/entity/MediaRequest';
+import MusicAlbum from '@server/entity/MusicAlbum';
 import { User } from '@server/entity/User';
+import { rollBackOnRelease } from '@server/utils/nestedTransaction';
 import gravatarUrl from 'gravatar-url';
 
 export interface SeedDbOptions {
-  /** If true, preserves existing data instead of dropping the database */
+  /** Keep existing data instead of dropping the database. */
   preserveDb?: boolean;
-  /** If true, runs migrations instead of synchronizing schema */
+  /** Run migrations instead of synchronizing the schema. */
   withMigrations?: boolean;
-  /** If true, permits seeding while NODE_ENV is not test */
+  /** Allow seeding when NODE_ENV is not test. */
   allowOutsideTest?: boolean;
 }
 
-// Precomputed bcrypt hash of 'test1234'. We precompute this to avoid
-// having to hash the password every time we seed the database.
+// Precomputed bcrypt hash of 'test1234', so seeding doesn't hash every time.
 const TEST_USER_PASSWORD_HASH =
   '$2b$12$Z5V2P5HZgmx4/AnWFMZN1.aD5AM1NucNi.mhNTSQ9oVtmdzu7Le/a';
 
@@ -27,10 +36,7 @@ function assertTestDatabase(operation: string, allowOutsideTest = false): void {
   );
 }
 
-/**
- * Seeds test users into the database.
- * Assumes the database schema is already set up.
- */
+/** Seeds test users. Assumes the schema exists. */
 async function seedTestUsers(): Promise<void> {
   const userRepository = getRepository(User);
 
@@ -76,8 +82,8 @@ async function seedTestUsers(): Promise<void> {
 }
 
 /**
- * Initializes the database connection and seeds test users.
- * Used by both Cypress tests and Vitest unit tests.
+ * Initializes the database connection and seeds test users, for Cypress and
+ * unit tests.
  */
 export async function seedTestDb(options: SeedDbOptions = {}): Promise<void> {
   assertTestDatabase('seed the test database', options.allowOutsideTest);
@@ -85,6 +91,7 @@ export async function seedTestDb(options: SeedDbOptions = {}): Promise<void> {
   const dbConnection = dataSource.isInitialized
     ? dataSource
     : await dataSource.initialize();
+  rollBackOnRelease(dbConnection);
 
   if (!options.preserveDb) {
     await dbConnection.dropDatabase();
@@ -100,13 +107,184 @@ export async function seedTestDb(options: SeedDbOptions = {}): Promise<void> {
 }
 
 /**
- * Resets the database to a clean state with seeded test users.
- * Used between tests to ensure isolation.
- * Assumes DB has been initialized.
+ * Resets the database to seeded test users between tests. Assumes it's
+ * initialized.
  */
 export async function resetTestDb(): Promise<void> {
   assertTestDatabase('reset the test database');
 
   await dataSource.synchronize(true);
   await seedTestUsers();
+}
+
+/** MusicBrainz ids used by the music fixtures. */
+export const MUSIC_FIXTURE_IDS = {
+  /** An artist with albums in the library and a request in each status. */
+  artist: '3c9e5f21-8d47-4b6a-a1e3-5f7d2c90b844',
+  album: '7e41c0d8-5b29-3f6c-b8a4-91d6e2f07a35',
+  otherAlbum: '4f6a2d93-c1e8-3a57-9b02-6d3e8f1c7a40',
+  /** An artist whose albums Lidarr is still fetching. */
+  processingArtist: 'd2b7c4e9-6a13-4f58-8e06-c39f71a5b204',
+  processingAlbum: '1d84b6f2-9e07-3c5a-a4d8-e3f2b7091c6d',
+} as const;
+
+export interface MusicFixtures {
+  artist: Media;
+  processingArtist: Media;
+  albums: MusicAlbum[];
+  /** One music request in each status, by status. */
+  requests: Record<MediaRequestStatus, MediaRequest>;
+}
+
+/**
+ * Seeds music: two artists (music Media, tmdbId 0) with ids on every server and
+ * in Lidarr, their albums, and an album request in each status, all old enough
+ * to count as old. Saved without subscribers, like pre-existing data.
+ */
+export async function seedMusicFixtures(): Promise<MusicFixtures> {
+  assertTestDatabase('seed music fixtures');
+
+  const manager = dataSource.manager;
+  const longAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const ids = MUSIC_FIXTURE_IDS;
+
+  const [artist, processingArtist] = await manager.save(
+    [
+      new Media({
+        mediaType: MediaType.MUSIC,
+        tmdbId: 0,
+        foreignId: ids.artist,
+        status: MediaStatus.PARTIALLY_AVAILABLE,
+        serviceId: 0,
+        externalServiceId: 7,
+        externalServiceSlug: ids.artist,
+        ratingKey: '9001',
+        jellyfinMediaId: 'jellyfin-artist',
+        embyMediaId: 'emby-artist',
+        mediaAddedAt: longAgo,
+      }),
+      new Media({
+        mediaType: MediaType.MUSIC,
+        tmdbId: 0,
+        foreignId: ids.processingArtist,
+        status: MediaStatus.PROCESSING,
+        serviceId: 0,
+        externalServiceId: 8,
+        externalServiceSlug: ids.processingArtist,
+      }),
+    ],
+    { listeners: false }
+  );
+
+  const albums = await manager.save(
+    [
+      new MusicAlbum({
+        mediaId: artist.id,
+        mbId: ids.album,
+        title: 'Sing to the Ferryman',
+        primaryType: 'Album',
+        secondaryTypes: [],
+        releaseDate: '2003-06-09',
+        status: MediaStatus.AVAILABLE,
+        lidarrAlbumId: 70,
+        trackCount: 14,
+        trackFileCount: 14,
+        ratingKey: '9002',
+        jellyfinItemId: 'jellyfin-album',
+        embyItemId: 'emby-album',
+        folder: 'Sing to the Ferryman (2003)',
+        mediaAddedAt: longAgo,
+      }),
+      new MusicAlbum({
+        mediaId: artist.id,
+        mbId: ids.otherAlbum,
+        title: 'Static Garden',
+        primaryType: 'Album',
+        secondaryTypes: [],
+        releaseDate: '1997-05-21',
+        status: MediaStatus.PROCESSING,
+        lidarrAlbumId: 71,
+        trackCount: 12,
+        trackFileCount: 3,
+      }),
+      new MusicAlbum({
+        mediaId: artist.id,
+        mbId: null,
+        title: 'A Bootleg Nobody Matched',
+        secondaryTypes: ['Live'],
+        status: MediaStatus.AVAILABLE,
+        ratingKey: '9003',
+      }),
+      new MusicAlbum({
+        mediaId: processingArtist.id,
+        mbId: ids.processingAlbum,
+        title: 'In Lanterns',
+        primaryType: 'Album',
+        secondaryTypes: [],
+        releaseDate: '2007-10-10',
+        status: MediaStatus.PROCESSING,
+        lidarrAlbumId: 80,
+      }),
+    ],
+    { listeners: false }
+  );
+
+  const requester = await getRepository(User).findOneByOrFail({ id: 2 });
+  const statuses = [
+    MediaRequestStatus.PENDING,
+    MediaRequestStatus.APPROVED,
+    MediaRequestStatus.DECLINED,
+    MediaRequestStatus.FAILED,
+    MediaRequestStatus.COMPLETED,
+  ];
+  const requests = {} as Record<MediaRequestStatus, MediaRequest>;
+  for (const status of statuses) {
+    const request = await manager.save(
+      new MediaRequest({
+        type: MediaType.MUSIC,
+        status,
+        media: artist,
+        requestedBy: requester,
+        is4k: false,
+        serverId: 0,
+        profileId: 1,
+        metadataProfileId: 1,
+        rootFolder: '/music',
+        albums: [
+          new AlbumRequest({
+            albumMbid: ids.otherAlbum,
+            title: 'Static Garden',
+            status,
+          }),
+        ],
+      }),
+      { listeners: false }
+    );
+    requests[status] = request;
+  }
+
+  // Old enough for every "waiting too long" check.
+  await manager
+    .createQueryBuilder()
+    .update(MediaRequest)
+    .set({ createdAt: longAgo, updatedAt: longAgo })
+    .where({ type: MediaType.MUSIC })
+    .callListeners(false)
+    .execute();
+  await manager
+    .createQueryBuilder()
+    .update(Media)
+    .set({ updatedAt: longAgo })
+    .where({ mediaType: MediaType.MUSIC })
+    .callListeners(false)
+    .execute();
+
+  return {
+    artist: await manager.findOneByOrFail(Media, { id: artist.id }),
+    processingArtist: await manager.findOneByOrFail(Media, {
+      id: processingArtist.id,
+    }),
+    albums,
+    requests,
+  };
 }

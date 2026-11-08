@@ -10,8 +10,8 @@ import path from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
 /*
- * What each poster on a page can be filtered by, from stubbed TMDB details,
- * behind the real API validator.
+ * Filterable text for each poster on a page, from stubbed TMDB details, behind
+ * the real API validator.
  */
 
 setupTestDb();
@@ -30,7 +30,7 @@ stub('getMovie', async ({ movieId }: { movieId: number }) => {
   if (movieId === 404) {
     throw new Error('not found');
   }
-  // TMDB taking longer than the server waits before answering.
+  // TMDB slower than the server waits before answering.
   if (movieId === 777) {
     await new Promise((resolve) => setTimeout(resolve, 6500));
   }
@@ -40,17 +40,17 @@ stub('getMovie', async ({ movieId }: { movieId: number }) => {
     original_title: 'Le Film',
     credits: {
       cast: [
-        { name: 'Harrison Ford', character: 'Han Solo' },
-        { name: 'Harrison Ford', character: 'Indiana Jones' },
+        { name: 'Garrick Holt', character: 'Tam Vexley' },
+        { name: 'Garrick Holt', character: 'Dakota Reyes' },
       ],
       crew: [
-        { name: 'George Lucas', job: 'Director' },
-        { name: 'Gary Kurtz', job: 'Producer' },
+        { name: 'Morris Thane', job: 'Director' },
+        { name: 'Lyle Brannock', job: 'Producer' },
       ],
     },
     genres: [{ id: 1, name: 'Science Fiction' }],
     keywords: { keywords: [{ id: 1, name: 'space opera' }] },
-    production_companies: [{ id: 1, name: 'Lucasfilm Ltd.' }],
+    production_companies: [{ id: 1, name: 'Thanefilm Ltd.' }],
   };
 });
 stub('getTvShow', async ({ tvId }: { tvId: number }) => {
@@ -60,10 +60,12 @@ stub('getTvShow', async ({ tvId }: { tvId: number }) => {
     name: `Show ${tvId}`,
     original_name: `Show ${tvId}`,
     aggregate_credits: {
-      cast: [{ name: 'Alan Ritchson', roles: [{ character: 'Jack Reacher' }] }],
+      cast: [
+        { name: 'Brock Tallard', roles: [{ character: 'Nils Halvorsen' }] },
+      ],
     },
     credits: { crew: [] },
-    created_by: [{ name: 'Nick Santora' }],
+    created_by: [{ name: 'Dean Ferrow' }],
     genres: [{ id: 2, name: 'Crime' }],
     keywords: { results: [] },
     production_companies: [{ id: 2, name: 'Amazon MGM Studios' }],
@@ -125,22 +127,22 @@ describe('GET /discover/search-text', () => {
     for (const word of [
       'film',
       'le',
-      'harrison',
-      'ford',
-      'han',
-      'solo',
-      'indiana',
-      'lucas',
+      'garrick',
+      'holt',
+      'tam',
+      'vexley',
+      'dakota',
+      'thane',
       'science',
       'space',
       'opera',
-      'lucasfilm',
+      'thanefilm',
     ]) {
       assert.ok(words.includes(` ${word} `), `has "${word}"`);
     }
-    assert.ok(!words.includes(' kurtz '), 'not a producer');
+    assert.ok(!words.includes(' brannock '), 'not a producer');
     assert.equal(
-      words.split(' harrison ').length,
+      words.split(' garrick ').length,
       2,
       'each word once, however many roles'
     );
@@ -149,8 +151,8 @@ describe('GET /discover/search-text', () => {
   it('covers series: cast by role, and who created it', async () => {
     const { text } = await get('tv:22');
 
-    assert.match(text['tv:22'], /\bjack reacher\b/);
-    assert.match(text['tv:22'], /\bsantora\b/);
+    assert.match(text['tv:22'], /\bnils halvorsen\b/);
+    assert.match(text['tv:22'], /\bferrow\b/);
     assert.match(text['tv:22'], /\bcrime\b/);
     assert.match(text['tv:22'], /\bamazon mgm studios\b/);
     assert.match(text['tv:22'], /\bprime video\b/);
@@ -171,8 +173,8 @@ describe('GET /discover/search-text', () => {
   });
 
   it('refuses an address with unescaped ":" and ",", so the page escapes them', async () => {
-    // Seerr's API validator rejects reserved characters in a query. The page
-    // once let axios send them as they were, and every request failed.
+    // Seerr's API validator rejects reserved characters in a query, so the
+    // client must encode them or every request fails.
     const res = await fetch(
       `http://127.0.0.1:${port}/api/v1/discover/search-text?ids=movie:11,tv:22`
     );
@@ -197,7 +199,7 @@ describe('GET /discover/search-text, when TMDB is slow', () => {
     assert.deepEqual(Object.keys(first.text), ['movie:776']);
     assert.deepEqual(first.pending, ['movie:777']);
 
-    // The lookup carried on in the background: asked again, it is there.
+    // The lookup continued in the background: asked again, it's there.
     await new Promise((resolve) => setTimeout(resolve, 2000));
     const second = await get('movie:777');
 

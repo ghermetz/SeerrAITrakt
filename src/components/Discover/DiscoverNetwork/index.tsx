@@ -53,7 +53,8 @@ const DiscoverTvNetwork = () => {
                 type="tmdb"
                 src={`https://image.tmdb.org/t/p/w780_filter(duotone,ffffff,bababa)${firstResultData.network.logoPath}`}
                 alt={firstResultData.network.name}
-                className="object-contain"
+                // Logos are white; invert in light mode.
+                className="object-contain light:invert"
                 fill
               />
             </div>

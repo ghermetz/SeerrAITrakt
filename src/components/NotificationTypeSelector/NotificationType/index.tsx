@@ -6,6 +6,8 @@ interface NotificationTypeProps {
   currentTypes: number;
   parent?: NotificationItem;
   onUpdate: (newTypes: number) => void;
+  /** Note under a type the admin disabled for everyone. */
+  turnedOffNote?: string;
 }
 
 const NotificationType = ({
@@ -13,14 +15,16 @@ const NotificationType = ({
   currentTypes,
   onUpdate,
   parent,
+  turnedOffNote,
 }: NotificationTypeProps) => {
+  const parentOn =
+    !!parent?.value && hasNotificationType(parent.value, currentTypes);
+  const off = !!option.turnedOff;
   return (
     <>
       <div
         className={`relative mt-4 flex items-start first:mt-0 ${
-          !!parent?.value && hasNotificationType(parent.value, currentTypes)
-            ? 'opacity-50'
-            : ''
+          parentOn || off ? 'opacity-50' : ''
         }`}
       >
         <div className="flex h-6 items-center">
@@ -28,9 +32,7 @@ const NotificationType = ({
             id={option.id}
             name="permissions"
             type="checkbox"
-            disabled={
-              !!parent?.value && hasNotificationType(parent.value, currentTypes)
-            }
+            disabled={parentOn || off}
             onClick={() => {
               onUpdate(
                 hasNotificationType(option.value, currentTypes)
@@ -39,19 +41,23 @@ const NotificationType = ({
               );
             }}
             checked={
-              hasNotificationType(option.value, currentTypes) ||
-              (!!parent?.value &&
-                hasNotificationType(parent.value, currentTypes))
+              !off &&
+              (hasNotificationType(option.value, currentTypes) || parentOn)
             }
           />
         </div>
         <div className="ml-3 text-sm leading-6">
           <label htmlFor={option.id} className="block" aria-label={option.name}>
             <div className="flex flex-col">
-              <span className="font-medium text-white">{option.name}</span>
+              <span className="font-medium text-strong">{option.name}</span>
               <span className="font-normal text-gray-400">
                 {option.description}
               </span>
+              {off && turnedOffNote && (
+                <span className="font-normal italic text-gray-400">
+                  {turnedOffNote}
+                </span>
+              )}
             </div>
           </label>
         </div>
@@ -63,6 +69,7 @@ const NotificationType = ({
             currentTypes={currentTypes}
             onUpdate={(newTypes) => onUpdate(newTypes)}
             parent={option}
+            turnedOffNote={turnedOffNote}
           />
         </div>
       ))}

@@ -1,16 +1,16 @@
 import RadarrLogo from '@app/assets/services/radarr.svg';
 import SonarrLogo from '@app/assets/services/sonarr.svg';
 import Badge from '@app/components/Common/Badge';
+import CardFooter from '@app/components/Settings/CardFooter';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import { PencilIcon, TrashIcon } from '@heroicons/react/24/solid';
 import { useIntl } from 'react-intl';
 
 /*
- * The tile for one configured service on the Services settings page: Radarr,
- * Sonarr, Maintainerr. Its own module so any section can use it without
- * importing the page. Message ids are unchanged from when it lived in
- * SettingsServices, so existing translations still apply.
+ * The tile for one configured service on the Services page (Radarr, Sonarr,
+ * Maintainerr). Its own module so any section can use it without importing
+ * the page. Message ids match SettingsServices', so translations still apply.
  */
 const messages = defineMessages('components.Settings', {
   ssl: 'SSL',
@@ -35,6 +35,8 @@ interface ServerInstanceProps {
   logo?: React.ReactNode;
   /** Another service's detail line, in place of the active profile. */
   detail?: { label: string; value: string };
+  /** The address line, for a service without its own host and port. */
+  address?: string;
   onEdit: () => void;
   onDelete: () => void;
 }
@@ -51,6 +53,7 @@ const ServerInstance = ({
   isSSL = false,
   isSonarr = false,
   externalUrl,
+  address,
   onEdit,
   onDelete,
 }: ServerInstanceProps) => {
@@ -63,14 +66,14 @@ const ServerInstance = ({
   return (
     <li className="col-span-1 rounded-lg bg-gray-800 shadow ring-1 ring-gray-500">
       <div className="flex w-full items-center justify-between space-x-6 p-6">
-        <div className="flex-1 truncate">
-          <div className="mb-2 flex items-center space-x-2">
-            <h3 className="truncate font-medium leading-5 text-white">
+        <div className="min-w-0 flex-1">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <h3 className="min-w-0 break-words font-medium leading-5 text-strong">
               <a
                 href={serviceUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="transition duration-300 hover:text-white hover:underline"
+                className="transition duration-300 hover:text-strong hover:underline"
               >
                 {name}
               </a>
@@ -92,20 +95,20 @@ const ServerInstance = ({
               </Badge>
             )}
           </div>
-          <p className="mt-1 truncate text-sm leading-5 text-gray-300">
+          <p className="mt-1 break-words text-sm leading-5 text-gray-300">
             <span className="mr-2 font-bold">
               {intl.formatMessage(messages.address)}
             </span>
             <a
-              href={internalUrl}
+              href={address ? serviceUrl : internalUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="transition duration-300 hover:text-white hover:underline"
+              className="transition duration-300 hover:text-strong hover:underline"
             >
-              {internalUrl}
+              {address ?? internalUrl}
             </a>
           </p>
-          <p className="mt-1 truncate text-sm leading-5 text-gray-300">
+          <p className="mt-1 break-words text-sm leading-5 text-gray-300">
             <span className="mr-2 font-bold">
               {detail?.label ?? intl.formatMessage(messages.activeProfile)}
             </span>
@@ -120,34 +123,27 @@ const ServerInstance = ({
         >
           {logo ??
             (isSonarr ? (
-              <SonarrLogo className="h-10 w-10 flex-shrink-0" />
+              <SonarrLogo className="service-logo h-10 w-10 flex-shrink-0" />
             ) : (
-              <RadarrLogo className="h-10 w-10 flex-shrink-0" />
+              <RadarrLogo className="service-logo h-10 w-10 flex-shrink-0" />
             ))}
         </a>
       </div>
-      <div className="border-t border-gray-500">
-        <div className="-mt-px flex">
-          <div className="flex w-0 flex-1 border-r border-gray-500">
-            <button
-              onClick={() => onEdit()}
-              className="focus:ring-blue relative -mr-px inline-flex w-0 flex-1 items-center justify-center rounded-bl-lg border border-transparent py-4 text-sm font-medium leading-5 text-gray-200 transition duration-150 ease-in-out hover:text-white focus:z-10 focus:border-gray-500 focus:outline-none"
-            >
-              <PencilIcon className="mr-2 h-5 w-5" />
-              <span>{intl.formatMessage(globalMessages.edit)}</span>
-            </button>
-          </div>
-          <div className="-ml-px flex w-0 flex-1">
-            <button
-              onClick={() => onDelete()}
-              className="focus:ring-blue relative inline-flex w-0 flex-1 items-center justify-center rounded-br-lg border border-transparent py-4 text-sm font-medium leading-5 text-gray-200 transition duration-150 ease-in-out hover:text-white focus:z-10 focus:border-gray-500 focus:outline-none"
-            >
-              <TrashIcon className="mr-2 h-5 w-5" />
-              <span>{intl.formatMessage(globalMessages.delete)}</span>
-            </button>
-          </div>
-        </div>
-      </div>
+      <CardFooter
+        room={2}
+        actions={[
+          {
+            label: intl.formatMessage(globalMessages.edit),
+            icon: PencilIcon,
+            onClick: () => onEdit(),
+          },
+          {
+            label: intl.formatMessage(globalMessages.delete),
+            icon: TrashIcon,
+            onClick: () => onDelete(),
+          },
+        ]}
+      />
     </li>
   );
 };

@@ -13,6 +13,7 @@ import {
   setPushOptIn,
   subscribeToPushNotifications,
 } from '@app/utils/pushSubscriptionHelpers';
+import axios from 'axios';
 import type React from 'react';
 import {
   createContext,
@@ -41,14 +42,14 @@ interface PushSubscriptionRecord {
 interface UsePushDeviceState {
   state: PushDeviceState;
   subscribe: () => Promise<boolean>;
+  /** Stops this device's notifications for the signed-in user. */
+  unsubscribe: () => Promise<boolean>;
   revalidate: () => void;
 }
 
 /**
- * Computes the device's push state. Used once, by PushDeviceProvider; every
- * consumer reads the shared result through usePushDeviceState so the
- * service-worker subscription lookup happens once per page, not once per
- * component that happens to need it.
+ * Computes the device's push state. Used only by PushDeviceProvider; others
+ * read it via usePushDeviceState, so the subscription lookup runs once per page.
  */
 const usePushDeviceStateInternal = (): UsePushDeviceState => {
   const { user } = useUser();
@@ -103,7 +104,7 @@ const usePushDeviceStateInternal = (): UsePushDeviceState => {
       knownDevices.some((device) => device.endpoint === subscription.endpoint);
 
     if (isRegistered) {
-      // Registered, so at some point they said yes on this device.
+      // Registered, so they opted in on this device at some point.
       setPushOptIn(user.id, true);
       setState('registered');
       return;
@@ -111,21 +112,20 @@ const usePushDeviceStateInternal = (): UsePushDeviceState => {
 
     const optedIn = getPushOptIn(user.id) === true;
 
-    // This device is still subscribed, but not for the person now signed in:
-    // it belongs to whoever used it before. Let it go, so their
-    // notifications stop arriving here (the server drops a subscription once
-    // the push service reports it gone). Only when the list of this person's
-    // devices actually loaded, or a failed lookup would look the same.
+    // Subscribed, but for a previous user: unsubscribe so their notifications
+    // stop arriving here (the server drops it once the push service reports
+    // it gone). Only when the device list loaded, since a failed lookup looks
+    // the same.
     if (subscription && !optedIn && !devicesError) {
       try {
         await subscription.unsubscribe();
       } catch {
-        // Tried again on the next visit.
+        // Retried next visit.
       }
     }
 
-    // Subscribe without asking only someone who chose it on this device
-    // before: the browser's permission is the device's, not the person's.
+    // Auto-subscribe only users who opted in on this device: browser
+    // permission is per device, not per user.
     if (optedIn && getNotificationPermission() === 'granted') {
       try {
         const subscribed = await subscribeToPushNotifications(
@@ -191,7 +191,45 @@ const usePushDeviceStateInternal = (): UsePushDeviceState => {
     }
   }, [user?.id, currentSettings, mutate]);
 
-  return { state, subscribe, revalidate: mutate };
+  const unsubscribe = useCallback(async () => {
+    if (!user?.id) {
+      return false;
+    }
+
+    try {
+      const { subscription } = await getPushSubscription();
+      const endpoint = subscription?.endpoint;
+
+      // Only delete their own; another user's leftover subscription is
+      // dropped above, not removed from the server under this user's name.
+      if (
+        subscription &&
+        endpoint &&
+        (devices ?? []).some((device) => device.endpoint === endpoint)
+      ) {
+        await subscription.unsubscribe();
+        try {
+          await axios.delete(
+            `/api/v1/user/${user.id}/pushSubscription/${encodeURIComponent(
+              endpoint
+            )}`
+          );
+        } catch {
+          // The server drops it once the push service reports it gone.
+        }
+      }
+
+      // Stored, so the device doesn't auto-resubscribe.
+      setPushOptIn(user.id, false);
+      await mutate();
+      setState('prompt');
+      return true;
+    } catch {
+      return false;
+    }
+  }, [user?.id, devices, mutate]);
+
+  return { state, subscribe, unsubscribe, revalidate: mutate };
 };
 
 const PushDeviceContext = createContext<UsePushDeviceState | null>(null);

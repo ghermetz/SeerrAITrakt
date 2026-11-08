@@ -21,6 +21,7 @@ import PlayButton from '@app/components/Common/PlayButton';
 import StatusBadgeMini from '@app/components/Common/StatusBadgeMini';
 import Tag from '@app/components/Common/Tag';
 import Tooltip from '@app/components/Common/Tooltip';
+import TitleDeclineReason from '@app/components/DeclineReason/TitleDeclineReason';
 import { DeletingSoonBadge, KeepButton } from '@app/components/DeletingSoon';
 import ExternalLinkBlock from '@app/components/ExternalLinkBlock';
 import IssueModal from '@app/components/IssueModal';
@@ -28,10 +29,12 @@ import ManageSlideOver from '@app/components/ManageSlideOver';
 import MediaSlider from '@app/components/MediaSlider';
 import PersonCard from '@app/components/PersonCard';
 import PlexMatchWarning from '@app/components/PlexMatchWarning';
+import QualityBadges from '@app/components/QualityBadges';
 import RequestButton from '@app/components/RequestButton';
 import TitleEta from '@app/components/RequestEta/TitleEta';
 import RequestModal from '@app/components/RequestModal';
 import type { RequestPreselect } from '@app/components/RequestModal/TvRequestModal';
+import RequestedBy from '@app/components/RequestedBy';
 import Slider from '@app/components/Slider';
 import StatusBadge from '@app/components/StatusBadge';
 import { SeasonSubtitleBadge } from '@app/components/Subtitles/EpisodeSubtitles';
@@ -39,16 +42,19 @@ import SubtitlesCard from '@app/components/Subtitles/SubtitlesCard';
 import FutureSeasonsButton from '@app/components/TvDetails/FutureSeasonsButton';
 import Season from '@app/components/TvDetails/Season';
 import WatchedBy from '@app/components/WatchedBy';
-import useDeepLinks from '@app/hooks/useDeepLinks';
+import useIsAnime from '@app/hooks/useIsAnime';
 import useLocale from '@app/hooks/useLocale';
+import usePlayLinks from '@app/hooks/usePlayLinks';
 import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
-import { Permission, UserType, useUser } from '@app/hooks/useUser';
+import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import ErrorPage from '@app/pages/_error';
 import blocklistAction from '@app/utils/blocklistAction';
 import { sortCrewPriority } from '@app/utils/creditHelpers';
 import defineMessages from '@app/utils/defineMessages';
+import { titleBackdrop, titlePoster } from '@app/utils/imageSources';
+import { hasAccountOn } from '@app/utils/mediaServerAccounts';
 import {
   refreshIntervalHelper,
   watchMedia,
@@ -80,7 +86,6 @@ import {
 import { MediaServerType } from '@server/constants/server';
 import type { TvDetails as TvDetailsType } from '@server/models/Tv';
 import type { Crew } from '@server/models/common';
-import { isAnime } from '@server/utils/isAnime';
 import axios from 'axios';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
@@ -135,13 +140,14 @@ interface TvDetailsProps {
 
 const TvDetails = ({ tv }: TvDetailsProps) => {
   const settings = useSettings();
+  const isAnime = useIsAnime();
   const { user, hasPermission } = useUser();
   const router = useRouter();
   const intl = useIntl();
   const { locale } = useLocale();
   const [showRequestModal, setShowRequestModal] = useState(false);
   const [showManager, setShowManager] = useState(false);
-  // A season, or one episode of it, being requested from its own button.
+  // Season or episode being requested from its own button.
   const [requestFor, setRequestFor] = useState<RequestPreselect | null>(null);
   const { mutate: mutateCache } = useSWRConfig();
   const [showIssueModal, setShowIssueModal] = useState(false);
@@ -192,12 +198,11 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
     []
   );
 
-  const { mediaUrl: plexUrl, mediaUrl4k: plexUrl4k } = useDeepLinks({
-    mediaUrl: data?.mediaInfo?.mediaUrl,
-    mediaUrl4k: data?.mediaInfo?.mediaUrl4k,
-    iOSPlexUrl: data?.mediaInfo?.iOSPlexUrl,
-    iOSPlexUrl4k: data?.mediaInfo?.iOSPlexUrl4k,
-  });
+  const {
+    links: playLinks,
+    playLink,
+    playLink4k,
+  } = usePlayLinks(data?.mediaInfo);
 
   if (!data && !error) {
     return <MediaPageSkeleton />;
@@ -209,30 +214,41 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
 
   const mediaLinks: PlayButtonLink[] = [];
 
+  // One Play button per server with the series, the viewer's own first.
   if (
-    plexUrl &&
     hasPermission([Permission.REQUEST, Permission.REQUEST_TV], {
       type: 'or',
     })
   ) {
-    mediaLinks.push({
-      text: getAvailableMediaServerName(),
-      url: plexUrl,
-      svg: <PlayIcon />,
+    playLinks.forEach((link) => {
+      if (link.url) {
+        mediaLinks.push({
+          text: intl.formatMessage(messages.play, {
+            mediaServerName: link.name,
+          }),
+          url: link.url,
+          svg: <PlayIcon />,
+        });
+      }
     });
   }
 
   if (
     settings.currentSettings.series4kEnabled &&
-    plexUrl4k &&
     hasPermission([Permission.REQUEST_4K, Permission.REQUEST_4K_TV], {
       type: 'or',
     })
   ) {
-    mediaLinks.push({
-      text: getAvailable4kMediaServerName(),
-      url: plexUrl4k,
-      svg: <PlayIcon />,
+    playLinks.forEach((link) => {
+      if (link.url4k) {
+        mediaLinks.push({
+          text: intl.formatMessage(messages.play4k, {
+            mediaServerName: link.name,
+          }),
+          url: link.url4k,
+          svg: <PlayIcon />,
+        });
+      }
     });
   }
 
@@ -270,7 +286,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
     );
   }
 
-  // Does NOT include "Specials"
+  // Excludes Specials.
   const seasonCount = data.seasons.filter(
     (season) => season.seasonNumber !== 0 && season.episodeCount !== 0
   ).length;
@@ -333,7 +349,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
     return [...requestedSeasons, ...availableSeasons];
   };
 
-  // Mirrors the season list the request modal offers, so the two agree.
+  // Mirrors the request modal's season list so they agree.
   const requestableSeasons = data.seasons
     .filter(
       (season) =>
@@ -363,30 +379,6 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
     data?.watchProviders?.find(
       (provider) => provider.iso_3166_1 === streamingRegion
     )?.flatrate ?? [];
-
-  function getAvailableMediaServerName() {
-    if (settings.currentSettings.mediaServerType === MediaServerType.EMBY) {
-      return intl.formatMessage(messages.play, { mediaServerName: 'Emby' });
-    }
-
-    if (settings.currentSettings.mediaServerType === MediaServerType.PLEX) {
-      return intl.formatMessage(messages.play, { mediaServerName: 'Plex' });
-    }
-
-    return intl.formatMessage(messages.play, { mediaServerName: 'Jellyfin' });
-  }
-
-  function getAvailable4kMediaServerName() {
-    if (settings.currentSettings.mediaServerType === MediaServerType.EMBY) {
-      return intl.formatMessage(messages.play4k, { mediaServerName: 'Emby' });
-    }
-
-    if (settings.currentSettings.mediaServerType === MediaServerType.PLEX) {
-      return intl.formatMessage(messages.play4k, { mediaServerName: 'Plex' });
-    }
-
-    return intl.formatMessage(messages.play4k, { mediaServerName: 'Jellyfin' });
-  }
 
   const onClickWatchlistBtn = async (): Promise<void> => {
     setIsUpdating(true);
@@ -475,7 +467,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
           { appearance: 'success', autoDismiss: true }
         );
 
-        // Blocklisted, but a Radarr/Sonarr removal did not go through.
+        // Blocklisted, but a Radarr/Sonarr removal failed.
         const failed = res.data?.failed ?? [];
         if (failed.length) {
           addToast(
@@ -521,13 +513,11 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
   });
 
   /*
-   * Which seasons the per-season and per-episode Request buttons appear on.
-   * The same rule the server applies when creating a request: a season with
-   * any status (partly available, available, processing) or in any request
-   * that is not declined or completed is taken, and would be dropped from a
-   * new one. Offering a button there would look like it worked and do
-   * nothing. Never for a blocklisted title, and not at all while partial
-   * requests are off: a request is then for every season still wanted.
+   * Seasons that get per-season and per-episode Request buttons. Matches the
+   * server: a season with any status or in a request that isn't declined or
+   * completed is taken and would be dropped from a new request, so a button
+   * there would silently do nothing. None for blocklisted titles or while
+   * partial requests are off (a request then covers every wanted season).
    */
   const takenSeasons = new Set<number>([
     ...(data.mediaInfo?.requests ?? [])
@@ -565,18 +555,12 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
           <CachedImage
             type="tmdb"
             alt=""
-            src={`https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${data.backdropPath}`}
+            src={titleBackdrop(data.backdropPath)}
             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
             fill
             priority
           />
-          <div
-            className="absolute inset-0"
-            style={{
-              backgroundImage:
-                'linear-gradient(180deg, rgba(17, 24, 39, 0.47) 0%, rgba(17, 24, 39, 1) 100%)',
-            }}
-          />
+          <div className="media-page-fade" />
         </div>
       )}
       <PageTitle title={data.name} />
@@ -604,7 +588,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
           preselect={requestFor}
           onComplete={() => {
             revalidate();
-            // The episode list shows what is requested; refresh it too.
+            // The episode list shows request state; refresh it too.
             mutateCache(
               `/api/v1/tv/${data.id}/season/${requestFor.seasonNumber}`
             );
@@ -636,13 +620,13 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
         revalidate={() => revalidate()}
         show={showManager}
       />
-      <div className="media-header">
-        <div className="media-poster">
+      <div className="media-header" data-seerr="title-header">
+        <div className="media-poster" data-seerr="poster">
           <CachedImage
             type="tmdb"
             src={
               data.posterPath
-                ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${data.posterPath}`
+                ? titlePoster(data.posterPath)
                 : '/images/seerr_poster_not_found.png'
             }
             alt=""
@@ -656,6 +640,11 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
         <div className="media-title">
           <div className="media-status">
             <DeletingSoonBadge tmdbId={data.id} mediaType="tv" />
+            {data.mediaInfo?.outsideLibraries && (
+              <Badge badgeType="dark">
+                {intl.formatMessage(globalMessages.notInYourLibraries)}
+              </Badge>
+            )}
             <StatusBadge
               status={data.mediaInfo?.status}
               downloadItem={data.mediaInfo?.downloadStatus}
@@ -663,9 +652,10 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
               inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
               tmdbId={data.mediaInfo?.tmdbId}
               mediaType="tv"
-              plexUrl={plexUrl}
+              playLink={playLink}
               serviceUrl={data.mediaInfo?.serviceUrl}
             />
+            <QualityBadges quality={data.mediaInfo?.availableQuality} />
             {settings.currentSettings.series4kEnabled &&
               hasPermission(
                 [
@@ -677,19 +667,22 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                   type: 'or',
                 }
               ) && (
-                <StatusBadge
-                  status={data.mediaInfo?.status4k}
-                  downloadItem={data.mediaInfo?.downloadStatus4k}
-                  title={data.name}
-                  is4k
-                  inProgress={
-                    (data.mediaInfo?.downloadStatus4k ?? []).length > 0
-                  }
-                  tmdbId={data.mediaInfo?.tmdbId}
-                  mediaType="tv"
-                  plexUrl={plexUrl4k}
-                  serviceUrl={data.mediaInfo?.serviceUrl4k}
-                />
+                <>
+                  <StatusBadge
+                    status={data.mediaInfo?.status4k}
+                    downloadItem={data.mediaInfo?.downloadStatus4k}
+                    title={data.name}
+                    is4k
+                    inProgress={
+                      (data.mediaInfo?.downloadStatus4k ?? []).length > 0
+                    }
+                    tmdbId={data.mediaInfo?.tmdbId}
+                    mediaType="tv"
+                    playLink={playLink4k}
+                    serviceUrl={data.mediaInfo?.serviceUrl4k}
+                  />
+                  <QualityBadges quality={data.mediaInfo?.availableQuality4k} />
+                </>
               )}
           </div>
           <h1 data-testid="media-title">
@@ -716,6 +709,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
             requests={data.mediaInfo?.requests}
             media={data.mediaInfo}
           />
+          <TitleDeclineReason requests={data.mediaInfo?.requests} />
         </div>
         <div className="media-actions">
           {blocklist.show && (
@@ -733,7 +727,8 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
             </Tooltip>
           )}
           {data?.mediaInfo?.status !== MediaStatus.BLOCKLISTED &&
-            user?.userType !== UserType.PLEX && (
+            // Plex users keep their watchlist on Plex.
+            !hasAccountOn(user, 'plex') && (
               <>
                 {toggleWatchlist ? (
                   <Tooltip
@@ -748,7 +743,9 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                       {isUpdating ? (
                         <Spinner />
                       ) : (
-                        <StarIcon className={'text-amber-300'} />
+                        <StarIcon
+                          className={'text-amber-300 light:text-amber-600'}
+                        />
                       )}
                     </Button>
                   </Tooltip>
@@ -819,7 +816,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
             data.mediaInfo?.externalServiceId != null &&
             data.mediaInfo.serviceId != null && (
               <BackfillTitleButton
-                tmdbId={data.id}
+                id={data.id}
                 target={{
                   kind: 'series',
                   serverId: data.mediaInfo.serviceId,
@@ -895,7 +892,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
               <div className="mt-4 flex justify-end">
                 <Link
                   href={`/tv/${data.id}/crew`}
-                  className="flex items-center text-gray-400 transition duration-300 hover:text-gray-100"
+                  className="flex items-center text-muted transition duration-300 hover:text-gray-100"
                 >
                   <span>{intl.formatMessage(messages.viewfullcrew)}</span>
                   <ArrowRightCircleIcon className="ml-1.5 inline-block h-5 w-5" />
@@ -985,7 +982,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                     {({ open }) => (
                       <>
                         <DisclosureButton
-                          className={`mt-2 flex w-full items-center justify-between space-x-2 border-gray-700 bg-gray-800 px-4 py-2 text-gray-200 ${
+                          className={`mt-2 flex w-full items-center justify-between space-x-2 border-subtle bg-surface px-4 py-2 text-gray-200 ${
                             open
                               ? 'rounded-t-md border-l border-r border-t'
                               : 'rounded-md border'
@@ -1212,10 +1209,10 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                           leave="transition-opacity duration-75 ease-out"
                           leaveFrom="opacity-100"
                           leaveTo="opacity-0"
-                          // Not sure why this transition is adding a margin without this here
+                          // The transition adds a margin otherwise.
                           style={{ margin: '0px' }}
                         >
-                          <DisclosurePanel className="w-full rounded-b-md border-b border-l border-r border-gray-700 px-4 pb-2">
+                          <DisclosurePanel className="w-full rounded-b-md border-b border-l border-r border-subtle px-4 pb-2">
                             <Season
                               tvId={data.id}
                               seasonNumber={season.seasonNumber}
@@ -1256,7 +1253,9 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                 tmdbId={data.id}
                 tvdbId={data.mediaInfo.tvdbId}
                 itemKey={
-                  data.mediaInfo.ratingKey ?? data.mediaInfo.jellyfinMediaId
+                  data.mediaInfo.ratingKey ??
+                  data.mediaInfo.jellyfinMediaId ??
+                  data.mediaInfo.embyMediaId
                 }
               />
             )}
@@ -1264,7 +1263,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
             data.mediaInfo?.externalServiceId != null &&
             data.mediaInfo.serviceId != null && (
               <BackfillForTitle
-                tmdbId={data.id}
+                id={data.id}
                 target={{
                   kind: 'series',
                   serverId: data.mediaInfo.serviceId,
@@ -1379,6 +1378,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
               <span>{intl.formatMessage(globalMessages.status)}</span>
               <span className="media-fact-value">{data.status}</span>
             </div>
+            <RequestedBy requests={data.mediaInfo?.requests} />
             <WatchedBy mediaId={data.mediaInfo?.id} isShow={true} />
             {data.firstAirDate && (
               <div className="media-fact">
@@ -1525,7 +1525,7 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
                 tvdbId={data.externalIds.tvdbId}
                 imdbId={data.externalIds.imdbId}
                 rtUrl={ratingData?.url}
-                mediaUrl={plexUrl ?? plexUrl4k}
+                playLinks={playLinks}
               />
             </div>
           </div>

@@ -1,10 +1,12 @@
-import Badge from '@app/components/Common/Badge';
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import PageTitle from '@app/components/Common/PageTitle';
+import SaveBar from '@app/components/Common/SaveBar';
 import LanguageSelector from '@app/components/LanguageSelector';
 import QuotaSelector from '@app/components/QuotaSelector';
 import RegionSelector from '@app/components/RegionSelector';
+import AccountTypeBadges from '@app/components/UserList/AccountTypeBadges';
+import DefaultProfiles from '@app/components/UserProfile/UserSettings/UserGeneralSettings/DefaultProfiles';
 import { availableLanguages } from '@app/context/LanguageContext';
 import useLocale from '@app/hooks/useLocale';
 import useSettings from '@app/hooks/useSettings';
@@ -13,8 +15,10 @@ import { Permission, UserType, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import ErrorPage from '@app/pages/_error';
 import defineMessages from '@app/utils/defineMessages';
+import { connectedAccountServers } from '@app/utils/mediaServerAccounts';
 import { ArrowDownOnSquareIcon } from '@heroicons/react/24/outline';
 import { ApiErrorCode } from '@server/constants/error';
+import { isStandInEmail } from '@server/constants/oidc';
 import type { UserSettingsGeneralResponse } from '@server/interfaces/api/userSettingsInterfaces';
 import type { AvailableLocale } from '@server/types/languages';
 import axios from 'axios';
@@ -35,10 +39,7 @@ const messages = defineMessages(
     email: 'Email',
     save: 'Save Changes',
     saving: 'Saving…',
-    mediaServerUser: '{mediaServerName} User',
     accounttype: 'Account Type',
-    plexuser: 'Plex User',
-    localuser: 'Local User',
     role: 'Role',
     owner: 'Owner',
     admin: 'Admin',
@@ -58,6 +59,7 @@ const messages = defineMessages(
     streamingRegionTip: 'Show streaming sites by regional availability',
     movierequestlimit: 'Movie Request Limit',
     seriesrequestlimit: 'Series Request Limit',
+    musicrequestlimit: 'Album Request Limit',
     enableOverride: 'Override Global Limit',
     applanguage: 'Display Language',
     languageDefault: 'Default ({language})',
@@ -91,6 +93,7 @@ const UserGeneralSettings = () => {
   const { locale, setLocale } = useLocale();
   const [movieQuotaEnabled, setMovieQuotaEnabled] = useState(false);
   const [tvQuotaEnabled, setTvQuotaEnabled] = useState(false);
+  const [musicQuotaEnabled, setMusicQuotaEnabled] = useState(false);
   const router = useRouter();
   const {
     user,
@@ -101,6 +104,11 @@ const UserGeneralSettings = () => {
   });
   const { user: currentUser, hasPermission: currentHasPermission } = useUser();
   const { currentSettings } = useSettings();
+  // Default profiles count only while they may choose advanced options.
+  const choosesProfiles = hasPermission(
+    [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
+    { type: 'or' }
+  );
   const {
     data,
     error,
@@ -109,6 +117,11 @@ const UserGeneralSettings = () => {
     user ? `/api/v1/user/${user?.id}/settings/main` : null
   );
 
+  const emailSchema = Yup.string().test(
+    'email',
+    intl.formatMessage(messages.validationemailformat),
+    (value) => !value || isEmail(value, { require_tld: false })
+  );
   const UserGeneralSettingsSchema = Yup.object().shape({
     traktUsername: Yup.string()
       .trim()
@@ -117,25 +130,24 @@ const UserGeneralSettings = () => {
         intl.formatMessage(messages.validationtraktusername)
       ),
     email:
-      // email is required for everybody except non-admin jellyfin users
+      // Optional for non-owner Jellyfin/Emby users and for stand-in emails
+      // from providers that gave none.
       user?.id === 1 ||
-      (user?.userType !== UserType.JELLYFIN && user?.userType !== UserType.EMBY)
-        ? Yup.string()
-            .test(
-              'email',
-              intl.formatMessage(messages.validationemailformat),
-              (value) => !value || isEmail(value, { require_tld: false })
-            )
-            .required(intl.formatMessage(messages.validationemailrequired))
-        : Yup.string().test(
-            'email',
-            intl.formatMessage(messages.validationemailformat),
-            (value) => !value || isEmail(value, { require_tld: false })
-          ),
+      (user?.userType !== UserType.JELLYFIN &&
+        user?.userType !== UserType.EMBY &&
+        !isStandInEmail(user?.email))
+        ? emailSchema.required(
+            intl.formatMessage(messages.validationemailrequired)
+          )
+        : emailSchema,
   });
 
-  // The watchlists their switches below apply to.
-  const plexWatchlist = user?.userType === UserType.PLEX;
+  // Plex watchlist applies only with a linked account on a connected Plex.
+  const plexWatchlist =
+    !!user &&
+    connectedAccountServers(user, currentSettings.mediaServers).includes(
+      'plex'
+    );
   const traktWatchlist = !!currentSettings.traktReady;
   const syncTip = <T,>(plexOnly: T, traktOnly: T, both: T): T =>
     plexWatchlist && traktWatchlist
@@ -150,6 +162,9 @@ const UserGeneralSettings = () => {
     );
     setTvQuotaEnabled(
       data?.tvQuotaLimit != undefined && data?.tvQuotaDays != undefined
+    );
+    setMusicQuotaEnabled(
+      data?.musicQuotaLimit != undefined && data?.musicQuotaDays != undefined
     );
   }, [data]);
 
@@ -186,9 +201,12 @@ const UserGeneralSettings = () => {
           movieQuotaDays: data?.movieQuotaDays,
           tvQuotaLimit: data?.tvQuotaLimit,
           tvQuotaDays: data?.tvQuotaDays,
+          musicQuotaLimit: data?.musicQuotaLimit ?? undefined,
+          musicQuotaDays: data?.musicQuotaDays ?? undefined,
           watchlistSyncMovies: data?.watchlistSyncMovies,
           watchlistSyncTv: data?.watchlistSyncTv,
           traktUsername: data?.traktUsername ?? '',
+          defaultProfiles: data?.defaultProfiles ?? [],
         }}
         validationSchema={UserGeneralSettingsSchema}
         enableReinitialize
@@ -197,7 +215,10 @@ const UserGeneralSettings = () => {
             await axios.post(`/api/v1/user/${user?.id}/settings/main`, {
               username: values.displayName,
               email:
-                values.email || user?.jellyfinUsername || user?.plexUsername,
+                values.email ||
+                user?.jellyfinUsername ||
+                user?.embyUsername ||
+                user?.plexUsername,
               locale: values.locale,
               discoverRegion: values.discoverRegion,
               streamingRegion: values.streamingRegion,
@@ -208,10 +229,17 @@ const UserGeneralSettings = () => {
               movieQuotaDays: movieQuotaEnabled ? values.movieQuotaDays : null,
               tvQuotaLimit: tvQuotaEnabled ? values.tvQuotaLimit : null,
               tvQuotaDays: tvQuotaEnabled ? values.tvQuotaDays : null,
+              musicQuotaLimit: musicQuotaEnabled
+                ? values.musicQuotaLimit
+                : null,
+              musicQuotaDays: musicQuotaEnabled ? values.musicQuotaDays : null,
               watchlistSyncMovies: values.watchlistSyncMovies,
               watchlistSyncTv: values.watchlistSyncTv,
               ...(currentSettings.traktReady
                 ? { traktUsername: values.traktUsername.trim() }
+                : {}),
+              ...(choosesProfiles
+                ? { defaultProfiles: values.defaultProfiles }
                 : {}),
             });
 
@@ -274,27 +302,7 @@ const UserGeneralSettings = () => {
                 </label>
                 <div className="mb-1 text-sm font-medium leading-5 text-gray-400 sm:mt-2">
                   <div className="flex max-w-lg items-center">
-                    {user?.userType === UserType.PLEX ? (
-                      <Badge badgeType="warning">
-                        {intl.formatMessage(messages.plexuser)}
-                      </Badge>
-                    ) : user?.userType === UserType.LOCAL ? (
-                      <Badge badgeType="default">
-                        {intl.formatMessage(messages.localuser)}
-                      </Badge>
-                    ) : user?.userType === UserType.EMBY ? (
-                      <Badge badgeType="success">
-                        {intl.formatMessage(messages.mediaServerUser, {
-                          mediaServerName: 'Emby',
-                        })}
-                      </Badge>
-                    ) : user?.userType === UserType.JELLYFIN ? (
-                      <Badge badgeType="default">
-                        {intl.formatMessage(messages.mediaServerUser, {
-                          mediaServerName: 'Jellyfin',
-                        })}
-                      </Badge>
-                    ) : null}
+                    {user && <AccountTypeBadges user={user} />}
                   </div>
                 </div>
               </div>
@@ -324,6 +332,7 @@ const UserGeneralSettings = () => {
                       type="text"
                       placeholder={
                         user?.jellyfinUsername ||
+                        user?.embyUsername ||
                         user?.plexUsername ||
                         user?.email
                       }
@@ -350,7 +359,8 @@ const UserGeneralSettings = () => {
                       name="email"
                       type="text"
                       placeholder="example@domain.com"
-                      disabled={user?.plexUsername}
+                      // Plex users' email comes from Plex.
+                      disabled={user?.userType === UserType.PLEX}
                       className={
                         user?.warnings.find((w) => w === 'userEmailRequired')
                           ? 'border-2 border-red-400 focus:border-blue-600'
@@ -430,7 +440,7 @@ const UserGeneralSettings = () => {
                 </div>
               </div>
               <div className="form-row">
-                <label htmlFor="streamingRegionTip" className="text-label">
+                <label htmlFor="streamingRegion" className="text-label">
                   <span>{intl.formatMessage(messages.streamingRegion)}</span>
                   <span className="label-tip">
                     {intl.formatMessage(messages.streamingRegionTip)}
@@ -540,6 +550,52 @@ const UserGeneralSettings = () => {
                         </div>
                       </div>
                     </div>
+                    {currentSettings.musicReady && (
+                      <div className="form-row">
+                        <label htmlFor="musicQuotaLimit" className="text-label">
+                          <span>
+                            {intl.formatMessage(messages.musicrequestlimit)}
+                          </span>
+                        </label>
+                        <div className="form-input-area">
+                          <div className="flex flex-col">
+                            <div className="mb-4 flex items-center">
+                              <input
+                                type="checkbox"
+                                id="musicQuotaOverride"
+                                checked={musicQuotaEnabled}
+                                onChange={() => setMusicQuotaEnabled((s) => !s)}
+                              />
+                              <label
+                                htmlFor="musicQuotaOverride"
+                                className="ml-2 text-gray-300"
+                              >
+                                {intl.formatMessage(messages.enableOverride)}
+                              </label>
+                            </div>
+                            <QuotaSelector
+                              isDisabled={!musicQuotaEnabled}
+                              dayFieldName="musicQuotaDays"
+                              limitFieldName="musicQuotaLimit"
+                              mediaType="music"
+                              onChange={setFieldValue}
+                              defaultDays={values.musicQuotaDays}
+                              defaultLimit={values.musicQuotaLimit}
+                              dayOverride={
+                                !musicQuotaEnabled
+                                  ? data?.globalMusicQuotaDays
+                                  : undefined
+                              }
+                              limitOverride={
+                                !musicQuotaEnabled
+                                  ? data?.globalMusicQuotaLimit
+                                  : undefined
+                              }
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </>
                 )}
               {traktWatchlist &&
@@ -601,7 +657,7 @@ const UserGeneralSettings = () => {
                             ) => (
                               <a
                                 href="https://support.plex.tv/articles/universal-watchlist/"
-                                className="text-white transition duration-300 hover:underline"
+                                className="text-strong transition duration-300 hover:underline"
                                 target="_blank"
                                 rel="noreferrer"
                               >
@@ -650,7 +706,7 @@ const UserGeneralSettings = () => {
                             ) => (
                               <a
                                 href="https://support.plex.tv/articles/universal-watchlist/"
-                                className="text-white transition duration-300 hover:underline"
+                                className="text-strong transition duration-300 hover:underline"
                                 target="_blank"
                                 rel="noreferrer"
                               >
@@ -676,7 +732,13 @@ const UserGeneralSettings = () => {
                     </div>
                   </div>
                 )}
-              <div className="actions">
+              {choosesProfiles && (
+                <DefaultProfiles
+                  value={values.defaultProfiles}
+                  onChange={(value) => setFieldValue('defaultProfiles', value)}
+                />
+              )}
+              <SaveBar>
                 <div className="flex justify-end">
                   <span className="ml-3 inline-flex rounded-md shadow-sm">
                     <Button
@@ -693,7 +755,7 @@ const UserGeneralSettings = () => {
                     </Button>
                   </span>
                 </div>
-              </div>
+              </SaveBar>
             </Form>
           );
         }}

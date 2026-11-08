@@ -8,6 +8,8 @@ import UserWarnings from '@app/components/Layout/UserWarnings';
 import WatchSuggestions from '@app/components/MediaLists/WatchSuggestions';
 import PasskeyNudge from '@app/components/PasskeyNudge';
 import PushOptInBanner from '@app/components/PushOptIn/PushOptInBanner';
+import SeasonalNote from '@app/components/Seasonal/SeasonalNote';
+import { NavLayoutProvider } from '@app/context/NavLayoutContext';
 import useLocale from '@app/hooks/useLocale';
 import useSettings from '@app/hooks/useSettings';
 import { useUser } from '@app/hooks/useUser';
@@ -75,17 +77,29 @@ const Layout = ({ children }: LayoutProps) => {
     };
   }, []);
 
-  // How far into this visit's history the current page is, so the back
-  // button knows whether there is anywhere to go. A reload — an update
-  // prompt, or the app being restored by iOS — wipes the history stack, and
-  // router.back() on an empty stack does nothing at all, which reads as a
-  // dead button.
+  // iPhone Safari can leave empty scroll space when the page gets shorter, so
+  // scroll back to the new end.
+  const mainRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const main = mainRef.current;
+    if (!main || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      const end = document.documentElement.scrollHeight - window.innerHeight;
+      if (window.scrollY > end + 1) {
+        window.scrollTo({ top: Math.max(0, end) });
+      }
+    });
+    observer.observe(main);
+    return () => observer.disconnect();
+  }, []);
+
+  // History depth, so the back button knows if there is anywhere to go. A
+  // reload (update prompt, iOS restoring the app) wipes the stack, and
+  // router.back() on an empty stack does nothing.
   //
-  // Each history entry Next makes carries a key: a push makes a new one, a
-  // replace (a filter changing the address, say) keeps it. So an entry seen
-  // before is a step back or forward to a known depth, and a new one is one
-  // deeper. Counting route changes instead counted replaces, and the back
-  // step itself, as further pages, until the button walked out of the app.
+  // Next gives each history entry a key: a push makes a new one, a replace
+  // keeps it. A known key is a step to a known depth; a new one is one deeper.
+  // Counting route changes would count replaces and back steps as pages.
   const depthByEntry = useRef(new Map<string, number>());
   const historyDepth = useRef(0);
 
@@ -93,8 +107,8 @@ const Layout = ({ children }: LayoutProps) => {
     const entryKey = (): string | undefined =>
       (window.history.state as { key?: string } | null)?.key;
 
-    // The entry being left. Next only labels the first entry once the app
-    // has started, so it is recorded on the way out rather than on load.
+    // Records the entry being left: Next only keys the first entry after
+    // start-up, so it can't be recorded on load.
     const onRouteStart = () => {
       const key = entryKey();
       if (key && !depthByEntry.current.has(key)) {
@@ -131,8 +145,8 @@ const Layout = ({ children }: LayoutProps) => {
       return;
     }
 
-    // Nothing to return to: fall back to the listing the current page most
-    // likely came from, rather than leaving the button inert.
+    // Nothing to go back to: go to the listing this page most likely came
+    // from.
     if (router.pathname.startsWith('/movie')) {
       router.push('/discover/movies');
     } else if (router.pathname.startsWith('/tv')) {
@@ -145,81 +159,89 @@ const Layout = ({ children }: LayoutProps) => {
   }, [router]);
 
   return (
-    <div className="flex h-full min-h-full min-w-0 bg-gray-900">
-      <div className="pwa-only fixed inset-0 z-20 h-1 w-full border-gray-700 md:border-t" />
-      <div className="absolute top-0 h-64 w-full bg-gradient-to-bl from-gray-800 to-gray-900">
-        <div className="relative inset-0 h-full w-full bg-gradient-to-t from-gray-900 to-transparent" />
-      </div>
-      <Sidebar
-        open={isSidebarOpen}
-        setClosed={() => setSidebarOpen(false)}
-        pendingRequestsCount={requestResponse?.pending ?? 0}
-        openIssuesCount={issueResponse?.open ?? 0}
-        revalidateIssueCount={() => revalidateIssueCount()}
-        revalidateRequestsCount={() => revalidateRequestsCount()}
-      />
-      <div className="sm:hidden">
-        <MobileMenu
+    // Shares the menu being arranged between Discover and the menus.
+    <NavLayoutProvider>
+      <div className="flex h-full min-h-full min-w-0 bg-page">
+        <div className="pwa-only fixed inset-0 z-20 h-1 w-full border-subtle md:border-t" />
+        <div className="absolute top-0 h-64 w-full bg-gradient-to-bl from-surface to-page">
+          <div className="relative inset-0 h-full w-full bg-gradient-to-t from-page to-transparent" />
+        </div>
+        <Sidebar
+          open={isSidebarOpen}
+          setClosed={() => setSidebarOpen(false)}
           pendingRequestsCount={requestResponse?.pending ?? 0}
           openIssuesCount={issueResponse?.open ?? 0}
           revalidateIssueCount={() => revalidateIssueCount()}
           revalidateRequestsCount={() => revalidateRequestsCount()}
         />
-      </div>
-
-      <div className="relative mb-16 flex w-0 min-w-0 flex-1 flex-col lg:ml-64">
-        <PullToRefresh />
-        <div
-          className={`searchbar fixed left-0 right-0 top-0 z-10 flex flex-shrink-0 transition duration-300 ${
-            isScrolled ? 'bg-gray-700/80' : 'bg-transparent'
-          } lg:left-64`}
-          style={{
-            backdropFilter: isScrolled ? 'blur(5px)' : undefined,
-            WebkitBackdropFilter: isScrolled ? 'blur(5px)' : undefined,
-          }}
-        >
-          <div className="flex flex-1 items-center justify-between px-4 md:pl-4 md:pr-4">
-            <button
-              className={`mr-2 hidden text-white sm:block ${
-                isScrolled ? 'opacity-90' : 'opacity-70'
-              } transition duration-300 focus:outline-none lg:hidden`}
-              aria-label={intl.formatMessage(messages.openSidebar)}
-              onClick={() => setSidebarOpen(true)}
-              data-testid="sidebar-toggle"
-            >
-              <Bars3BottomLeftIcon className="h-7 w-7" />
-            </button>
-            <button
-              aria-label={intl.formatMessage(messages.goBack)}
-              className={`mr-2 text-white ${
-                isScrolled ? 'opacity-90' : 'opacity-70'
-              } transition duration-300 hover:text-white focus:text-white focus:outline-none`}
-              onClick={goBack}
-            >
-              <ArrowLeftIcon className="w-7" />
-            </button>
-            <SearchInput />
-            <AiChat />
-            <div className="flex items-center">
-              <UserDropdown />
-            </div>
-          </div>
+        <div className="sm:hidden">
+          <MobileMenu
+            pendingRequestsCount={requestResponse?.pending ?? 0}
+            openIssuesCount={issueResponse?.open ?? 0}
+            revalidateIssueCount={() => revalidateIssueCount()}
+            revalidateRequestsCount={() => revalidateRequestsCount()}
+          />
         </div>
 
-        <main className="relative top-16 z-0 focus:outline-none" tabIndex={0}>
-          <div className="mb-6">
-            <div className="max-w-8xl mx-auto px-4">
-              <UserWarnings />
-              {/* One of these at a time, in order: see NoticeQueue. */}
-              <PushOptInBanner />
-              <PasskeyNudge />
-              <WatchSuggestions />
-              {children}
+        <div className="relative mb-16 flex w-0 min-w-0 flex-1 flex-col lg:ml-64">
+          <PullToRefresh />
+          <div
+            className={`searchbar fixed left-0 right-0 top-0 z-10 flex flex-shrink-0 transition duration-300 ${
+              isScrolled
+                ? 'top-bar-blur bg-surface-raised/panel'
+                : 'bg-transparent'
+            } lg:left-64`}
+            data-seerr="top-bar"
+          >
+            <div className="flex flex-1 items-center justify-between px-4 md:pl-4 md:pr-4">
+              <button
+                className={`mr-2 hidden text-strong sm:block ${
+                  isScrolled ? 'opacity-90' : 'opacity-70'
+                } transition duration-300 focus:outline-none lg:hidden`}
+                aria-label={intl.formatMessage(messages.openSidebar)}
+                onClick={() => setSidebarOpen(true)}
+                data-testid="sidebar-toggle"
+              >
+                <Bars3BottomLeftIcon className="h-7 w-7" />
+              </button>
+              <button
+                aria-label={intl.formatMessage(messages.goBack)}
+                className={`mr-2 text-strong ${
+                  isScrolled ? 'opacity-90' : 'opacity-70'
+                } transition duration-300 hover:text-strong focus:text-strong focus:outline-none`}
+                onClick={goBack}
+              >
+                <ArrowLeftIcon className="w-7" />
+              </button>
+              <SearchInput />
+              <AiChat />
+              <div className="flex items-center">
+                <UserDropdown />
+              </div>
             </div>
           </div>
-        </main>
+
+          <main
+            ref={mainRef}
+            className="relative top-16 z-0 focus:outline-none"
+            tabIndex={0}
+            data-seerr="page"
+          >
+            <div className="mb-6">
+              <div className="max-w-8xl mx-auto px-4">
+                <UserWarnings />
+                {/* One at a time, in order (see NoticeQueue). */}
+                <PushOptInBanner />
+                <PasskeyNudge />
+                <WatchSuggestions />
+                <SeasonalNote />
+                {children}
+              </div>
+            </div>
+          </main>
+        </div>
       </div>
-    </div>
+    </NavLayoutProvider>
   );
 };
 

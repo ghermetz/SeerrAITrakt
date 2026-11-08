@@ -1,6 +1,7 @@
 import QuickConnectModal from '@app/components/Common/QuickConnectModal';
 import defineMessages from '@app/utils/defineMessages';
-import axios from 'axios';
+import { ApiErrorCode } from '@server/constants/error';
+import axios, { isAxiosError } from 'axios';
 import { useCallback } from 'react';
 import { useIntl } from 'react-intl';
 
@@ -16,6 +17,8 @@ interface JellyfinQuickConnectModalProps {
   onAuthenticated: () => void;
   onError: (error: string) => void;
   mediaServerName: string;
+  /** Shown when the username is already another account's email. */
+  existingAccountMessage: string;
 }
 
 const JellyfinQuickConnectModal = ({
@@ -23,14 +26,29 @@ const JellyfinQuickConnectModal = ({
   onAuthenticated,
   onError,
   mediaServerName,
+  existingAccountMessage,
 }: JellyfinQuickConnectModalProps) => {
   const intl = useIntl();
 
-  const authenticate = useCallback(async (secret: string) => {
-    await axios.post('/api/v1/auth/jellyfin/quickconnect/authenticate', {
-      secret,
-    });
-  }, []);
+  const authenticate = useCallback(
+    async (secret: string) => {
+      try {
+        await axios.post('/api/v1/auth/jellyfin/quickconnect/authenticate', {
+          secret,
+        });
+      } catch (e) {
+        // Replace the server's error code with readable text.
+        if (
+          isAxiosError(e) &&
+          e.response?.data?.message === ApiErrorCode.ExistingAccount
+        ) {
+          e.response.data.message = existingAccountMessage;
+        }
+        throw e;
+      }
+    },
+    [existingAccountMessage]
+  );
 
   return (
     <QuickConnectModal

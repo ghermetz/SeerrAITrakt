@@ -1,9 +1,16 @@
 import { useUser } from '@app/hooks/useUser';
+import defineMessages from '@app/utils/defineMessages';
 import type { Permission } from '@server/lib/permissions';
 import { hasPermission } from '@server/lib/permissions';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
-import { useEffect } from 'react';
+import { useEffect, useId } from 'react';
+import { useIntl } from 'react-intl';
+
+const messages = defineMessages('components.Common.SettingsTabs', {
+  selectTab: 'Select a Tab',
+  tabs: 'Tabs',
+});
 
 export interface SettingsRoute {
   text: string;
@@ -44,14 +51,14 @@ const SettingsLink = ({
 
   let linkClasses =
     'px-1 py-4 ml-8 text-sm font-medium leading-5 transition duration-300 border-b-2 border-transparent whitespace-nowrap first:ml-0';
-  let activeLinkColor = 'text-indigo-500 border-indigo-600';
+  let activeLinkColor = 'text-accent-text border-indigo-600';
   let inactiveLinkColor =
     'text-gray-500 border-transparent hover:text-gray-300 hover:border-gray-400 focus:text-gray-300 focus:border-gray-400';
 
   if (tabType === 'button') {
     linkClasses =
       'px-3 py-2 text-sm font-medium transition duration-300 rounded-md whitespace-nowrap mx-2 my-1';
-    activeLinkColor = 'bg-indigo-700';
+    activeLinkColor = 'bg-indigo-700 text-white';
     inactiveLinkColor = 'bg-gray-800 hover:bg-gray-700 focus:bg-gray-700';
   }
 
@@ -75,19 +82,19 @@ const SettingsTabs = ({
   tabType?: 'default' | 'button';
   settingsRoutes: SettingsRoute[];
 }) => {
+  const intl = useIntl();
   const router = useRouter();
   const { user: currentUser } = useUser();
+  // A page can have two tab sets (Settings, then a section's), so each
+  // dropdown label needs its own id.
+  const selectId = useId();
 
   /*
-   * Load the other sections' code in the background once this one has
-   * settled. Each page's code otherwise downloads the first time it is
-   * opened — over half a megabyte for Services — so the first visit to each
-   * was slow. Links pre-load themselves, but on a phone these tabs are a
-   * dropdown, which never did. Next.js only downloads here, without running
-   * anything, and the service worker keeps it across restarts, so this costs
-   * once per update. One page at a time, after a pause so the open page
-   * comes first; it stops when the menu goes away. Only sections this user
-   * can see.
+   * Prefetch the other visible sections' code once this one settles (over
+   * half a megabyte for Services). Links prefetch themselves, but on a phone
+   * these tabs are a dropdown. Next.js only downloads, and the service worker
+   * keeps it across restarts, so this costs once per update. One page at a
+   * time after a pause; stops on unmount.
    */
   const visibleRoutes = settingsRoutes
     .filter(
@@ -134,11 +141,11 @@ const SettingsTabs = ({
   return (
     <>
       <div className="sm:hidden">
-        <label htmlFor="tabs" className="sr-only">
-          Select a Tab
+        <label htmlFor={selectId} className="sr-only">
+          {intl.formatMessage(messages.selectTab)}
         </label>
         <select
-          id="tabs"
+          id={selectId}
           onChange={(e) => {
             router.push(e.target.value);
           }}
@@ -149,7 +156,6 @@ const SettingsTabs = ({
             settingsRoutes.find((route) => !!router.pathname.match(route.regex))
               ?.route
           }
-          aria-label="Selected Tab"
         >
           {settingsRoutes
             .filter(
@@ -180,7 +186,10 @@ const SettingsTabs = ({
       </div>
       {tabType === 'button' ? (
         <div className="hidden sm:block">
-          <nav className="-mx-2 -my-1 flex flex-wrap" aria-label="Tabs">
+          <nav
+            className="-mx-2 -my-1 flex flex-wrap"
+            aria-label={intl.formatMessage(messages.tabs)}
+          >
             {settingsRoutes.map((route, index) => (
               <SettingsLink
                 tabType={tabType}

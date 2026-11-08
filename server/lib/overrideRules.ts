@@ -10,8 +10,73 @@ import { toSeriesTypeFor } from '@server/constants/seriesType';
 import { getRepository } from '@server/datasource';
 import OverrideRule from '@server/entity/OverrideRule';
 import type { User } from '@server/entity/User';
+import { detectAnime } from '@server/lib/animeDecision';
 import { getSettings } from '@server/lib/settings';
-import { isAnime } from '@server/utils/isAnime';
+import type { RuleCertification } from '@server/utils/ruleCertification';
+import { parseRuleCertifications } from '@server/utils/ruleCertification';
+
+/**
+ * A title's age rating as its page reads it: TMDB's rating for the region
+ * (for a film, the first release there with one), else its US rating.
+ * Undefined when neither exists.
+ */
+export const titleCertification = (
+  tmdbMedia: TmdbMovieDetails | TmdbTvDetails,
+  region: string
+): RuleCertification | undefined => {
+  const ratingIn = (country: string) =>
+    'release_dates' in tmdbMedia
+      ? tmdbMedia.release_dates?.results
+          ?.find((r) => r.iso_3166_1 === country)
+          ?.release_dates.find((release) => release.certification?.trim())
+          ?.certification.trim()
+      : tmdbMedia.content_ratings?.results
+          ?.find((r) => r.iso_3166_1 === country)
+          ?.rating?.trim();
+
+  for (const country of new Set([region, 'US'])) {
+    const certification = ratingIn(country);
+    if (certification) {
+      return { country, certification };
+    }
+  }
+
+  return undefined;
+};
+
+/**
+ * Where a title was made, as ISO 3166-1 codes: TMDB's production countries
+ * and origin countries (a series' main one, newer for films).
+ */
+export const titleCountries = (
+  tmdbMedia: TmdbMovieDetails | TmdbTvDetails
+): Set<string> =>
+  new Set(
+    [
+      ...(tmdbMedia.production_countries ?? []).map(
+        (country) => country.iso_3166_1
+      ),
+      ...(tmdbMedia.origin_country ?? []),
+    ]
+      .filter((code): code is string => typeof code === 'string')
+      .map((code) => code.toUpperCase())
+  );
+
+/**
+ * A rule's countries as stored: ISO 3166-1 codes, each once, comma-separated;
+ * null for none.
+ */
+export const formatRuleCountries = (value?: string | null): string | null => {
+  const codes = [
+    ...new Set(
+      (value ?? '')
+        .split(',')
+        .map((code) => code.trim().toUpperCase())
+        .filter((code) => /^[A-Z]{2}$/.test(code))
+    ),
+  ];
+  return codes.length ? codes.join(',') : null;
+};
 
 export type OverrideRulesResult = {
   rootFolder: string | null;
@@ -36,7 +101,7 @@ async function overrideRules({
   requestUser: User;
   tags?: number[] | null;
   serviceId?: number;
-  /** The title's own anime setting (Media.animeSetting), if it has one. */
+  /** The title's own anime setting (Media.animeSetting), if set. */
   animeSetting?: boolean | null;
 }): Promise<OverrideRulesResult> {
   const settings = getSettings();
@@ -66,8 +131,8 @@ async function overrideRules({
           where: { [serviceIdField]: serviceId },
         });
 
-  // Anime movies too, once their Radarr server has an anime folder or
-  // profile of its own; until then rules apply to them as to any movie.
+  // Anime movies too, once their Radarr server has its own anime folder or
+  // profile; until then rules treat them as any movie.
   const radarrServer =
     mediaType === MediaType.MOVIE
       ? settings.radarr.find((r) => r.id === serviceId)
@@ -76,13 +141,22 @@ async function overrideRules({
     mediaType === MediaType.TV ||
     !!radarrServer?.activeAnimeDirectory ||
     !!radarrServer?.activeAnimeProfileId;
-  const anime = animeSettings && (animeSetting ?? isAnime(tmdbMedia));
+  // Whether Seerr treats the title as anime: the request's choice (passed as
+  // animeSetting), the title's own setting, else detection.
+  const decidedAnime = animeSetting ?? detectAnime(tmdbMedia);
+  const anime = animeSettings && decidedAnime;
+
+  // Read for the server's Discover region, as the title page does for users
+  // without their own region.
+  const certification = rules.some((rule) => rule.certification)
+    ? titleCertification(tmdbMedia, settings.main.discoverRegion || 'US')
+    : undefined;
 
   const appliedOverrideRules = rules.filter((rule) => {
-    // Anime goes by the anime settings, unless a rule names the anime
-    // keyword to take it over. Anime is told by the title's own setting, or
-    // else the same test as routing (utils/isAnime), so a title without the
-    // keyword is treated alike.
+    // Anime follows the anime settings unless a rule names the anime keyword to
+    // take it over. Anime is decided by the request's choice, the title's
+    // setting, else the routing test (utils/isAnime), so titles without the
+    // keyword are treated the same.
     if (
       anime &&
       (!rule.keywords ||
@@ -115,9 +189,17 @@ async function overrideRules({
     ) {
       return false;
     }
+    // A rule naming TMDB's anime keyword matches exactly the titles Seerr
+    // treats as anime, keyword or not: a title set as not anime, or excluded by
+    // country, stays out, and Japanese animation without the keyword (or a
+    // title set as anime) is in.
     if (
       rule.keywords &&
       !rule.keywords.split(',').some((keywordId) => {
+        if (Number(keywordId) === ANIME_KEYWORD_ID) {
+          return decidedAnime;
+        }
+
         let keywordList: TmdbKeyword[] = [];
 
         if ('keywords' in tmdbMedia.keywords) {
@@ -130,6 +212,25 @@ async function overrideRules({
           .map((keyword: TmdbKeyword) => keyword.id)
           .includes(Number(keywordId));
       })
+    ) {
+      return false;
+    }
+    // Any one of the rule's countries; a title with none never matches.
+    if (rule.country) {
+      const made = titleCountries(tmdbMedia);
+      if (!rule.country.split(',').some((code) => made.has(code))) {
+        return false;
+      }
+    }
+    // A rating only equals the same rating in the same country's system: US
+    // "PG" is not British "PG". A title without one never matches.
+    if (
+      rule.certification &&
+      !parseRuleCertifications(rule.certification).some(
+        (entry) =>
+          entry.country === certification?.country &&
+          entry.certification === certification.certification
+      )
     ) {
       return false;
     }
@@ -147,14 +248,20 @@ async function overrideRules({
     return typeof value !== 'string' || value.trim() !== '';
   };
   const prioritizedRule = appliedOverrideRules.sort((a, b) => {
-    const keys: (keyof OverrideRule)[] = ['genre', 'language', 'keywords'];
+    const keys: (keyof OverrideRule)[] = [
+      'genre',
+      'language',
+      'keywords',
+      'certification',
+      'country',
+    ];
     const aSpecificity = keys.filter((key) =>
       hasSpecificOverrideValue(a, key)
     ).length;
     const bSpecificity = keys.filter((key) =>
       hasSpecificOverrideValue(b, key)
     ).length;
-    // Take the rule with the most specific condition first
+    // Most specific condition first.
     return bSpecificity - aSpecificity;
   })[0];
 

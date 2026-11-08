@@ -1,5 +1,6 @@
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
+import SaveBar from '@app/components/Common/SaveBar';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
 import NotificationTypeSelector from '@app/components/NotificationTypeSelector';
 import useToasts from '@app/hooks/useToasts';
@@ -18,7 +19,7 @@ const messages = defineMessages('components.Settings.Notifications', {
   embedPoster: 'Embed Poster',
   botUsername: 'Bot Username',
   botUsernameTip:
-    'Allow users to also start a chat with your bot and configure their own notifications',
+    'Lets people chat with your bot to set up their own notifications',
   botAPI: 'Bot Authorization Token',
   botApiTip:
     '<CreateBotLink>Create a bot</CreateBotLink> for use with Seerr AI',
@@ -26,8 +27,7 @@ const messages = defineMessages('components.Settings.Notifications', {
   chatIdTip:
     'Start a chat with your bot, add <GetIdBotLink>@get_id_bot</GetIdBotLink>, and issue the <code>/my_id</code> command',
   messageThreadId: 'Thread/Topic ID',
-  messageThreadIdTip:
-    "If your group-chat has topics enabled, you can specify a thread/topic's ID here",
+  messageThreadIdTip: 'For a group chat with topics: the topic’s ID',
   validationBotAPIRequired: 'You must provide a bot authorization token',
   validationChatIdRequired: 'You must provide a valid chat ID',
   validationMessageThreadId:
@@ -208,7 +208,7 @@ const NotificationsTelegram = () => {
                     CreateBotLink: (msg: React.ReactNode) => (
                       <a
                         href="https://core.telegram.org/bots#6-botfather"
-                        className="text-white transition duration-300 hover:underline"
+                        className="text-strong transition duration-300 hover:underline"
                         target="_blank"
                         rel="noreferrer"
                       >
@@ -218,7 +218,7 @@ const NotificationsTelegram = () => {
                     GetIdBotLink: (msg: React.ReactNode) => (
                       <a
                         href="https://telegram.me/get_id_bot"
-                        className="text-white transition duration-300 hover:underline"
+                        className="text-strong transition duration-300 hover:underline"
                         target="_blank"
                         rel="noreferrer"
                       >
@@ -362,7 +362,7 @@ const NotificationsTelegram = () => {
                   : undefined
               }
             />
-            <div className="actions">
+            <SaveBar>
               <div className="flex justify-end">
                 <span className="ml-3 inline-flex rounded-md shadow-sm">
                   <Button
@@ -396,7 +396,7 @@ const NotificationsTelegram = () => {
                   </Button>
                 </span>
               </div>
-            </div>
+            </SaveBar>
           </Form>
         );
       }}

@@ -13,6 +13,7 @@ import {
   useMediaServerName,
   useSubtitleReasons,
 } from '@app/components/Subtitles/parts';
+import useNow, { elapsed } from '@app/hooks/useNow';
 import type { SubtitlesKind } from '@app/hooks/useSubtitles';
 import {
   subtitlesKey,
@@ -43,6 +44,7 @@ import {
   SpeakerWaveIcon,
 } from '@heroicons/react/24/outline';
 import type {
+  BazarrJobLive,
   EpisodeSubtitles,
   MovieSubtitles,
   SeriesSubtitles,
@@ -85,8 +87,14 @@ const messages = defineMessages('components.Subtitles.SubtitlesCard', {
     'Transcribe: AI subtitles from the audio, {left} of {total} to do',
   transcribingNow: 'Transcribing now…',
   transcribingEpisode: 'Transcribing S{season} E{episode}…',
+  waitingInBazarr: 'Waiting its turn in Bazarr…',
+  waitingInBazarrEpisode: 'S{season} E{episode} waiting its turn in Bazarr…',
   transcribingQueued: '{count} more queued',
   searchingNow: 'Searching for the missing subtitles…',
+  searchWaiting: 'The search is waiting its turn in Bazarr…',
+  jobsAhead: '{count, plural, one {# job} other {# jobs}} ahead of it',
+  bazarrBusy: 'Bazarr has been busy with other jobs for {time}',
+  jobProgress: '{value} of {max}',
   noneFoundMovie: 'no provider had one',
   noneFoundEpisodes:
     '{count, plural, one {# episode} other {# episodes}} no provider had',
@@ -101,7 +109,7 @@ const messages = defineMessages('components.Subtitles.SubtitlesCard', {
   searching:
     'Bazarr is searching for the missing subtitles. They show here as they arrive.',
   searchingThenTranscribe:
-    'Bazarr is searching for the missing subtitles. They show here as they arrive, and whatever no provider has is then transcribed from the audio.',
+    'Bazarr is searching for the missing subtitles; any it can’t find are then transcribed.',
   defaultSet: 'Plex will start this with that subtitle for you.',
   defaultSetSeries:
     'Setting it on {count, plural, one {# episode} other {# episodes}} in Plex.',
@@ -115,8 +123,10 @@ const messages = defineMessages('components.Subtitles.SubtitlesCard', {
 });
 
 const OPEN_KEY = 'subtitles-card-open';
+/** Bazarr busy this long with other jobs is reported. */
+const BUSY_MS = 2 * 60 * 60_000;
 
-/** The card stays open or closed as its viewer last left it. */
+/** Remembers whether the viewer left the card open. */
 const useRememberedOpen = (): [boolean, (open: boolean) => void] => {
   const [open, setOpen] = useState(true);
   useEffect(() => {
@@ -125,7 +135,7 @@ const useRememberedOpen = (): [boolean, (open: boolean) => void] => {
         setOpen(false);
       }
     } catch {
-      // Storage refused: open, as it starts.
+      // Storage unavailable: stays open.
     }
   }, []);
   return [
@@ -135,7 +145,7 @@ const useRememberedOpen = (): [boolean, (open: boolean) => void] => {
       try {
         window.localStorage.setItem(OPEN_KEY, String(next));
       } catch {
-        // Not remembered this time.
+        // Storage unavailable: not remembered.
       }
     },
   ];
@@ -181,7 +191,7 @@ const languagesOf = (intl: IntlShape, tracks: SubtitleTrack[]) => {
 interface SubtitlesCardProps {
   kind: SubtitlesKind;
   tmdbId: number;
-  /** The title as dialogs name it: "10 Cloverfield Lane (2016)". */
+  /** The title as dialogs name it: "Glasswing (2016)". */
   title: string;
 }
 
@@ -200,6 +210,10 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
   const current = kind === 'movie' ? movie : series;
   const loaded = !!current.data;
   const transcription = useTranscription(kind, tmdbId, on && loaded);
+  // Ticks to show elapsed time while a job runs.
+  const now = useNow(
+    !!(transcription.data?.searchJob || transcription.data?.transcribeJob)
+  );
   const plex = usePlexDefault(kind, tmdbId, on && loaded);
 
   const [search, setSearch] = useState<{
@@ -210,7 +224,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
   const [toDelete, setToDelete] = useState<SubtitleTrack | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // A finished transcription is a new subtitle on disk.
+  // A finished transcription adds a subtitle on disk: refetch.
   const done = transcription.data?.done ?? 0;
   const lastDone = useRef(done);
   useEffect(() => {
@@ -221,7 +235,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [done]);
 
-  // So is whatever a finished search found.
+  // So may a finished search.
   const searching = !!transcription.data?.searching;
   const wasSearching = useRef(searching);
   useEffect(() => {
@@ -257,7 +271,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
             : messages.searching
         )
       );
-      // Followed until Bazarr is done; what it found then shows.
+      // Tracked until Bazarr finishes; its results then show.
       void transcription.mutate(data, { revalidate: false });
     } catch (e) {
       toast(
@@ -325,7 +339,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
     }
   };
 
-  // ---- What the header and rows say ----------------------------------------
+  // ---- Header and row text ----------------------------------------------
 
   const movieData =
     kind === 'movie' ? (movie.data as MovieSubtitles) : undefined;
@@ -339,7 +353,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
 
   const plexSelected = plex.data?.available ? plex.data.selected : undefined;
   const selectedOption = plex.data?.options.find((o) => o.id === plexSelected);
-  /** The track Plex starts this with for the viewer, as best it can be told. */
+  /** Best guess at the track Plex starts with for this viewer. */
   const isDefault = (track: SubtitleTrack) =>
     !!selectedOption &&
     !!track.language3 &&
@@ -349,7 +363,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
       : track.kind === 'embedded');
   const defaultTrack = movieData?.tracks.find(isDefault);
   const groups = seriesData ? groupTracks(episodes, wanted) : [];
-  /** A series is set by language: its first group in that language. */
+  /** A series' default is by language: its first group in that language. */
   const defaultGroupKey =
     typeof plexSelected === 'string' && plexSelected
       ? groups.find(
@@ -406,17 +420,60 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
     ? !movieData.tracks.some((t) => t.ai)
     : toTranscribe > 0;
   const status = transcription.data;
+  // A Bazarr job's wait or run time, what's ahead of it, and Bazarr's own
+  // count if any.
+  const jobNotes = (job?: BazarrJobLive): string[] => {
+    if (!job) {
+      return [];
+    }
+    if (job.state === 'running') {
+      return [
+        elapsed(job.since, now),
+        job.progress
+          ? intl.formatMessage(messages.jobProgress, job.progress)
+          : '',
+      ];
+    }
+    const busyFor = job.busySince ? now - Date.parse(job.busySince) : 0;
+    return [
+      job.ahead
+        ? intl.formatMessage(messages.jobsAhead, { count: job.ahead })
+        : '',
+      busyFor > BUSY_MS
+        ? intl.formatMessage(messages.bazarrBusy, {
+            time: elapsed(job.busySince, now),
+          })
+        : elapsed(job.since, now),
+    ];
+  };
   const statusLine =
     [
-      status?.searching ? intl.formatMessage(messages.searchingNow) : '',
+      status?.searching
+        ? intl.formatMessage(
+            status.searchJob?.state === 'waiting'
+              ? messages.searchWaiting
+              : messages.searchingNow
+          )
+        : '',
+      ...(status?.searching ? jobNotes(status.searchJob) : []),
       status?.running
         ? status.current
-          ? intl.formatMessage(messages.transcribingEpisode, {
-              season: status.current.seasonNumber,
-              episode: status.current.episodeNumber,
-            })
-          : intl.formatMessage(messages.transcribingNow)
+          ? intl.formatMessage(
+              status.waitingInBazarr
+                ? messages.waitingInBazarrEpisode
+                : messages.transcribingEpisode,
+              {
+                season: status.current.seasonNumber,
+                episode: status.current.episodeNumber,
+              }
+            )
+          : intl.formatMessage(
+              status.waitingInBazarr
+                ? messages.waitingInBazarr
+                : messages.transcribingNow
+            )
         : '',
+      ...(status?.running ? jobNotes(status.transcribeJob) : []),
       status?.running && status.queued
         ? intl.formatMessage(messages.transcribingQueued, {
             count: status.queued,
@@ -439,7 +496,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
   const searchButton = (
     <button
       type="button"
-      className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-md bg-indigo-600 px-3 text-sm font-semibold text-white transition hover:bg-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:opacity-50"
+      className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-md bg-accent px-3 text-sm font-semibold text-on-accent transition hover:bg-accent-hover focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:opacity-50"
       disabled={(kind === 'tv' && missingCount === 0) || searching}
       onClick={() =>
         kind === 'movie'
@@ -456,44 +513,44 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
   );
 
   return (
-    <section className="mt-4 overflow-hidden rounded-lg border border-gray-700 bg-gray-900 text-sm text-gray-300 shadow">
+    <section className="mt-4 overflow-hidden rounded-lg border border-subtle bg-page text-sm text-default shadow">
       <h2 className="m-0">
         <button
           type="button"
           aria-expanded={open}
           aria-controls={bodyId}
           onClick={() => setOpen(!open)}
-          className="flex min-h-[52px] w-full items-center gap-2.5 px-4 py-2.5 text-left text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500"
+          className="flex min-h-[52px] w-full items-center gap-2.5 px-4 py-2.5 text-left text-strong focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500"
         >
-          <ChatBubbleBottomCenterTextIcon className="h-[18px] w-[18px] flex-none text-indigo-300" />
+          <ChatBubbleBottomCenterTextIcon className="h-[18px] w-[18px] flex-none text-indigo-300 light:text-accent-text" />
           <span className="flex min-w-0 flex-1 flex-col">
             <span className="text-[15px] font-bold">
               {intl.formatMessage(messages.subtitles)}
             </span>
-            <span className="truncate text-xs font-normal text-gray-400">
+            <span className="whitespace-normal break-words text-xs font-normal text-muted">
               {summary}
             </span>
           </span>
           <ChevronDownIcon
             className={
               open
-                ? 'h-[18px] w-[18px] flex-none text-gray-400 transition-transform'
-                : 'h-[18px] w-[18px] flex-none -rotate-90 text-gray-400 transition-transform'
+                ? 'h-[18px] w-[18px] flex-none text-muted transition-transform'
+                : 'h-[18px] w-[18px] flex-none -rotate-90 text-muted transition-transform'
             }
           />
         </button>
       </h2>
 
       {open && current.data && (
-        <div id={bodyId} className="border-t border-gray-700">
+        <div id={bodyId} className="border-t border-subtle">
           {plex.data?.available &&
             (kind === 'movie'
               ? plex.data.options.length > 0
               : (plex.data.languages ?? []).length > 0) && (
-              <div className="flex flex-col gap-1.5 border-b border-gray-700 bg-gray-800 px-4 py-3">
+              <div className="flex flex-col gap-1.5 border-b border-subtle bg-surface px-4 py-3">
                 <label
                   htmlFor={`${bodyId}-default`}
-                  className="text-xs text-gray-400"
+                  className="text-xs text-muted"
                 >
                   {intl.formatMessage(messages.yourDefaultLabel)}
                 </label>
@@ -501,7 +558,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
                   id={`${bodyId}-default`}
                   value={String(plex.data.selected)}
                   onChange={(e) => setPlexDefault(e.target.value)}
-                  className="rounded-md border border-gray-500 bg-gray-700 py-2 text-sm text-white"
+                  className="rounded-md border border-field-border bg-field py-2 text-sm text-strong"
                 >
                   {kind === 'movie' ? (
                     <>
@@ -563,11 +620,11 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
               groups.map((group) => (
                 <li
                   key={group.key}
-                  className="flex items-center gap-2.5 border-b border-gray-700 px-4 py-2.5"
+                  className="flex items-center gap-2.5 border-b border-subtle px-4 py-2.5"
                 >
                   <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                     <div className="flex flex-wrap items-center gap-1.5">
-                      <span className="font-semibold text-white">
+                      <span className="font-semibold text-strong">
                         {group.name}
                       </span>
                       {group.ai ? (
@@ -589,7 +646,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
                         </Pill>
                       )}
                     </div>
-                    <span className="text-xs text-gray-400">
+                    <span className="text-xs text-muted">
                       {intl.formatMessage(
                         group.ai
                           ? messages.episodesWhereAi
@@ -620,7 +677,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
               ))}
             {(movieData?.tracks.length === 0 ||
               (seriesData && episodes.every((e) => e.tracks.length === 0))) && (
-              <li className="border-b border-gray-700 px-4 py-2.5 text-gray-400">
+              <li className="border-b border-subtle px-4 py-2.5 text-muted">
                 {intl.formatMessage(messages.noneOnDisk)}
               </li>
             )}
@@ -629,7 +686,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
           <GroupLabel>{intl.formatMessage(messages.missing)}</GroupLabel>
           <ul>
             {missingCount === 0 && (
-              <li className="flex items-center gap-2 border-b border-gray-700 px-4 py-2.5 text-green-200">
+              <li className="flex items-center gap-2 border-b border-subtle px-4 py-2.5 text-green-200 light:text-success-text">
                 <CheckIcon className="h-4 w-4 flex-none" />
                 {wanted.length
                   ? intl.formatMessage(messages.noneMissing, {
@@ -650,18 +707,18 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
             {movieData?.missing.map((missing) => (
               <li
                 key={`${missing.language}-${missing.hi}-${missing.forced}`}
-                className="flex items-center gap-2.5 border-b border-gray-700 px-4 py-2.5"
+                className="flex items-center gap-2.5 border-b border-subtle px-4 py-2.5"
               >
                 <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                   <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="font-semibold text-white">
+                    <span className="font-semibold text-strong">
                       {missing.name}
                     </span>
                     <Tag tone="missing">
                       {intl.formatMessage(partMessages.missingTag)}
                     </Tag>
                   </div>
-                  <span className="text-xs text-gray-400">
+                  <span className="text-xs text-muted">
                     {intl.formatMessage(messages.profileWants)}
                   </span>
                 </div>
@@ -670,7 +727,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
                     type="button"
                     onClick={searchMissing}
                     disabled={searching}
-                    className="min-h-[40px] flex-none rounded-md bg-indigo-600 px-3 text-sm font-semibold text-white hover:bg-indigo-500 disabled:opacity-50"
+                    className="min-h-[40px] flex-none rounded-md bg-accent px-3 text-sm font-semibold text-on-accent hover:bg-accent-hover disabled:opacity-50"
                   >
                     {intl.formatMessage(messages.search)}
                   </button>
@@ -681,18 +738,18 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
               groupMissing(episodes).map((group) => (
                 <li
                   key={group.language}
-                  className="flex items-center gap-2.5 border-b border-gray-700 px-4 py-2.5"
+                  className="flex items-center gap-2.5 border-b border-subtle px-4 py-2.5"
                 >
                   <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                     <div className="flex flex-wrap items-center gap-1.5">
-                      <span className="font-semibold text-white">
+                      <span className="font-semibold text-strong">
                         {group.name}
                       </span>
                       <Tag tone="missing">
                         {intl.formatMessage(partMessages.missingTag)}
                       </Tag>
                     </div>
-                    <span className="text-xs text-gray-400">
+                    <span className="text-xs text-muted">
                       {intl.formatMessage(messages.episodesWhere, {
                         count: group.episodes.length,
                         where: describeWhere(
@@ -707,7 +764,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
                       type="button"
                       onClick={searchMissing}
                       disabled={searching}
-                      className="min-h-[40px] flex-none rounded-md bg-indigo-600 px-3 text-sm font-semibold text-white hover:bg-indigo-500 disabled:opacity-50"
+                      className="min-h-[40px] flex-none rounded-md bg-accent px-3 text-sm font-semibold text-on-accent hover:bg-accent-hover disabled:opacity-50"
                     >
                       {intl.formatMessage(messages.search)}
                     </button>
@@ -737,7 +794,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
                         ? transcribeMovie()
                         : setTranscribing(true)
                     }
-                    className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-md border border-indigo-500 bg-indigo-500/10 px-3 text-sm font-semibold text-indigo-200 transition hover:bg-indigo-500/20 focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:opacity-50"
+                    className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-md border border-indigo-500 bg-indigo-500/10 px-3 text-sm font-semibold text-indigo-200 transition hover:bg-indigo-500/20 focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:opacity-50 light:text-accent-text"
                   >
                     <SpeakerWaveIcon className="h-[18px] w-[18px]" />
                     {intl.formatMessage(messages.transcribe)}
@@ -749,7 +806,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
               rights.manage &&
               !!status?.failed &&
               status.error && (
-                <span className="text-xs text-yellow-300">
+                <span className="text-xs text-yellow-300 light:text-warning-text">
                   {intl.formatMessage(messages.transcribeFailed, {
                     count: status.failed,
                     reason: describe(status.error),
@@ -757,11 +814,13 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
                 </span>
               )}
             {statusLine ? (
-              <span className="text-xs text-indigo-200">{statusLine}</span>
+              <span className="text-xs text-indigo-200 light:text-accent-text">
+                {statusLine}
+              </span>
             ) : (
               rights.manage &&
               canTranscribe && (
-                <span className="text-xs text-gray-400">
+                <span className="text-xs text-muted">
                   {movieData
                     ? intl.formatMessage(messages.aboutTranscribe)
                     : intl.formatMessage(messages.aboutTranscribeSeries, {
@@ -772,7 +831,7 @@ const SubtitlesCard = ({ kind, tmdbId, title }: SubtitlesCardProps) => {
               )
             )}
             {current.data.profile && (
-              <span className="text-xs text-gray-400">
+              <span className="text-xs text-muted">
                 {intl.formatMessage(messages.profile, {
                   profile: current.data.profile,
                 })}

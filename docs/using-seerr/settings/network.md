@@ -6,7 +6,7 @@ sidebar_position: 7
 
 # Network
 
-Network-related settings are available in the **Network** tab under **Settings**. These options control how Seerr communicates with external services
+Network-related settings are available in the **Network** tab under **Settings**. These options control how Seerr communicates with external services. Every change on this page applies as soon as you save, with no restart.
 
 ## DNS Caching
 
@@ -23,11 +23,11 @@ You can enable the DNS caching settings in the Network tab of the Seerr settings
 
 Sometimes there are configuration issues with IPv6 that prevent the hostname resolution from working correctly.
 
-You can force resolution to prefer IPv4 by going to `Settings > Network`, enabling `Force IPv4 Resolution First`, and then restarting Seerr.
+You can force resolution to prefer IPv4 by going to `Settings > Network`, and enabling `Force IPv4 Resolution First`.
 
 ## HTTP(S) Proxy
 
-If you can't change your DNS servers or force IPV4 resolution, you can use Seerr through a proxy.
+If you can't change your DNS servers or force IPV4 resolution, you can use Seerr through a proxy. It carries all of Seerr AI's outgoing HTTP and HTTPS requests; it doesn't set up HTTPS, SSL or certificates for Seerr AI itself.
 
 In some places (like China), the ISP blocks not only the DNS resolution but also the connection to the TMDB API.
 
@@ -35,26 +35,36 @@ In some places (like China), the ISP blocks not only the DNS resolution but also
 
 If you have Seerr behind a reverse proxy, enable this setting to allow Seerr to correctly register client IP addresses. For details, please see the [Express Documentation](https://expressjs.com/en/guide/behind-proxies.html).
 
+Seerr AI only takes the address from a proxy it trusts. Always trusted is the proxy that connects to Seerr AI from the same machine, your local network or Tailscale (loopback, link-local and private addresses such as `10.x.x.x`, `172.16.x.x`–`172.31.x.x`, `192.168.x.x` and `fc00::/7`, and `100.64.0.0/10`, where Tailscale and carrier-grade NAT give out addresses and which nobody on the internet can connect from), which is where a reverse proxy (Nginx, Caddy or Traefik in Docker, say) or a Docker network sits. The address used is the last one a trusted proxy added, so nobody can choose their own by sending a made-up `X-Forwarded-For` header: the sign-in attempt limits count by address. That includes visitors on your local network or Tailscale: an address on them that your reverse proxy passes on is taken as the visitor's own, not as another proxy.
+
+If one local proxy sits behind another (Traefik behind a Cloudflare Tunnel container, say), list the address or range of the one further out under **Also Trust These Proxies**; otherwise Seerr AI sees that proxy's address for everyone. Each account's failed sign-ins and reset emails are also limited across all addresses together (50 in 15 minutes).
+
+A proxy on a public address in front of your reverse proxy is only trusted if you say so, under the switch:
+
+- **Cloudflare Tunnel** needs nothing: the tunnel connects from your own machine or network.
+- **Cloudflare's proxy** (the orange cloud in front of your reverse proxy): tick **Trust Cloudflare**. Seerr AI then trusts [Cloudflare's published addresses](https://cloudflare.com/ips).
+- **Any other proxy on a public address**, such as a reverse proxy on a rented server: list its address or range (`203.0.113.5`, `203.0.113.0/24`, `2001:db8::/32`) under **Also Trust These Proxies**, separated by commas or spaces.
+
+Without that, Seerr AI sees the public proxy's address for everyone. Having your local reverse proxy put the visitor's real address in `X-Forwarded-For` still works too (in Nginx, the `real_ip` module with the public proxy's addresses as `set_real_ip_from`).
+
+Changes to these apply as soon as you save.
+
 This setting is **disabled** by default.
 
 ## Enable CSRF Protection
 
-:::warning
-**This is an advanced setting.** Please only enable this setting if you are familiar with CSRF protection and how it works.
-:::
+CSRF stands for [cross-site request forgery](https://en.wikipedia.org/wiki/Cross-site_request_forgery). With this on, every change made from a browser must carry a token Seerr AI gave that browser, so another website can't make your signed-in browser change things.
 
-CSRF stands for [cross-site request forgery](https://en.wikipedia.org/wiki/Cross-site_request_forgery). When this setting is enabled, all external API access that alters Seerr application data is blocked.
+Apps and scripts that use an API key (the server's, or a [personal one](../../seerr-ai/account.md#api-keys)) in the `X-Api-Key` header are not affected: they never use the browser's sign-in, so they need no token and can still make changes. A wrong key is always refused. An app that signs in like a browser and keeps the session cookie instead needs that token for every change, so with this on, set such apps up with an API key.
 
-If you do not use Seerr integrations with third-party applications to add/modify/delete requests or users, you can consider enabling this setting to protect against malicious attacks.
+It works over HTTPS and over plain _HTTP_ (including an IP address and port).
 
-One caveat, however, is that HTTPS is required, meaning that once this setting is enabled, you will no longer be able to access your Seerr instance over _HTTP_ (including using an IP address and port number).
+It applies as soon as you save. Pages already open get a token on their next change. If you turn it on and can't get in, turn it off again by setting `csrfProtection` to `false` under `network` in `settings.json` in `/app/config`, and restart.
 
-If you enable this setting and find yourself unable to access Seerr, you can disable the setting by modifying `settings.json` in `/app/config`.
-
-This setting is **disabled** by default.
+This setting is **enabled** by default on new installs. An existing install keeps the setting it had.
 
 ## API Request Timeout
 
-The API Request Timeout setting defines the maximum time (in seconds) Seerr will wait for a response from external services, such as Radarr or Sonarr. The default value is 10 seconds, though it can be entirely disabled by setting it to 0. Please note that any changes to this value require restarting Seerr to take effect.
+The API Request Timeout setting defines the maximum time (in seconds) Seerr will wait for a response from external services, such as Radarr or Sonarr. The default value is 10 seconds, though it can be entirely disabled by setting it to 0.
 
 Enforcing a timeout ensures the Seerr interface remains responsive and prevents infinite loading states when a connected service unexpectedly goes offline. Conversely, you may want to increase this value if you frequently experience failed requests due to your external services being slow to respond, which often happens when they are under heavy load or querying network-mounted storage.

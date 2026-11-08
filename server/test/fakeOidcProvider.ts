@@ -1,0 +1,310 @@
+import {
+  createHash,
+  createHmac,
+  generateKeyPairSync,
+  randomBytes,
+  sign,
+  type KeyObject,
+} from 'node:crypto';
+import http from 'node:http';
+
+// A local OpenID Connect provider for tests, standing in for Authentik,
+// Keycloak and the like: discovery, an authorization endpoint signing in
+// whoever the test picks, a token endpoint checking the client secret and PKCE
+// verifier, ID tokens signed with a test key (published as JWKS), and userinfo.
+// Seerr reaches it over real HTTP with the real openid-client.
+
+export interface FakeOidcAccount {
+  sub: string;
+  email?: string;
+  email_verified?: boolean;
+  name?: string;
+  preferred_username?: string;
+}
+
+export interface FakeOidcProvider {
+  /** http://127.0.0.1:<port>/realms/test, once started. */
+  issuer: string;
+  clientId: string;
+  clientSecret: string;
+  /** Discovery document fetch count. */
+  discoveryCalls: number;
+  /** Every token request, as received. */
+  tokenRequests: URLSearchParams[];
+  /** While set, discovery returns a server error. */
+  down: boolean;
+  /**
+   * The issuer that discovery and ID tokens report, when not `issuer`: with a
+   * trailing slash (as Authentik's has) or another address.
+   */
+  issuerSaid?: string;
+  /** Put the account's claims only in userinfo, not the ID token. */
+  claimsInUserinfoOnly: boolean;
+  /** Extra ID token claims, as a provider's mappers would add. */
+  idTokenClaims: Record<string, unknown>;
+  /** Extra claims for userinfo only. */
+  userinfoClaims: Record<string, unknown>;
+  /** While set, userinfo returns a server error. */
+  userinfoDown: boolean;
+  /**
+   * How ID tokens are signed: RS256 (default) or ES256 with a published key,
+   * HS256 with the client secret, or forged (RS256 with an unpublished key
+   * under the published key's id).
+   */
+  signing: 'RS256' | 'ES256' | 'HS256' | 'forged';
+  start: () => Promise<void>;
+  stop: () => Promise<void>;
+  reset: () => void;
+  /**
+   * Simulates the browser visiting Seerr's authorization URL and signing in as
+   * `account`; returns the redirect back (the callback, with code and state).
+   * `nonce` overrides the ID token's nonce; `state` overrides the returned
+   * state.
+   */
+  authorize: (
+    authorizationUrl: string,
+    account: FakeOidcAccount,
+    tamper?: { nonce?: string; state?: string }
+  ) => Promise<URL>;
+}
+
+interface IssuedCode {
+  account: FakeOidcAccount;
+  nonce?: string;
+  challenge: string;
+  redirectUri: string;
+}
+
+const base64url = (data: Buffer | string) =>
+  Buffer.from(data).toString('base64url');
+
+const signJwt = (
+  alg: 'RS256' | 'ES256' | 'HS256',
+  key: KeyObject | string,
+  kid: string | undefined,
+  claims: Record<string, unknown>
+): string => {
+  const header = base64url(JSON.stringify({ alg, typ: 'JWT', kid }));
+  const payload = base64url(JSON.stringify(claims));
+  const data = Buffer.from(`${header}.${payload}`);
+  const signature =
+    typeof key === 'string'
+      ? createHmac('sha256', key).update(data).digest()
+      : sign(
+          'sha256',
+          data,
+          alg === 'ES256' ? { key, dsaEncoding: 'ieee-p1363' } : key
+        );
+  return `${header}.${payload}.${signature.toString('base64url')}`;
+};
+
+const readBody = (req: http.IncomingMessage): Promise<string> =>
+  new Promise((resolve) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', () => resolve(body));
+  });
+
+export const createFakeOidcProvider = (): FakeOidcProvider => {
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+  });
+  const kid = 'test-key';
+  const ec = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const ecKid = 'test-ec-key';
+  const unpublished = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const codes = new Map<string, IssuedCode>();
+  const accessTokens = new Map<string, FakeOidcAccount>();
+  let port = 0;
+
+  const fake: FakeOidcProvider = {
+    issuer: '',
+    clientId: 'seerr-client',
+    clientSecret: 'seerr-client-secret',
+    discoveryCalls: 0,
+    tokenRequests: [],
+    down: false,
+    claimsInUserinfoOnly: false,
+    idTokenClaims: {},
+    userinfoClaims: {},
+    userinfoDown: false,
+    signing: 'RS256',
+    start: () =>
+      new Promise((resolve) => {
+        server.listen(0, '127.0.0.1', () => {
+          port = (server.address() as { port: number }).port;
+          fake.issuer = `http://127.0.0.1:${port}/realms/test`;
+          resolve();
+        });
+      }),
+    stop: () =>
+      new Promise((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+    reset: () => {
+      codes.clear();
+      accessTokens.clear();
+      fake.discoveryCalls = 0;
+      fake.tokenRequests = [];
+      fake.down = false;
+      fake.issuerSaid = undefined;
+      fake.claimsInUserinfoOnly = false;
+      fake.idTokenClaims = {};
+      fake.userinfoClaims = {};
+      fake.userinfoDown = false;
+      fake.signing = 'RS256';
+    },
+    authorize: async (authorizationUrl, account, tamper = {}) => {
+      const url = new URL(authorizationUrl);
+      const params = url.searchParams;
+      if (
+        url.origin + url.pathname !== `${fake.issuer}/authorize` ||
+        params.get('client_id') !== fake.clientId ||
+        params.get('response_type') !== 'code' ||
+        params.get('code_challenge_method') !== 'S256' ||
+        !params.get('code_challenge') ||
+        !params.get('redirect_uri')
+      ) {
+        throw new Error(`Not an authorization request: ${authorizationUrl}`);
+      }
+      const code = randomBytes(16).toString('hex');
+      codes.set(code, {
+        account,
+        nonce: tamper.nonce ?? params.get('nonce') ?? undefined,
+        challenge: params.get('code_challenge') as string,
+        redirectUri: params.get('redirect_uri') as string,
+      });
+      const back = new URL(params.get('redirect_uri') as string);
+      back.searchParams.set('code', code);
+      back.searchParams.set('state', tamper.state ?? params.get('state') ?? '');
+      // Keycloak sends this too; Seerr ignores it.
+      back.searchParams.set('session_state', 'abc');
+      return back;
+    },
+  };
+
+  const claimsOf = (account: FakeOidcAccount) => {
+    const { sub, ...rest } = account;
+    return { sub, ...rest };
+  };
+
+  const json = (res: http.ServerResponse, status: number, body: unknown) => {
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
+    // Everything lives under the realm, as with Keycloak (or the application,
+    // with Authentik): nothing answers at the host root.
+    const path = url.pathname.startsWith('/realms/test/')
+      ? url.pathname.slice('/realms/test'.length)
+      : '';
+
+    if (path === '/.well-known/openid-configuration') {
+      fake.discoveryCalls += 1;
+      if (fake.down) {
+        return json(res, 500, { error: 'down' });
+      }
+      return json(res, 200, {
+        issuer: fake.issuerSaid ?? fake.issuer,
+        authorization_endpoint: `${fake.issuer}/authorize`,
+        token_endpoint: `${fake.issuer}/token`,
+        userinfo_endpoint: `${fake.issuer}/userinfo`,
+        jwks_uri: `${fake.issuer}/jwks`,
+        response_types_supported: ['code'],
+        subject_types_supported: ['public'],
+        id_token_signing_alg_values_supported: ['RS256', 'ES256', 'HS256'],
+        code_challenge_methods_supported: ['S256'],
+        token_endpoint_auth_methods_supported: [
+          'client_secret_basic',
+          'client_secret_post',
+        ],
+        scopes_supported: ['openid', 'profile', 'email'],
+      });
+    }
+
+    if (path === '/jwks') {
+      return json(res, 200, {
+        keys: [
+          { ...publicKey.export({ format: 'jwk' }), kid, alg: 'RS256' },
+          { ...ec.publicKey.export({ format: 'jwk' }), kid: ecKid, use: 'sig' },
+        ],
+      });
+    }
+
+    if (path === '/token' && req.method === 'POST') {
+      const body = new URLSearchParams(await readBody(req));
+      fake.tokenRequests.push(body);
+      const basic = req.headers.authorization?.startsWith('Basic ')
+        ? Buffer.from(req.headers.authorization.slice(6), 'base64')
+            .toString()
+            .split(':')
+            .map(decodeURIComponent)
+        : undefined;
+      const [clientId, secret] = basic ?? [
+        body.get('client_id'),
+        body.get('client_secret'),
+      ];
+      if (clientId !== fake.clientId || secret !== fake.clientSecret) {
+        return json(res, 401, { error: 'invalid_client' });
+      }
+      const issued = codes.get(body.get('code') ?? '');
+      codes.delete(body.get('code') ?? '');
+      const verifier = body.get('code_verifier') ?? '';
+      if (
+        !issued ||
+        body.get('grant_type') !== 'authorization_code' ||
+        body.get('redirect_uri') !== issued.redirectUri ||
+        createHash('sha256').update(verifier).digest('base64url') !==
+          issued.challenge
+      ) {
+        return json(res, 400, { error: 'invalid_grant' });
+      }
+      const now = Math.floor(Date.now() / 1000);
+      const accessToken = randomBytes(16).toString('hex');
+      accessTokens.set(accessToken, issued.account);
+      const signer = {
+        RS256: ['RS256', privateKey, kid],
+        ES256: ['ES256', ec.privateKey, ecKid],
+        HS256: ['HS256', fake.clientSecret, undefined],
+        forged: ['RS256', unpublished.privateKey, kid],
+      } as const;
+      const [alg, key, keyId] = signer[fake.signing];
+      const idToken = signJwt(alg, key, keyId, {
+        iss: fake.issuerSaid ?? fake.issuer,
+        aud: fake.clientId,
+        iat: now,
+        exp: now + 300,
+        ...(issued.nonce ? { nonce: issued.nonce } : {}),
+        ...fake.idTokenClaims,
+        ...(fake.claimsInUserinfoOnly
+          ? { sub: issued.account.sub }
+          : claimsOf(issued.account)),
+      });
+      return json(res, 200, {
+        access_token: accessToken,
+        token_type: 'Bearer',
+        expires_in: 300,
+        id_token: idToken,
+      });
+    }
+
+    if (path === '/userinfo') {
+      const token = req.headers.authorization?.replace(/^Bearer /, '') ?? '';
+      const account = accessTokens.get(token);
+      if (!account) {
+        return json(res, 401, { error: 'invalid_token' });
+      }
+      if (fake.userinfoDown) {
+        return json(res, 500, { error: 'down' });
+      }
+      return json(res, 200, { ...claimsOf(account), ...fake.userinfoClaims });
+    }
+
+    json(res, 404, { error: 'not_found' });
+  });
+
+  return fake;
+};

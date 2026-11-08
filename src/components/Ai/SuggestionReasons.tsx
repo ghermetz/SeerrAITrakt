@@ -21,8 +21,8 @@ interface Reason {
 }
 
 /**
- * Why each of the first page of suggestions was suggested, one line each,
- * from what this person has been watching.
+ * One-line reason, from the user's watch history, for each first-page
+ * suggestion.
  */
 const SuggestionReasons = ({
   titles,
@@ -83,7 +83,7 @@ const SuggestionReasons = ({
                 <li key={`${reason.mediaType}-${reason.tmdbId}`}>
                   <Link
                     href={`/${reason.mediaType}/${reason.tmdbId}`}
-                    className="font-semibold text-white hover:underline"
+                    className="font-semibold text-strong hover:underline"
                   >
                     {title.mediaType === 'movie' ? title.title : title.name}
                   </Link>

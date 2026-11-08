@@ -4,7 +4,8 @@ import {
   MediaStatus,
   MediaType,
 } from '@server/constants/media';
-import { getRepository } from '@server/datasource';
+import dataSource, { getRepository } from '@server/datasource';
+import AlbumRequest from '@server/entity/AlbumRequest';
 import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { User } from '@server/entity/User';
@@ -36,10 +37,7 @@ const stubTmdb = () => {
   });
 };
 
-/**
- * `requestCount` is shown on the profile and in the user list. It used to come
- * from a `@RelationCount` decorator; these cover the explicit replacement.
- */
+/** `requestCount` is shown on the profile and in the user list. */
 describe('user request counts', () => {
   setupTestDb();
 
@@ -97,12 +95,43 @@ describe('user request counts', () => {
     assert.equal(two.requestCount, 1);
   });
 
+  it('counts music requests too, once each however many albums', async () => {
+    const user = await makeUser('count-music');
+    await addRequest(user);
+    const artist = await dataSource.manager.save(
+      new Media({
+        tmdbId: 0,
+        mediaType: MediaType.MUSIC,
+        foreignId: '3c9e5f21-8d47-4b6a-a1e3-5f7d2c90b844',
+        status: MediaStatus.PENDING,
+      }),
+      { listeners: false }
+    );
+    await dataSource.manager.save(
+      new MediaRequest({
+        media: artist,
+        requestedBy: user,
+        type: MediaType.MUSIC,
+        status: MediaRequestStatus.PENDING,
+        is4k: false,
+        albums: ['Static Garden', 'Fog B'].map(
+          (title, i) => new AlbumRequest({ albumMbid: `album-${i}`, title })
+        ),
+      }),
+      { listeners: false }
+    );
+
+    await attachRequestCount(user);
+
+    assert.equal(user.requestCount, 2);
+  });
+
   it('reports zero for a user with no requests', async () => {
     const user = await makeUser('count-none');
 
     await attachRequestCount(user);
 
-    // Must be 0, not undefined — the profile formats this as a number.
+    // Must be 0, not undefined: the profile formats it as a number.
     assert.equal(user.requestCount, 0);
   });
 

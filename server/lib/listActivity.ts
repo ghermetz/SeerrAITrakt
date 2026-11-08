@@ -3,6 +3,7 @@ import { getRepository } from '@server/datasource';
 import type { MediaList, MediaListItem } from '@server/entity/MediaList';
 import { MediaListMember } from '@server/entity/MediaList';
 import type { User } from '@server/entity/User';
+import { listTitle } from '@server/lib/listTitles';
 import notificationManager, { Notification } from '@server/lib/notifications';
 import logger from '@server/logger';
 
@@ -15,10 +16,39 @@ const VERBS: Record<ListActivity, string> = {
 };
 
 /**
- * Tells everyone who shares a list that its contents changed.
- *
- * A list with no members is private to its owner, so nothing is sent. The
- * person who made the change never hears about their own action.
+ * The actor's name. displayName is populated when a user is loaded from the
+ * database; the fallbacks avoid "undefined added ...".
+ */
+const nameOf = (actor: User): string =>
+  actor.displayName || actor.plexUsername || actor.username || 'Someone';
+
+/** Everyone who sees a list, except the actor. */
+const recipientsOf = async (list: MediaList, actor: User): Promise<User[]> => {
+  const members = await getRepository(MediaListMember).find({
+    where: { listId: list.id },
+    relations: { user: true },
+  });
+  const recipients: User[] = [];
+
+  if (list.owner && list.owner.id !== actor.id) {
+    recipients.push(list.owner);
+  }
+  for (const member of members) {
+    if (member.user && member.user.id !== actor.id) {
+      recipients.push(member.user);
+    }
+  }
+
+  return recipients;
+};
+
+const posterUrl = (path?: string | null) =>
+  path ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${path}` : undefined;
+
+/**
+ * Tells everyone sharing a list that its contents changed. A list with no
+ * members is private, so nothing is sent; the actor never hears of their own
+ * change.
  */
 export const notifyListActivity = async (
   list: MediaList,
@@ -27,52 +57,20 @@ export const notifyListActivity = async (
   actor: User
 ): Promise<void> => {
   try {
-    const members = await getRepository(MediaListMember).find({
-      where: { listId: list.id },
-      relations: { user: true },
-    });
-
-    // Everyone with visibility: the owner plus every member, minus whoever
-    // performed the action.
-    const recipients: User[] = [];
-
-    if (list.owner && list.owner.id !== actor.id) {
-      recipients.push(list.owner);
-    }
-
-    for (const member of members) {
-      if (member.user && member.user.id !== actor.id) {
-        recipients.push(member.user);
-      }
-    }
+    const recipients = await recipientsOf(list, actor);
 
     if (!recipients.length) {
       return;
     }
-
-    // displayName is populated when a user is loaded from the database; fall
-    // back so a notification never reads "undefined added ...".
-    const actorName =
-      actor.displayName || actor.plexUsername || actor.username || 'Someone';
 
     const tmdb = new TheMovieDb();
     let title = `TMDB ${item.tmdbId}`;
     let image: string | undefined;
 
     try {
-      if (item.mediaType === 'movie') {
-        const movie = await tmdb.getMovie({ movieId: item.tmdbId });
-        title = movie.title;
-        image = movie.poster_path
-          ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${movie.poster_path}`
-          : undefined;
-      } else {
-        const tv = await tmdb.getTvShow({ tvId: item.tmdbId });
-        title = tv.name;
-        image = tv.poster_path
-          ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${tv.poster_path}`
-          : undefined;
-      }
+      const found = await listTitle(tmdb, item.tmdbId, item.mediaType);
+      title = found.title;
+      image = posterUrl(found.posterPath);
     } catch {
       // A title without metadata is still worth announcing.
     }
@@ -84,7 +82,7 @@ export const notifyListActivity = async (
         notifySystem: false,
         notifyUser: recipient,
         subject: list.name,
-        message: `${actorName} ${VERBS[activity]} ${title}.`,
+        message: `${nameOf(actor)} ${VERBS[activity]} ${title}.`,
         image,
       });
     }
@@ -98,12 +96,54 @@ export const notifyListActivity = async (
 };
 
 /**
- * Tells someone a list has been shared with them.
+ * Tells everyone sharing a list that several titles were added at once (an
+ * import or collection), in one notice instead of one each.
+ */
+export const notifyListAdded = async (
+  list: MediaList,
+  items: Pick<MediaListItem, 'tmdbId' | 'mediaType' | 'posterPath'>[],
+  actor: User
+): Promise<void> => {
+  if (items.length <= 1) {
+    if (items.length) {
+      await notifyListActivity(list, items[0], 'added', actor);
+    }
+    return;
+  }
+
+  try {
+    const recipients = await recipientsOf(list, actor);
+    const what = items.every((item) => item.mediaType === 'movie')
+      ? 'films'
+      : 'titles';
+    const image = posterUrl(items.find((item) => item.posterPath)?.posterPath);
+
+    for (const recipient of recipients) {
+      notificationManager.sendNotification(Notification.LIST_ACTIVITY, {
+        event: list.name,
+        notifyAdmin: false,
+        notifySystem: false,
+        notifyUser: recipient,
+        subject: list.name,
+        message: `${nameOf(actor)} added ${items.length} ${what}.`,
+        image,
+      });
+    }
+  } catch (e) {
+    logger.error('Failed to send list activity notification', {
+      label: 'Notifications',
+      listId: list.id,
+      errorMessage: e instanceof Error ? e.message : String(e),
+    });
+  }
+};
+
+/**
+ * Tells users a list was shared with them.
  *
- * Only newly added members are told — re-saving the sharing dialog should not
- * notify people who were already on the list. Uses the same notification type
- * as other list activity, so a user who has turned that off is not notified
- * here either.
+ * Only newly added members are told, so re-saving the sharing dialog doesn't
+ * re-notify existing members. Uses the same notification type as other list
+ * activity, so users who turned that off aren't notified here either.
  */
 export const notifyListShared = async (
   list: MediaList,
@@ -116,9 +156,6 @@ export const notifyListShared = async (
     return;
   }
 
-  const actorName =
-    actor.displayName || actor.plexUsername || actor.username || 'Someone';
-
   try {
     for (const recipient of recipients) {
       notificationManager.sendNotification(Notification.LIST_ACTIVITY, {
@@ -127,7 +164,7 @@ export const notifyListShared = async (
         notifySystem: false,
         notifyUser: recipient,
         subject: list.name,
-        message: `${actorName} shared the list "${list.name}" with you.`,
+        message: `${nameOf(actor)} shared the list "${list.name}" with you.`,
       });
     }
   } catch (e) {

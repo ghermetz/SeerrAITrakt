@@ -11,28 +11,42 @@ import type {
   TmdbTvDetails,
   TmdbTvScanDetails,
 } from '@server/api/themoviedb/interfaces';
-import { MediaServerType } from '@server/constants/server';
-import { getRepository } from '@server/datasource';
-import { User } from '@server/entity/User';
+import type { JellyfinFamilyKind } from '@server/constants/server';
+import { detectAnime } from '@server/lib/animeDecision';
+import type { SeenQuality } from '@server/lib/mediaQuality';
+import {
+  combineQuality,
+  jellyfinSourceQuality,
+} from '@server/lib/mediaQuality';
+import {
+  hostnameFor,
+  isConnected,
+  jellyfinAdmin,
+  jellyfinFamily,
+  serverName,
+} from '@server/lib/mediaServers';
 import type {
   ProcessableSeason,
   RunnableScanner,
   StatusBase,
 } from '@server/lib/scanners/baseScanner';
 import BaseScanner from '@server/lib/scanners/baseScanner';
+import { LibraryItems } from '@server/lib/scanners/libraryItems';
+import type { ItemLabel } from '@server/lib/scanners/unidentified';
+import {
+  NotIdentifiedError,
+  UnidentifiedTitles,
+  nameOf,
+} from '@server/lib/scanners/unidentified';
 import type { Library } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
-import { getHostname } from '@server/utils/getHostname';
-import { isAnime } from '@server/utils/isAnime';
 import { uniqWith } from 'lodash';
 
 /**
- * Whether the server has not read an item's file yet: Jellyfin and Emby list
- * a file before they probe it, and until then it has no media sources, or
- * sources without a video stream. Such an item counts as standard quality
- * until its resolution is known. If it then turns out to be 4K, the next
- * scan adds it as 4K too; the standard status it was given is not taken
- * back.
+ * Whether the server hasn't probed an item's file yet: Jellyfin and Emby
+ * list a file before probing it, so it has no media sources or no video
+ * stream. Such an item counts as standard quality; if it turns out to be
+ * 4K, the next scan adds 4K too without revoking the standard status.
  */
 const resolutionUnknown = (item: {
   MediaSources?: JellyfinMediaSource[];
@@ -42,6 +56,52 @@ const resolutionUnknown = (item: {
       (MediaStream) => MediaStream.Type === 'Video'
     )
   );
+
+/** Whether a version is 4K by Seerr's rule: wider than 2000 pixels. */
+const is4kSource = (source: JellyfinMediaSource): boolean =>
+  source.MediaStreams?.some(
+    (stream) => stream.Type === 'Video' && (stream.Width ?? 0) > 2000
+  ) ?? false;
+
+/** What an item's versions are in, on the side they count for. */
+const qualityOfSources = (
+  sources: JellyfinMediaSource[] | undefined,
+  is4k: boolean,
+  split4k: boolean
+): SeenQuality | undefined =>
+  combineQuality(
+    (sources ?? [])
+      .filter((source) => !split4k || is4kSource(source) === is4k)
+      .map(jellyfinSourceQuality)
+  );
+
+/** Episodes a file covers (IndexNumber..IndexNumberEnd for multi-episode). */
+const episodeCountOf = (episode: {
+  IndexNumber?: number;
+  IndexNumberEnd?: number;
+}): number =>
+  episode.IndexNumber !== undefined && episode.IndexNumberEnd !== undefined
+    ? episode.IndexNumberEnd - episode.IndexNumber + 1
+    : 1;
+
+/**
+ * An item as the log names it; never the server's whole record. An episode
+ * or season (from a recently added scan) is named by its series, whose id
+ * the scan uses.
+ */
+const labelOf = (item: JellyfinLibraryItem): ItemLabel =>
+  item.SeriesName && (item.Type === 'Episode' || item.Type === 'Season')
+    ? { name: item.SeriesName, type: 'Series', id: item.SeriesId ?? item.Id }
+    : {
+        name: item.Name,
+        ...(item.ProductionYear ? { year: item.ProductionYear } : {}),
+        type: item.Type,
+        id: item.Id,
+      };
+
+/** Whether the server has given the title any matchable id. */
+const hasAnyId = (ids: JellyfinLibraryItemExtended['ProviderIds']): boolean =>
+  !!(ids.Tmdb || ids.TheMovieDb || ids.Imdb || ids.Tvdb || ids.AniDB);
 
 interface JellyfinSyncStatus extends StatusBase {
   currentLibrary: Library;
@@ -57,10 +117,44 @@ class JellyfinScanner
   private currentLibrary: Library;
   private isRecentOnly = false;
   private processedAnidbSeason: Map<number, Map<number, number>>;
+  /** The server this scanner reads: Jellyfin or Emby. */
+  public readonly kind: JellyfinFamilyKind;
+  /** Titles this scan skipped because the server hasn't identified them. */
+  private unidentified: UnidentifiedTitles;
+  /** Titles in the current library that failed for a real reason. */
+  private failures = 0;
 
-  constructor({ isRecentOnly }: { isRecentOnly?: boolean } = {}) {
-    super('Jellyfin Sync');
+  constructor({
+    isRecentOnly,
+    kind = 'jellyfin',
+  }: { isRecentOnly?: boolean; kind?: JellyfinFamilyKind } = {}) {
+    super(`${serverName(kind)} Sync`);
     this.isRecentOnly = isRecentOnly ?? false;
+    this.kind = kind;
+    this.libraryItems = new LibraryItems(kind);
+    this.unidentified = new UnidentifiedTitles({
+      server: serverName(kind),
+      verb: 'identified',
+      hint: "refresh the library's metadata, or use Identify on a title",
+    });
+  }
+
+  /** Logs and counts a title the server hasn't identified yet; not an error. */
+  private skipUnidentified(e: NotIdentifiedError) {
+    this.log(this.unidentified.add(e.kind, e.item), 'debug', {
+      item: e.item,
+    });
+  }
+
+  /** Logs one line naming a title that failed for a real reason. */
+  private failed(item: JellyfinLibraryItem, e: Error) {
+    this.failures += 1;
+    const label = labelOf(item);
+    this.log(
+      `Failed to process ${serverName(this.kind)} item ${nameOf(label)}`,
+      'error',
+      { errorMessage: e.message, item: label }
+    );
   }
 
   private async extractMovieIds(jellyfinitem: JellyfinLibraryItem): Promise<{
@@ -72,7 +166,7 @@ class JellyfinScanner
 
     if (!metadata?.Id) {
       this.log('No Id metadata for this title. Skipping', 'debug', {
-        jellyfinItemId: jellyfinitem.Id,
+        item: labelOf(jellyfinitem),
       });
       return null;
     }
@@ -83,7 +177,7 @@ class JellyfinScanner
     );
     let imdbId = metadata.ProviderIds.Imdb;
 
-    // We use anidb only if we have the anidbId and nothing else
+    // Use AniDB only when it's the sole id.
     if (anidbId && !imdbId && !tmdbId) {
       const result = animeList.getFromAnidbId(anidbId);
       tmdbId = Number(result?.tmdbId ?? null);
@@ -97,12 +191,18 @@ class JellyfinScanner
     }
 
     if (!tmdbId) {
+      // No id at all means not identified yet, which is normal for new
+      // files. An AniDB id missing from the anime list is a real gap and
+      // stays an error.
+      if (!hasAnyId(metadata.ProviderIds)) {
+        throw new NotIdentifiedError('film', labelOf(metadata));
+      }
       throw new Error('Unable to find TMDb ID');
     }
 
-    // With AniDB we can have mixed libraries with movies in a "show" library
-    // We take the first episode of the first season (the movie) and use it to
-    // get more information, like the MediaSource
+    // AniDB libraries can mix movies into a "show" library. The first
+    // episode of the first season is the movie; use it for details such as
+    // the MediaSource.
     if (anidbId && metadata.Type === 'Series') {
       const season = (await this.jfClient.getSeasons(jellyfinitem.Id)).find(
         (md) => {
@@ -111,7 +211,7 @@ class JellyfinScanner
       );
       if (!season) {
         this.log('No season found for anidb movie', 'debug', {
-          jellyfinitem,
+          item: labelOf(jellyfinitem),
         });
         return null;
       }
@@ -121,14 +221,14 @@ class JellyfinScanner
       );
       if (!episodes[0]) {
         this.log('No episode found for anidb movie', 'debug', {
-          jellyfinitem,
+          item: labelOf(jellyfinitem),
         });
         return null;
       }
       metadata = await this.jfClient.getItemData(episodes[0].Id);
       if (!metadata) {
         this.log('No metadata found for anidb movie', 'debug', {
-          jellyfinitem,
+          item: labelOf(jellyfinitem),
         });
         return null;
       }
@@ -172,9 +272,15 @@ class JellyfinScanner
         await this.processMovie(tmdbId, {
           is4k: false,
           mediaAddedAt,
-          jellyfinMediaId: metadata.Id,
+          mediaServer: this.kind,
+          itemId: metadata.Id,
           imdbId,
           title: metadata.Name,
+          quality: qualityOfSources(
+            metadata.MediaSources,
+            false,
+            this.enable4kMovie
+          ),
         });
       }
 
@@ -182,20 +288,19 @@ class JellyfinScanner
         await this.processMovie(tmdbId, {
           is4k: true,
           mediaAddedAt,
-          jellyfinMediaId: metadata.Id,
+          mediaServer: this.kind,
+          itemId: metadata.Id,
           imdbId,
           title: metadata.Name,
+          quality: qualityOfSources(metadata.MediaSources, true, true),
         });
       }
     } catch (e) {
-      this.log(
-        `Failed to process Jellyfin item, id: ${jellyfinitem.Id}`,
-        'error',
-        {
-          errorMessage: e.message,
-          jellyfinitem,
-        }
-      );
+      if (e instanceof NotIdentifiedError) {
+        this.skipUnidentified(e);
+      } else {
+        this.failed(jellyfinitem, e);
+      }
     }
   }
 
@@ -220,7 +325,7 @@ class JellyfinScanner
       throw new Error('No ID provided');
     }
 
-    const metadataProvider = isAnime(tvShow)
+    const metadataProvider = detectAnime(tvShow)
       ? await getMetadataProvider('anime')
       : await getMetadataProvider('tv');
 
@@ -243,9 +348,13 @@ class JellyfinScanner
 
       if (!metadata?.Id) {
         this.log('No Id metadata for this title. Skipping', 'debug', {
-          jellyfinItemId: jellyfinitem.Id,
+          item: labelOf(jellyfinitem),
         });
         return;
+      }
+
+      if (!hasAnyId(metadata.ProviderIds)) {
+        throw new NotIdentifiedError('series', labelOf(metadata));
       }
 
       if (metadata.ProviderIds.Tmdb || metadata.ProviderIds.TheMovieDb) {
@@ -255,10 +364,12 @@ class JellyfinScanner
               metadata.ProviderIds.Tmdb || metadata.ProviderIds.TheMovieDb
             ),
           });
-        } catch {
-          this.log('Unable to find TMDb ID for this title.', 'debug', {
-            jellyfinitem,
-          });
+        } catch (e) {
+          this.log(
+            `Couldn't find ${nameOf(labelOf(metadata))} on TMDB by its TMDB id`,
+            'debug',
+            { item: labelOf(metadata), errorMessage: e.message }
+          );
         }
       }
 
@@ -267,10 +378,12 @@ class JellyfinScanner
           tvShow = await this.getTvShow({
             tvdbId: Number(metadata.ProviderIds.Tvdb),
           });
-        } catch {
-          this.log('Unable to find TVDb ID for this title.', 'debug', {
-            jellyfinitem,
-          });
+        } catch (e) {
+          this.log(
+            `Couldn't find ${nameOf(labelOf(metadata))} on TMDB by its TVDB id`,
+            'debug',
+            { item: labelOf(metadata), errorMessage: e.message }
+          );
         }
       }
 
@@ -284,13 +397,15 @@ class JellyfinScanner
             tvShow = await this.tmdb.getShowByTvdbIdForScan({
               tvdbId: result.tvdbId,
             });
-          } catch {
-            this.log('Unable to find AniDB ID for this title.', 'debug', {
-              jellyfinitem,
-            });
+          } catch (e) {
+            this.log(
+              `Couldn't find ${nameOf(labelOf(metadata))} on TMDB by its AniDB id`,
+              'debug',
+              { item: labelOf(metadata), errorMessage: e.message }
+            );
           }
         }
-        // With AniDB we can have mixed libraries with movies in a "show" library
+        // AniDB libraries can mix movies into a "show" library.
         else if (result?.imdbId || result?.tmdbId) {
           await this.processJellyfinMovie(jellyfinitem);
           return;
@@ -302,6 +417,10 @@ class JellyfinScanner
         const jellyfinSeasons = await this.jfClient.getSeasons(Id);
 
         const processableSeasons: ProcessableSeason[] = [];
+        const seen: Record<'standard' | '4k', (SeenQuality | undefined)[]> = {
+          standard: [],
+          '4k': [],
+        };
 
         const settings = getSettings();
         const filteredSeasons = settings.main.enableSpecialEpisodes
@@ -311,10 +430,10 @@ class JellyfinScanner
         for (const season of filteredSeasons) {
           const matchedJellyfinSeason = jellyfinSeasons.find((md) => {
             if (tvdbSeasonFromAnidb) {
-              // In AniDB we don't have the concept of seasons,
-              // we have multiple shows with only Season 1 (and sometimes a season with index 0 for specials).
-              // We use tvdbSeasonFromAnidb to check if we are on the correct TMDB season and
-              // md.IndexNumber === 1 to be sure to find the correct season on jellyfin
+              // AniDB has no seasons: each is a separate show with only
+              // Season 1 (and sometimes 0 for specials). tvdbSeasonFromAnidb
+              // picks the TMDB season; md.IndexNumber === 1 picks the
+              // Jellyfin season.
               return (
                 tvdbSeasonFromAnidb === season.season_number &&
                 md.IndexNumber === 1
@@ -324,50 +443,35 @@ class JellyfinScanner
             }
           });
 
-          // Check if we found the matching season and it has all the available episodes
           if (matchedJellyfinSeason) {
             let totalStandard = 0;
             let total4k = 0;
 
-            if (!this.enable4kShow) {
-              const episodes = await this.jfClient.getEpisodes(
-                Id,
-                matchedJellyfinSeason.Id
+            // With media info: resolution for 4K, and what each is in.
+            const episodes = await this.jfClient.getEpisodes(
+              Id,
+              matchedJellyfinSeason.Id,
+              { includeMediaInfo: true }
+            );
+
+            for (const episode of episodes) {
+              seen.standard.push(
+                qualityOfSources(episode.MediaSources, false, this.enable4kShow)
               );
+              if (this.enable4kShow) {
+                seen['4k'].push(
+                  qualityOfSources(episode.MediaSources, true, true)
+                );
+              }
+            }
 
+            if (!this.enable4kShow) {
               for (const episode of episodes) {
-                let episodeCount = 1;
-
-                // count number of combined episodes
-                if (
-                  episode.IndexNumber !== undefined &&
-                  episode.IndexNumberEnd !== undefined
-                ) {
-                  episodeCount =
-                    episode.IndexNumberEnd - episode.IndexNumber + 1;
-                }
-
-                totalStandard += episodeCount;
+                totalStandard += episodeCountOf(episode);
               }
             } else {
-              // 4K detection enabled - request media info to check resolution
-              const episodes = await this.jfClient.getEpisodes(
-                Id,
-                matchedJellyfinSeason.Id,
-                { includeMediaInfo: true }
-              );
-
               for (const episode of episodes) {
-                let episodeCount = 1;
-
-                // count number of combined episodes
-                if (
-                  episode.IndexNumber !== undefined &&
-                  episode.IndexNumberEnd !== undefined
-                ) {
-                  episodeCount =
-                    episode.IndexNumberEnd - episode.IndexNumber + 1;
-                }
+                const episodeCount = episodeCountOf(episode);
 
                 const has4k = episode.MediaSources?.some((MediaSource) =>
                   MediaSource.MediaStreams.some(
@@ -387,21 +491,20 @@ class JellyfinScanner
                     )
                   );
 
-                // Count in both if episode has both versions
-                // TODO: Make this more robust in the future
-                // Currently, this detection is based solely on file resolution, not which
-                // Radarr/Sonarr instance the file came from. If a 4K request results in
-                // 1080p files (no 4K release available yet), those files will be counted
-                // as "standard" even though they're in the 4K library. This can cause
-                // non-4K users to see content as "available" when they can't access it.
-                // See issue https://github.com/seerr-team/seerr/issues/1744 for details.
+                // Counts in both if the episode has both versions.
+                // TODO: Detection uses file resolution only, not which
+                // Radarr/Sonarr instance the file came from. 1080p files from
+                // a 4K request (no 4K release yet) count as standard even in
+                // the 4K library, so non-4K users may see content as available
+                // that they can't access.
+                // See https://github.com/seerr-team/seerr/issues/1744.
                 if (hasStandard) totalStandard += episodeCount;
                 if (has4k) total4k += episodeCount;
               }
             }
 
-            // With AniDB we can have multiple shows for one season, so we need to save
-            // the episode from all the jellyfin entries to get the total
+            // With AniDB one season can span several shows, so sum episodes
+            // across all Jellyfin entries.
             if (tvdbSeasonFromAnidb) {
               let show = this.processedAnidbSeason.get(tvShow.id);
 
@@ -440,27 +543,28 @@ class JellyfinScanner
             mediaAddedAt: metadata.DateCreated
               ? new Date(metadata.DateCreated)
               : undefined,
-            jellyfinMediaId: Id,
+            mediaServer: this.kind,
+            itemId: Id,
             title: tvShow.name,
+            qualities: {
+              standard: combineQuality(seen.standard),
+              '4k': combineQuality(seen['4k']),
+            },
           }
         );
       } else {
         this.log(
           `No information found for the show: ${metadata.Name}`,
           'debug',
-          {
-            jellyfinitem,
-          }
+          { item: labelOf(metadata) }
         );
       }
     } catch (e) {
-      this.log(
-        `Failed to process Jellyfin item. Id: ${
-          jellyfinitem.SeriesId ?? jellyfinitem.SeasonId ?? jellyfinitem.Id
-        }`,
-        'error',
-        { errorMessage: e.message, jellyfinitem }
-      );
+      if (e instanceof NotIdentifiedError) {
+        this.skipUnidentified(e);
+      } else {
+        this.failed(jellyfinitem, e);
+      }
     }
   }
 
@@ -478,55 +582,49 @@ class JellyfinScanner
   }
 
   public async run(): Promise<void> {
-    const settings = getSettings();
-
-    if (
-      settings.main.mediaServerType != MediaServerType.JELLYFIN &&
-      settings.main.mediaServerType != MediaServerType.EMBY
-    ) {
+    if (!isConnected(this.kind)) {
       return;
     }
 
     const sessionId = this.startRun();
+    this.unidentified.clear();
 
     try {
-      const userRepository = getRepository(User);
-      const admin = await userRepository.findOne({
-        where: { id: 1 },
-        select: ['id', 'jellyfinUserId', 'jellyfinDeviceId'],
-        order: { id: 'ASC' },
-      });
+      const admin = await jellyfinAdmin(this.kind);
 
       if (!admin) {
-        return this.log('No admin configured. Jellyfin sync skipped.', 'warn');
+        return this.log(
+          `No admin configured. ${serverName(this.kind)} sync skipped.`,
+          'warn'
+        );
       }
 
+      const server = jellyfinFamily(this.kind);
       this.jfClient = new JellyfinAPI(
-        getHostname(),
-        settings.jellyfin.apiKey,
-        admin.jellyfinDeviceId
+        hostnameFor(this.kind),
+        server.apiKey,
+        admin.deviceId,
+        this.kind
       );
 
-      this.jfClient.setUserId(admin.jellyfinUserId ?? '');
+      this.jfClient.setUserId(admin.userId);
 
-      this.libraries = settings.jellyfin.libraries.filter(
-        (library) => library.enabled
-      );
+      this.libraries = server.libraries.filter((library) => library.enabled);
 
       await animeList.sync();
 
       if (this.isRecentOnly) {
         for (const library of this.libraries) {
           this.currentLibrary = library;
-          // Reset AniDB season tracking per library
           this.processedAnidbSeason = new Map();
           this.log(
             `Beginning to process recently added for library: ${library.name}`,
             'info'
           );
           const libraryItems = await this.jfClient.getRecentlyAdded(library.id);
+          await this.libraryItems?.begin(library.id);
 
-          // Bundle items up by rating keys
+          // One entry per series, season or item.
           this.items = uniqWith(libraryItems, (mediaA, mediaB) => {
             if (mediaA.SeriesId && mediaB.SeriesId) {
               return mediaA.SeriesId === mediaB.SeriesId;
@@ -540,16 +638,24 @@ class JellyfinScanner
           });
 
           await this.loop(this.processItem.bind(this), { sessionId });
+          this.libraryItems?.end();
         }
       } else {
         for (const library of this.libraries) {
           this.currentLibrary = library;
-          // Reset AniDB season tracking per library
           this.processedAnidbSeason = new Map();
           this.log(`Beginning to process library: ${library.name}`, 'info');
           this.items = await this.jfClient.getLibraryContents(library.id);
+          this.failures = 0;
+          await this.libraryItems?.begin(library.id);
           await this.loop(this.processItem.bind(this), { sessionId });
+          await this.settleLibraryItems(library);
         }
+      }
+
+      const skipped = this.unidentified.summary();
+      if (skipped) {
+        this.log(skipped.message, 'info', { examples: skipped.examples });
       }
 
       this.log(
@@ -561,7 +667,26 @@ class JellyfinScanner
     } catch (e) {
       this.log('Sync interrupted', 'error', { errorMessage: e.message });
     } finally {
+      this.libraryItems?.end();
       this.endRun(sessionId);
+    }
+  }
+
+  /**
+   * After a full pass of a library, forgets titles it no longer holds; not
+   * after a pass with failures, where a title it missed would look gone.
+   */
+  private async settleLibraryItems(library: Library): Promise<void> {
+    if (this.failures > 0) {
+      this.libraryItems?.end();
+      return;
+    }
+    const forgotten = (await this.libraryItems?.prune()) ?? 0;
+    if (forgotten) {
+      this.log(
+        `${library.name} no longer holds ${forgotten} title(s) it held`,
+        'info'
+      );
     }
   }
 
@@ -580,3 +705,17 @@ export const jellyfinFullScanner = new JellyfinScanner();
 export const jellyfinRecentScanner = new JellyfinScanner({
   isRecentOnly: true,
 });
+
+export const embyFullScanner = new JellyfinScanner({ kind: 'emby' });
+export const embyRecentScanner = new JellyfinScanner({
+  isRecentOnly: true,
+  kind: 'emby',
+});
+
+/** A Jellyfin or Emby server's full and recently added scanners. */
+export const jellyfinScanners = (
+  kind: JellyfinFamilyKind
+): { full: JellyfinScanner; recent: JellyfinScanner } =>
+  kind === 'emby'
+    ? { full: embyFullScanner, recent: embyRecentScanner }
+    : { full: jellyfinFullScanner, recent: jellyfinRecentScanner };

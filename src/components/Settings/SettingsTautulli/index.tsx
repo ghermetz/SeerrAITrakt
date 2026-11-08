@@ -18,7 +18,7 @@ import useSWR from 'swr';
 const messages = defineMessages('components.Settings.SettingsTautulli', {
   title: 'Tautulli',
   description:
-    'Link Tautulli for what people have watched on Plex: Suggested for You, “up next” on lists, Who Watched, Pick for the Room and Catch Me Up.',
+    'What people watch on Plex, for Suggested for You, Who Watched, Pick for the Room and more.',
   addTautulli: 'Add Tautulli',
   watchHistory: 'Watch history',
   fromPlex: 'From Plex',
@@ -29,8 +29,8 @@ const messages = defineMessages('components.Settings.SettingsTautulli', {
 });
 
 /*
- * Tautulli, laid out like the other services: its tile with Edit and Delete
- * once it is set up, a dashed tile to add it before. Plex only.
+ * Tautulli (Plex only), laid out like the other services: its tile with Edit
+ * and Delete once set up, else a dashed tile to add it.
  */
 const SettingsTautulli = () => {
   const intl = useIntl();
@@ -107,7 +107,9 @@ const SettingsTautulli = () => {
                 port={data.port ?? 8181}
                 isSSL={!!data.useSsl}
                 externalUrl={data.externalUrl || undefined}
-                logo={<TautulliLogo className="h-10 w-10 flex-shrink-0" />}
+                logo={
+                  <TautulliLogo className="service-logo h-10 w-10 flex-shrink-0" />
+                }
                 detail={{
                   label: intl.formatMessage(messages.watchHistory),
                   value: intl.formatMessage(messages.fromPlex),

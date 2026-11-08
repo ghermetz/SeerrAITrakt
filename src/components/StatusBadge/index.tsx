@@ -12,10 +12,13 @@ import {
   episodeSpan,
   isDownloadBusy,
   isOneRelease,
+  releasesOf,
   summarizeDownloads,
 } from '@app/utils/downloadSummary';
+import { SERVER_NAMES } from '@app/utils/mediaServerAccounts';
+import type { PlayTarget } from '@app/utils/playLinks';
+import { viewerServer } from '@app/utils/playLinks';
 import { MediaStatus } from '@server/constants/media';
-import { MediaServerType } from '@server/constants/server';
 import type { DownloadingItem } from '@server/lib/downloadtracker';
 import Link from 'next/link';
 import { useIntl } from 'react-intl';
@@ -26,6 +29,7 @@ const messages = defineMessages('components.StatusBadge', {
   playonplex: 'Play on {mediaServerName}',
   openinarr: 'Open in {arr}',
   managemedia: 'Manage {mediaType}',
+  manageartist: 'Manage Artist',
   seasonnumber: 'S{seasonNumber}',
   seasonepisodenumber: 'S{seasonNumber}E{episodeNumber}',
   episoderange: 'S{seasonNumber}E{first}–E{last}',
@@ -56,10 +60,13 @@ interface StatusBadgeProps {
   downloadItem?: DownloadingItem[];
   is4k?: boolean;
   inProgress?: boolean;
-  plexUrl?: string;
+  /** Where the viewer can play this version (usePlayLinks). */
+  playLink?: PlayTarget;
   serviceUrl?: string;
   tmdbId?: number;
-  mediaType?: 'movie' | 'tv';
+  mediaType?: 'movie' | 'tv' | 'music';
+  /** Music: the artist's MusicBrainz id; its page manages the album. */
+  artistId?: string;
   title?: string | string[];
   statusLabelOverride?: string;
 }
@@ -69,32 +76,29 @@ const StatusBadge = ({
   downloadItem = [],
   is4k = false,
   inProgress = false,
-  plexUrl,
+  playLink,
   serviceUrl,
   tmdbId,
   mediaType,
+  artistId,
   title,
   statusLabelOverride,
 }: StatusBadgeProps) => {
   const intl = useIntl();
-  const { hasPermission } = useUser();
+  const { user, hasPermission } = useUser();
   const settings = useSettings();
-  // On a touchscreen there is no hover to show a download's details, so a
-  // pill that is downloading opens them when tapped, rather than following
-  // its link (to Plex, or the manage panel); the link is then inside.
+  // No hover on touch: tapping a downloading pill opens its details (which
+  // hold the link) instead of following the link.
   const isTouch = useIsTouch();
 
   let mediaLink: string | undefined;
   let mediaLinkDescription: string | undefined;
 
-  const mediaServerName =
-    settings.currentSettings.mediaServerType === MediaServerType.EMBY
-      ? 'Emby'
-      : settings.currentSettings.mediaServerType === MediaServerType.PLEX
-        ? 'Plex'
-        : 'Jellyfin';
+  // The server a finished download goes to, from the viewer's view: the one they play on.
+  const watchServer = viewerServer(user, settings.currentSettings.mediaServers);
+  const mediaServerName = watchServer ? SERVER_NAMES[watchServer] : '';
 
-  // What is actually happening to its downloads, all of them together.
+  // All of its downloads combined.
   const download = summarizeDownloads(downloadItem);
   const downloadBusy = !download || isDownloadBusy(download);
   const downloadLabel = (() => {
@@ -109,8 +113,7 @@ const StatusBadge = ({
       : intl.formatMessage(messages[label], { mediaServerName });
   })();
 
-  // Which episodes are downloading: a season pack names its season, not
-  // whichever of its episodes is listed first.
+  // A season pack names its season, not its first listed episode.
   const span = mediaType === 'tv' ? episodeSpan(downloadItem) : undefined;
   const episodeLabel = !span
     ? undefined
@@ -136,7 +139,8 @@ const StatusBadge = ({
 
   if (
     mediaType &&
-    plexUrl &&
+    mediaType !== 'music' &&
+    playLink &&
     hasPermission(
       is4k
         ? [
@@ -160,12 +164,15 @@ const StatusBadge = ({
         ? settings.currentSettings.movie4kEnabled
         : settings.currentSettings.series4kEnabled))
   ) {
-    mediaLink = plexUrl;
+    mediaLink = playLink.url;
     mediaLinkDescription = intl.formatMessage(messages.playonplex, {
-      mediaServerName,
+      mediaServerName: playLink.name,
     });
   } else if (hasPermission(Permission.MANAGE_REQUESTS)) {
-    if (mediaType && tmdbId) {
+    if (mediaType === 'music' && artistId) {
+      mediaLink = `/music/artist/${artistId}?manage=1`;
+      mediaLinkDescription = intl.formatMessage(messages.manageartist);
+    } else if (mediaType && mediaType !== 'music' && tmdbId) {
       mediaLink = `/${mediaType}/${tmdbId}?manage=1`;
       mediaLinkDescription = intl.formatMessage(messages.managemedia, {
         mediaType: intl.formatMessage(
@@ -175,10 +182,28 @@ const StatusBadge = ({
     } else if (hasPermission(Permission.ADMIN) && serviceUrl) {
       mediaLink = serviceUrl;
       mediaLinkDescription = intl.formatMessage(messages.openinarr, {
-        arr: mediaType === 'movie' ? 'Radarr' : 'Sonarr',
+        arr:
+          mediaType === 'movie'
+            ? 'Radarr'
+            : mediaType === 'music'
+              ? 'Lidarr'
+              : 'Sonarr',
       });
     }
   }
+
+  // A downloading pill links to the download list (the title page, or its
+  // downloads for managers), not the play link, which is in its details.
+  const downloadsLink =
+    mediaType === 'music'
+      ? artistId && hasPermission(Permission.MANAGE_REQUESTS)
+        ? `/music/artist/${artistId}?manage=1`
+        : undefined
+      : mediaType && tmdbId
+        ? `/${mediaType}/${tmdbId}${
+            hasPermission(Permission.MANAGE_REQUESTS) ? '?manage=1' : ''
+          }`
+        : undefined;
 
   const tooltipContent =
     mediaType === 'tv' &&
@@ -192,7 +217,11 @@ const StatusBadge = ({
       />
     ) : (
       <ul>
-        {downloadItem.map((status, index) => (
+        {/* One row per release: a pack is one download, not one per episode. */}
+        {(mediaType === 'tv'
+          ? releasesOf(downloadItem)
+          : downloadItem.map((item) => ({ item, episodes: 1 }))
+        ).map(({ item: status, episodes }, index) => (
           <li
             key={`dl-status-${status.externalId}-${index}`}
             className="border-b border-gray-700 last:border-b-0"
@@ -201,6 +230,7 @@ const StatusBadge = ({
               downloadItem={status}
               title={Array.isArray(title) ? title[index] : title}
               is4k={is4k}
+              pack={episodes > 1}
             />
           </li>
         ))}
@@ -211,10 +241,10 @@ const StatusBadge = ({
     <div
       className={`absolute left-0 top-0 z-10 flex h-full ${
         status === MediaStatus.DELETED
-          ? 'bg-red-600/80'
+          ? 'bg-danger/fill'
           : status === MediaStatus.PROCESSING
-            ? 'bg-indigo-500/80'
-            : 'bg-green-500/80'
+            ? 'bg-info/fill'
+            : 'bg-success/fill'
       } transition-all duration-200 ease-in-out`}
       style={{
         width: `${download?.percent ?? 0}%`,
@@ -222,7 +252,7 @@ const StatusBadge = ({
     />
   );
 
-  /** Where the details' link goes, as a row at their foot. */
+  /** The details' footer link. */
   const detailsLink =
     mediaLink && mediaLinkDescription ? (
       <div className="border-t border-gray-700 py-2 text-right">
@@ -231,14 +261,14 @@ const StatusBadge = ({
             href={mediaLink}
             target="_blank"
             rel="noopener noreferrer"
-            className="font-semibold text-indigo-400 hover:text-indigo-300"
+            className="font-semibold text-indigo-400 hover:text-indigo-300 light:text-accent-text light:hover:text-accent-text"
           >
             {mediaLinkDescription}
           </a>
         ) : (
           <Link
             href={mediaLink}
-            className="font-semibold text-indigo-400 hover:text-indigo-300"
+            className="font-semibold text-indigo-400 hover:text-indigo-300 light:text-accent-text light:hover:text-accent-text"
           >
             {mediaLinkDescription}
           </Link>
@@ -246,11 +276,7 @@ const StatusBadge = ({
       </div>
     ) : null;
 
-  /**
-   * A pill that shows a download's progress while there is one: its
-   * details on hover (or on a tap, on a touchscreen), and otherwise the
-   * status it stands for.
-   */
+  /** A pill with download progress and hover (or tap) details; else the plain status. */
   const progressBadge = (
     badgeType: 'success' | 'primary' | 'danger',
     idleLabel: string
@@ -259,25 +285,32 @@ const StatusBadge = ({
     const badge = (
       <Badge
         badgeType={badgeType}
-        href={tapForDetails ? undefined : mediaLink}
+        href={
+          tapForDetails
+            ? undefined
+            : inProgress
+              ? (downloadsLink ?? mediaLink)
+              : mediaLink
+        }
+        // Truncates text but keeps the spinner. On the in-progress grey, text
+        // uses the page colour: a fill's ink (e.g. dark on orange) won't read on grey.
         className={`${
-          inProgress && 'relative !bg-gray-700/80 !px-0 hover:!bg-gray-700'
-        } overflow-hidden`}
+          inProgress &&
+          'relative !bg-gray-700/80 !px-0 !text-strong hover:!bg-gray-700'
+        } min-w-0 max-w-full overflow-hidden`}
       >
         {inProgress && badgeDownloadProgress}
         <div
-          className={`relative z-20 flex items-center ${inProgress && 'px-2'}`}
+          className={`relative z-20 flex min-w-0 items-center ${inProgress && 'px-2'}`}
         >
-          <span>
+          <span className="truncate">
             {intl.formatMessage(is4k ? messages.status4k : messages.status, {
               status: inProgress ? downloadLabel : idleLabel,
             })}
+            {inProgress && episodeLabel && ` ${episodeLabel}`}
           </span>
-          {inProgress && (
-            <>
-              {episodeLabel && <span className="ml-1">{episodeLabel}</span>}
-              {downloadBusy && <Spinner className="ml-1 h-3 w-3" />}
-            </>
+          {inProgress && downloadBusy && (
+            <Spinner className="ml-1 h-3 w-3 flex-none" />
           )}
         </div>
       </Badge>
@@ -288,7 +321,7 @@ const StatusBadge = ({
           inProgress ? (
             <>
               {tooltipContent}
-              {tapForDetails && detailsLink}
+              {(tapForDetails || mediaLink !== downloadsLink) && detailsLink}
             </>
           ) : (
             mediaLinkDescription

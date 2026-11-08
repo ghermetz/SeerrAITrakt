@@ -1,8 +1,6 @@
-/*
- * The fork's optional features. Each is on unless an admin turns it off for
- * everyone, or someone turns it off for themselves. Adding one here adds its
- * switch to both settings pages.
- */
+// The fork's optional features. Each is on unless an admin disables it for
+// everyone or a user for themselves. Adding one here adds its switch to both
+// settings pages.
 export const FEATURES = [
   'suggestedForYou',
   'deletingSoon',
@@ -11,15 +9,19 @@ export const FEATURES = [
   'whoWatched',
   'newSeasons',
   'watchSuggestions',
+  'listRequests',
   'passkeyPrompt',
   'subtitles',
   'autoFix',
+  'siri',
+  'music',
   'aiChat',
   'aiReasons',
   'aiPicker',
   'aiRecap',
   'aiDeletionReview',
   'aiIssueTriage',
+  'aiReports',
   'aiLogs',
   'aiBackfill',
   'aiAgent',
@@ -28,8 +30,8 @@ export const FEATURES = [
 export type Feature = (typeof FEATURES)[number];
 
 /**
- * The features that use an AI model. They only exist once an admin has set
- * one up (Settings → AI), and each can be turned off like any other.
+ * Features using an AI model. They exist only once an admin sets one up
+ * (Settings → AI), and each can be turned off like any other.
  */
 export const AI_FEATURES = [
   'aiChat',
@@ -38,6 +40,7 @@ export const AI_FEATURES = [
   'aiRecap',
   'aiDeletionReview',
   'aiIssueTriage',
+  'aiReports',
   'aiLogs',
   'aiBackfill',
   'aiAgent',
@@ -48,10 +51,7 @@ export type AiFeature = (typeof AI_FEATURES)[number];
 export const isAiFeature = (value: unknown): value is AiFeature =>
   AI_FEATURES.includes(value as AiFeature);
 
-export const isFeature = (value: unknown): value is Feature =>
-  FEATURES.includes(value as Feature);
-
-/** On unless turned off everywhere or by this person. */
+/** On unless disabled globally or by this user. */
 export const featureOn = (
   feature: Feature,
   globallyOff: readonly string[] | undefined,

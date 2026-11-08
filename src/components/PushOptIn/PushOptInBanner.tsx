@@ -9,7 +9,7 @@ import { useIntl } from 'react-intl';
 
 const DISMISS_DAYS = 7;
 
-// Per person: a dismissal by someone else on this device is not theirs.
+// Per user: another user's dismissal on this device doesn't count.
 const dismissKey = (userId: number) => `pushOptInDismissedAt:${userId}`;
 
 const messages = defineMessages('components.PushOptIn', {
@@ -21,7 +21,7 @@ const isDismissed = (userId: number): boolean => {
   try {
     raw = localStorage.getItem(dismissKey(userId));
   } catch {
-    // Storage unavailable (private browsing): ask, as nothing was saved.
+    // Storage unavailable (private browsing): nothing saved, so ask.
   }
 
   if (!raw) {
@@ -37,11 +37,20 @@ const isDismissed = (userId: number): boolean => {
   return Date.now() - dismissedAt < DISMISS_DAYS * 24 * 60 * 60 * 1000;
 };
 
+/** Suppresses the prompt for a while: dismissed here, or turned off in web push settings. */
+export const dismissPushOptIn = (userId: number) => {
+  try {
+    localStorage.setItem(dismissKey(userId), String(Date.now()));
+  } catch {
+    // Storage unavailable (private browsing): lasts for this page only.
+  }
+};
+
 const PushOptInBanner = () => {
   const intl = useIntl();
   const { user } = useUser();
   const { state, subscribe } = usePushDeviceState();
-  // Unknown until storage is read after mounting.
+  // Unknown until storage is read after mount.
   const [dismissed, setDismissed] = useState<boolean>();
   const [isSubscribing, setSubscribing] = useState(false);
 
@@ -50,15 +59,18 @@ const PushOptInBanner = () => {
     setDismissed(userId ? isDismissed(userId) : undefined);
   }, [userId]);
 
+  // Turning push off in its settings dismisses this too.
+  useEffect(() => {
+    if (userId && state === 'prompt' && isDismissed(userId)) {
+      setDismissed(true);
+    }
+  }, [userId, state]);
+
   const handleDismiss = useCallback(() => {
     if (!userId) {
       return;
     }
-    try {
-      localStorage.setItem(dismissKey(userId), String(Date.now()));
-    } catch {
-      // Dismissed for this visit only.
-    }
+    dismissPushOptIn(userId);
     setDismissed(true);
   }, [userId]);
 
@@ -99,7 +111,7 @@ const PushOptInBanner = () => {
       </div>
       <button
         aria-label={intl.formatMessage(messages.dismiss)}
-        className="text-gray-400 transition duration-150 hover:text-white"
+        className="text-gray-400 transition duration-150 hover:text-strong"
         onClick={handleDismiss}
         type="button"
       >

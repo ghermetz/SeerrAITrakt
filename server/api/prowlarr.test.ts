@@ -1,20 +1,41 @@
 import type { ProwlarrRelease } from '@server/api/prowlarr';
 import ProwlarrAPI from '@server/api/prowlarr';
+import { addressPolicy } from '@server/utils/publicHost';
 import assert from 'node:assert/strict';
 import type { IncomingHttpHeaders, Server } from 'node:http';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { after, before, describe, it } from 'node:test';
+import { after, afterEach, before, describe, it, mock } from 'node:test';
 
 /*
- * Fetching a search result through Prowlarr, against a stand-in Prowlarr.
- * Most torrent indexers give no download link, only Prowlarr's own link
- * for the magnet (which redirects to it): the shapes here are what the
- * live Prowlarr answered for EZTV, Knaben and ExtraTorrent results.
+ * Fetching results through a stand-in Prowlarr. Most torrent indexers give
+ * only Prowlarr's redirecting magnet link; shapes are from a live Prowlarr's
+ * EZTV, Knaben and ExtraTorrent results.
  */
 
 const MAGNET = 'magnet:?xt=urn:btih:7ea162cd6756dd883e69ce57085648ecd035dae3';
 const TORRENT = Buffer.from('d4:infod4:name4:showee');
+
+const music = { id: 3000, subCategories: [{ id: 3040 }] };
+const INDEXERS = [
+  { id: 1, enable: true, capabilities: { categories: [music] } },
+  // Only a music subcategory.
+  {
+    id: 2,
+    enable: true,
+    capabilities: { categories: [{ id: 8000, subCategories: [{ id: 3010 }] }] },
+  },
+  { id: 3, enable: true, capabilities: { categories: [{ id: 5070 }] } },
+  { id: 4, enable: false, capabilities: { categories: [music] } },
+  { id: 5, enable: true, capabilities: { categories: [music] } },
+  { id: 6, enable: true, capabilities: { categories: [music] } },
+];
+const STATUSES = [
+  // Disabled until tomorrow.
+  { indexerId: 5, disabledTill: '2026-11-03T12:00:00Z' },
+  // Disable expired; answering again.
+  { indexerId: 6, disabledTill: '2026-11-01T12:00:00Z' },
+];
 
 let server: Server;
 let prowlarr: ProwlarrAPI;
@@ -28,6 +49,19 @@ before(async () => {
       res.writeHead(301, { Location: MAGNET }).end();
     } else if (req.url?.startsWith('/2/download')) {
       res.writeHead(200).end(TORRENT);
+    } else if (req.url?.startsWith('/3/download?to=')) {
+      const to = new URL(req.url, 'http://x').searchParams.get('to')!;
+      res.writeHead(302, { Location: to }).end();
+    } else if (req.url === '/api/v1/indexer') {
+      res
+        .writeHead(200, { 'Content-Type': 'application/json' })
+        .end(JSON.stringify(INDEXERS));
+    } else if (req.url === '/api/v1/indexerstatus') {
+      res
+        .writeHead(200, { 'Content-Type': 'application/json' })
+        .end(JSON.stringify(STATUSES));
+    } else if (req.url?.startsWith('/api/v1/search?')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end('[]');
     } else {
       res.writeHead(404).end();
     }
@@ -51,7 +85,7 @@ after(() => {
 
 const release = (over: Partial<ProwlarrRelease>): ProwlarrRelease => ({
   guid: 'https://indexer/1',
-  title: 'Expedition Unknown Season 5 Complete 720p WEB x264 [i_c]',
+  title: 'Wayfarer Ledger Season 5 Complete 720p WEB x264 [q_z]',
   size: 1,
   indexerId: 46,
   indexer: 'ExtraTorrent.st',
@@ -60,6 +94,8 @@ const release = (over: Partial<ProwlarrRelease>): ProwlarrRelease => ({
 });
 
 describe('Fetching a result through Prowlarr', () => {
+  afterEach(() => mock.restoreAll());
+
   it('follows Prowlarr’s link to a magnet when there is no download link', async () => {
     const fetched = await prowlarr.fetchRelease(
       release({ magnetUrl: `${base}/1/download?link=magnet` })
@@ -88,7 +124,7 @@ describe('Fetching a result through Prowlarr', () => {
     assert.equal(fetched.kind, 'magnet');
     assert.match(
       (fetched as { uri: string }).uri,
-      /^magnet:\?xt=urn:btih:7ea162cd6756dd883e69ce57085648ecd035dae3&dn=Expedition/
+      /^magnet:\?xt=urn:btih:7ea162cd6756dd883e69ce57085648ecd035dae3&dn=Wayfarer/
     );
   });
 
@@ -102,10 +138,179 @@ describe('Fetching a result through Prowlarr', () => {
     assert.equal(fetched.kind, 'torrent');
   });
 
+  it('never sends the key back to Prowlarr from an indexer’s redirect', async () => {
+    // A public indexer at another address that redirects back to Prowlarr.
+    mock.method(addressPolicy, 'isLocal', () => false);
+    const indexer = createServer((_req, res) => {
+      res.writeHead(302, { Location: `${base}/2/download?from=indexer` }).end();
+    });
+    await new Promise<void>((resolve) =>
+      indexer.listen(0, '127.0.0.1', resolve)
+    );
+    try {
+      const { port } = indexer.address() as AddressInfo;
+      const fetched = await prowlarr.fetchRelease(
+        release({ downloadUrl: `http://127.0.0.1:${port}/file` })
+      );
+      assert.equal(fetched.kind, 'torrent');
+      const back = seen.at(-1);
+      assert.equal(back?.url, '/2/download?from=indexer');
+      assert.equal(back?.headers['x-api-key'], undefined);
+    } finally {
+      indexer.closeAllConnections();
+      indexer.close();
+    }
+  });
+
+  /** A second service on this machine, counting what reaches it. */
+  const elsewhere = async () => {
+    const hits: string[] = [];
+    const other = createServer((req, res) => {
+      hits.push(req.url ?? '');
+      res.writeHead(200).end(TORRENT);
+    });
+    await new Promise<void>((resolve) => other.listen(0, '127.0.0.1', resolve));
+    const { port } = other.address() as AddressInfo;
+    return {
+      hits,
+      port,
+      close: () => {
+        other.closeAllConnections();
+        other.close();
+      },
+    };
+  };
+
+  it('refuses a download link to a local address other than Prowlarr', async () => {
+    const other = await elsewhere();
+    try {
+      await assert.rejects(
+        prowlarr.fetchRelease(
+          release({ downloadUrl: `http://127.0.0.1:${other.port}/file` })
+        ),
+        /local address/
+      );
+      await assert.rejects(
+        prowlarr.fetchRelease(
+          release({
+            downloadUrl: `http://[::ffff:127.0.0.1]:${other.port}/file`,
+          })
+        ),
+        /local address/
+      );
+      assert.deepEqual(other.hits, []);
+    } finally {
+      other.close();
+    }
+  });
+
+  it('refuses a redirect from Prowlarr to a local address', async () => {
+    const other = await elsewhere();
+    try {
+      const to = encodeURIComponent(`http://127.0.0.1:${other.port}/file`);
+      await assert.rejects(
+        prowlarr.fetchRelease(
+          release({ downloadUrl: `${base}/3/download?to=${to}` })
+        ),
+        /local address/
+      );
+      const link = encodeURIComponent('http://169.254.0.10/file');
+      await assert.rejects(
+        prowlarr.fetchRelease(
+          release({ downloadUrl: `${base}/3/download?to=${link}` })
+        ),
+        /local address/
+      );
+      assert.deepEqual(other.hits, []);
+    } finally {
+      other.close();
+    }
+  });
+
+  it('follows Prowlarr’s download link by another name for it, without its key', async () => {
+    const port = new URL(base).port;
+    const before = seen.length;
+    const fetched = await prowlarr.fetchRelease(
+      release({ downloadUrl: `http://localhost:${port}/2/download?file=x` })
+    );
+    assert.equal(fetched.kind, 'torrent');
+    assert.equal(seen.length, before + 1);
+    assert.equal(seen.at(-1)?.headers['x-api-key'], undefined);
+  });
+
+  it('follows Prowlarr’s download link on another port when it carries Prowlarr’s key', async () => {
+    const proxy = await elsewhere();
+    try {
+      const link = (key: string) =>
+        `http://localhost:${proxy.port}/2/download?apikey=${key}&file=x`;
+      await assert.rejects(
+        prowlarr.fetchRelease(release({ downloadUrl: link('another-key') })),
+        /local address/
+      );
+      const fetched = await prowlarr.fetchRelease(
+        release({ downloadUrl: link('prowlarr-key') })
+      );
+      assert.equal(fetched.kind, 'torrent');
+      assert.equal(proxy.hits.length, 1);
+    } finally {
+      proxy.close();
+    }
+  });
+
+  it('follows a link to an indexer Sonarr, Radarr or Lidarr has set up on this network', async () => {
+    const indexer = await elsewhere();
+    try {
+      const fetched = await prowlarr.fetchRelease(
+        release({ downloadUrl: `http://127.0.0.1:${indexer.port}/file` }),
+        {
+          indexerOrigins: async () => new Set([`127.0.0.1:${indexer.port}`]),
+        }
+      );
+      assert.equal(fetched.kind, 'torrent');
+      assert.deepEqual(indexer.hits, ['/file']);
+    } finally {
+      indexer.close();
+    }
+  });
+
+  it('takes only a magnet or hash naming one valid info hash', async () => {
+    await assert.rejects(
+      prowlarr.fetchRelease(release({ infoHash: `${'ab'.repeat(20)}&tr=x` })),
+      /no download link/
+    );
+    await assert.rejects(
+      prowlarr.fetchRelease(
+        release({
+          magnetUrl: `magnet:?xt=urn:btih:${'ab'.repeat(20)}&xt=urn:btih:${'cd'.repeat(20)}`,
+        })
+      ),
+      /single valid info hash/
+    );
+  });
+
   it('says so when a result has no way to get it', async () => {
     await assert.rejects(
       prowlarr.fetchRelease(release({})),
       /no download link/
     );
+  });
+});
+
+describe('Searching Prowlarr for music', () => {
+  it('asks only indexers with music that aren’t resting', async () => {
+    assert.deepEqual(
+      await prowlarr.musicIndexerIds(Date.parse('2026-11-02T12:00:00Z')),
+      [1, 2, 6]
+    );
+  });
+
+  it('limits a search to the indexers given', async () => {
+    await prowlarr.search('Glasswing Static Garden', {
+      categories: [3000],
+      indexerIds: [1, 2],
+    });
+    const url = new URL(seen.at(-1)!.url, base);
+    assert.deepEqual(url.searchParams.getAll('indexerIds'), ['1', '2']);
+    assert.deepEqual(url.searchParams.getAll('categories'), ['3000']);
   });
 });

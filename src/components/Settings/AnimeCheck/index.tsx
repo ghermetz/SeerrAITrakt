@@ -14,7 +14,7 @@ import useSWR from 'swr';
 const messages = defineMessages('components.Settings.AnimeCheck', {
   animeCheck: 'Anime Check',
   description:
-    'Titles whose place in Sonarr or Radarr disagrees with what Seerr AI says they are: anime if TMDB has its anime keyword or it is Japanese animation, unless anime or not was chosen on its request or set on its page. Series are checked for root folder and series type, movies for root folder and quality profile. Nothing is changed here: open a title and use Anime in its manage panel to set it and move it.',
+    'Titles Sonarr or Radarr treat differently from Seerr AI on anime. Fix each with Anime in its manage panel.',
   run: 'Run Check',
   running: 'Checking…',
   runFailed: 'The check could not be started.',
@@ -28,12 +28,11 @@ const messages = defineMessages('components.Settings.AnimeCheck', {
     '{count, plural, one {# series is} other {# series are}} not on TMDB, so could not be checked.',
   movieUnmatched:
     '{count, plural, one {# movie is} other {# movies are}} not on TMDB, so could not be checked.',
-  foldersNotChecked:
-    'Folders are not checked: this server has no anime root folder of its own yet.',
+  foldersNotChecked: 'Folders aren’t checked: no anime root folder is set.',
   profilesNotChecked:
-    'Profiles are not checked: this server has no anime quality profile of its own yet.',
+    'Profiles aren’t checked: no anime quality profile is set.',
   moviesNotChecked:
-    '{server}: not checked, as this server has no anime root folder or quality profile of its own yet.',
+    '{server}: not checked, with no anime root folder or profile set.',
   serverError: '{server} could not be read: {error}',
   isAnime: 'Seerr AI: anime',
   notAnime: 'Seerr AI: not anime',
@@ -57,8 +56,8 @@ interface Item {
   badges: { key: string; className: string; text: string }[];
 }
 
-const FOLDER = 'bg-indigo-500/20 text-indigo-200';
-const OTHER = 'bg-yellow-500/20 text-yellow-200';
+const FOLDER = 'bg-indigo-500/20 text-indigo-200 light:text-accent-text';
+const OTHER = 'bg-yellow-500/20 text-yellow-200 light:text-warning-text';
 
 const AnimeCheck = () => {
   const intl = useIntl();
@@ -90,7 +89,7 @@ const AnimeCheck = () => {
                 <div className="flex flex-wrap items-baseline justify-between gap-x-3">
                   <Link
                     href={item.href}
-                    className="font-semibold text-white hover:underline"
+                    className="font-semibold text-strong hover:underline"
                   >
                     {item.title}
                   </Link>
@@ -126,7 +125,7 @@ const AnimeCheck = () => {
         {!expanded[group] && items.length > SHOWN && (
           <button
             type="button"
-            className="text-sm text-indigo-400 hover:text-indigo-300"
+            className="text-sm text-indigo-400 hover:text-indigo-300 light:text-accent-text light:hover:text-accent-text"
             onClick={() => setExpanded({ ...expanded, [group]: true })}
           >
             {intl.formatMessage(messages.showAll, { count: items.length })}

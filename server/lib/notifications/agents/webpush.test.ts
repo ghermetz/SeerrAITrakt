@@ -2,6 +2,7 @@ import { MediaRequestStatus } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { User } from '@server/entity/User';
+import { UserPushSubscription } from '@server/entity/UserPushSubscription';
 import { initI18n } from '@server/i18n';
 import { Notification } from '@server/lib/notifications';
 import type { NotificationPayload } from '@server/lib/notifications/agents/agent';
@@ -10,10 +11,13 @@ import { getSettings } from '@server/lib/settings';
 import { setupTestDb } from '@server/test/db';
 import assert from 'node:assert/strict';
 import { before, describe, it } from 'node:test';
+import webpush from 'web-push';
 
 setupTestDb();
 
 describe('web push', () => {
+  before(() => initI18n());
+
   it('does not read every pending request to send a notification', async (t) => {
     const user = await getRepository(User).findOneOrFail({
       where: { email: 'friend@seerr.dev' },
@@ -29,8 +33,8 @@ describe('web push', () => {
     });
 
     assert.equal(sent, true);
-    // Counted rather than compared: each recorded call holds the repository,
-    // and printing that in a failure message runs out of memory.
+    // Count, don't compare: printing recorded calls (they hold the repository)
+    // in a failure message runs out of memory.
     assert.equal(
       find.mock.calls.filter(
         (call) =>
@@ -41,9 +45,55 @@ describe('web push', () => {
       'pending requests read'
     );
   });
+
+  it('posts only to browser push services, and forgets any other address', async (t) => {
+    const user = await getRepository(User).findOneOrFail({
+      where: { email: 'friend@seerr.dev' },
+    });
+    const subs = getRepository(UserPushSubscription);
+    // Saved before endpoints were validated at signup.
+    await subs.save([
+      new UserPushSubscription({
+        user,
+        endpoint: 'https://fcm.googleapis.com/fcm/send/phone',
+        p256dh: 'key',
+        auth: 'auth',
+      }),
+      new UserPushSubscription({
+        user,
+        endpoint: 'http://192.168.1.10:8123/api/hook',
+        p256dh: 'key',
+        auth: 'auth',
+      }),
+    ]);
+    t.mock.method(webpush, 'setVapidDetails', () => undefined);
+    const posted = t.mock.method(webpush, 'sendNotification', async () => ({
+      statusCode: 201,
+      body: '',
+      headers: {},
+    }));
+
+    await new WebPushAgent().send(Notification.MEDIA_AVAILABLE, {
+      subject: 'Film (2020)',
+      notifyUser: user,
+      notifySystem: false,
+      notifyAdmin: false,
+    });
+
+    assert.deepEqual(
+      posted.mock.calls.map(
+        (call) => (call.arguments[0] as { endpoint: string }).endpoint
+      ),
+      ['https://fcm.googleapis.com/fcm/send/phone']
+    );
+    assert.deepEqual(
+      (await subs.find()).map((sub) => sub.endpoint),
+      ['https://fcm.googleapis.com/fcm/send/phone']
+    );
+  });
 });
 
-/** The payload a device is sent, as the agent builds it. */
+/** The payload the agent builds for a device. */
 const payloadFor = (type: Notification, subject: string) =>
   new WebPushAgent()['getNotificationPayload'](type, {
     subject,
@@ -58,20 +108,20 @@ describe('web push payload', () => {
     const appName = getSettings().main.applicationTitle;
 
     assert.deepEqual(
-      payloadFor(Notification.MEDIA_PENDING, 'Dune').actionLabels,
+      payloadFor(Notification.MEDIA_PENDING, 'Zelvara').actionLabels,
       {
         approve: 'Approve',
         decline: 'Decline',
         approveFailed: 'Could not approve',
         declineFailed: 'Could not decline',
-        failedBody: `Dune — open ${appName} to try again.`,
+        failedBody: `Zelvara — open ${appName} to try again.`,
       }
     );
   });
 
   it('carries none where there is nothing to approve', () => {
     assert.equal(
-      payloadFor(Notification.MEDIA_AVAILABLE, 'Dune').actionLabels,
+      payloadFor(Notification.MEDIA_AVAILABLE, 'Zelvara').actionLabels,
       undefined
     );
   });

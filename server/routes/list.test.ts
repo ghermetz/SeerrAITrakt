@@ -7,6 +7,7 @@ import {
   MediaStatus,
   MediaType,
 } from '@server/constants/media';
+import { MediaServerType } from '@server/constants/server';
 import dataSource, { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import {
@@ -18,6 +19,7 @@ import {
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { MediaRequestWatcher } from '@server/entity/MediaRequestWatcher';
 import { User } from '@server/entity/User';
+import { UserSettings } from '@server/entity/UserSettings';
 import notificationManager from '@server/lib/notifications';
 import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
@@ -94,7 +96,7 @@ describe('watch lists', () => {
   let member: User;
   let outsider: User;
   let notified: string[];
-  // Who the requests come from; the owner unless a test says otherwise.
+  // Who requests come from; the owner unless a test says otherwise.
   let actingAs: User | undefined;
 
   const call = <T>(method: string, path: string, body?: unknown) =>
@@ -383,7 +385,7 @@ describe('watch lists', () => {
       await call('PUT', `/api/v1/list/${id}`, { memberIds: [member.id] });
       await call('PUT', `/api/v1/list/${id}`, { memberIds: [] });
 
-      // Saving the list used to cascade its stale members array and fail.
+      // Saving the list must not cascade its stale members array and fail.
       assert.equal(
         await getRepository(MediaListItem).countBy({ listId: id }),
         1
@@ -430,8 +432,8 @@ describe('watch lists', () => {
       const id = await createList();
       await call('PUT', `/api/v1/list/${id}`, { memberIds: [member.id] });
 
-      // Swapping one person for another removes a row and adds one. Make the
-      // adding fail: the removal must not stand on its own.
+      // Swapping one member for another removes a row and adds one. Fail the
+      // add: the removal must not persist alone.
       const failInsert: EntitySubscriberInterface<MediaListMember> = {
         listenTo: () => MediaListMember,
         beforeInsert: () => {
@@ -573,6 +575,79 @@ describe('watch lists', () => {
         [22, 44]
       );
     });
+
+    it('marks titles on lists shared with this user, and says which lists', async () => {
+      const shared = await createList('Shared');
+      await call('POST', `/api/v1/list/${shared}/item`, {
+        tmdbId: 55,
+        mediaType: 'tv',
+      });
+      await call('PUT', `/api/v1/list/${shared}`, { memberIds: [member.id] });
+      const notShared = await createList('Not shared');
+      await call('POST', `/api/v1/list/${notShared}/item`, {
+        tmdbId: 66,
+        mediaType: 'movie',
+      });
+
+      actingAs = member;
+      const markers = await call<{ lists: { tmdbId: number }[] }>(
+        'GET',
+        '/api/v1/list/markers'
+      );
+      assert.deepEqual(
+        markers.body.lists.map((entry) => entry.tmdbId),
+        [55]
+      );
+
+      const contains = await call<{ listId: number; listName: string }[]>(
+        'GET',
+        '/api/v1/list/contains?tmdbId=55&mediaType=tv'
+      );
+      assert.deepEqual(contains.body, [
+        { listId: shared, listName: 'Shared', tmdbId: 55 },
+      ]);
+      const elsewhere = await call<unknown[]>(
+        'GET',
+        '/api/v1/list/contains?tmdbId=66&mediaType=movie'
+      );
+      assert.deepEqual(elsewhere.body, []);
+
+      actingAs = outsider;
+      const stranger = await call<{ lists: unknown[] }>(
+        'GET',
+        '/api/v1/list/markers'
+      );
+      assert.deepEqual(stranger.body.lists, []);
+    });
+
+    it('says which of several titles each list has, as for a collection’s films', async () => {
+      const films = await createList('Films');
+      const more = await createList('More');
+      for (const [list, tmdbId] of [
+        [films, 8001],
+        [more, 8001],
+        [more, 8002],
+      ]) {
+        await call('POST', `/api/v1/list/${list}/item`, {
+          tmdbId,
+          mediaType: 'movie',
+        });
+      }
+
+      const { body } = await call<
+        { listId: number; listName: string; tmdbId: number }[]
+      >('GET', '/api/v1/list/contains?tmdbIds=8001,8002,8003&mediaType=movie');
+      assert.deepEqual(
+        body.map((entry) => `${entry.listName}:${entry.tmdbId}`).sort(),
+        ['Films:8001', 'More:8001', 'More:8002']
+      );
+
+      const bad = await call(
+        'GET',
+        '/api/v1/list/contains?tmdbIds=8001,abc&mediaType=movie'
+      );
+      assert.equal(bad.status, 400);
+    });
   });
 
   describe('import', () => {
@@ -601,8 +676,8 @@ describe('watch lists', () => {
 
       it('reads the titles on a pasted Trakt list', async () => {
         traktTitles = [
-          { type: 'movie', title: 'The Matrix', year: 1999, tmdbId: 603 },
-          { type: 'show', title: 'Severance', year: 2022, tmdbId: 95396 },
+          { type: 'movie', title: 'The Mazewright', year: 1999, tmdbId: 603 },
+          { type: 'show', title: 'Lumenward', year: 2022, tmdbId: 86247 },
           { type: 'movie', title: 'Unmatched', year: 2001 },
         ];
         const { status, body } = await call<{
@@ -618,8 +693,8 @@ describe('watch lists', () => {
         assert.deepEqual(
           body.titles.map((t) => [t.mediaType, t.tmdbId ?? null, t.title]),
           [
-            ['movie', 603, 'The Matrix'],
-            ['tv', 95396, 'Severance'],
+            ['movie', 603, 'The Mazewright'],
+            ['tv', 86247, 'Lumenward'],
             ['movie', null, 'Unmatched'],
           ]
         );
@@ -684,10 +759,10 @@ describe('watch lists', () => {
             {
               tmdbId: 603,
               mediaType: 'movie',
-              title: 'The Matrix',
+              title: 'The Mazewright',
               year: 1999,
             },
-            { tmdbId: 95396, mediaType: 'tv', title: 'Severance' },
+            { tmdbId: 86247, mediaType: 'tv', title: 'Lumenward' },
             { mediaType: 'movie', title: 'Unmatched', year: 2001 },
           ],
         });
@@ -699,12 +774,12 @@ describe('watch lists', () => {
           ]),
           [[603, 'movie', '/m603.jpg']]
         );
-        assert.equal(body.results[0].raw, 'The Matrix (1999)');
+        assert.equal(body.results[0].raw, 'The Mazewright (1999)');
         assert.deepEqual(
           body.results[1].candidates.map((c) => [c.tmdbId, c.mediaType]),
-          [[95396, 'tv']]
+          [[86247, 'tv']]
         );
-        // No id: searched by name, as a written line is.
+        // No id: searched by name, like a typed line.
         assert.equal(body.results[2].candidates[0].tmdbId, 7001);
       });
 
@@ -732,11 +807,11 @@ describe('watch lists', () => {
         {
           text: [
             'Movies:',
-            '- The Matrix (1999)',
-            '• Practical Magic',
-            '[x] Person of Interest',
-            'Insidious — with Jordan',
-            '- The Matrix (1999)',
+            '- The Mazewright (1999)',
+            '• Practical Alchemy',
+            '[x] Matter of Record',
+            'Vesperline — with Jordan',
+            '- The Mazewright (1999)',
           ].join('\n'),
         }
       );
@@ -751,16 +826,16 @@ describe('watch lists', () => {
           candidates: { mediaType: string; partCount?: number }[];
         }[];
       }>('POST', '/api/v1/list/import/search', {
-        text: 'Pitch Perfect series',
+        text: 'Harmony Lane series',
       });
 
       const line = body.results[0];
       assert.equal(line.collectionHint, true);
       assert.equal(line.candidates[0].mediaType, 'collection');
       assert.equal(line.candidates[0].partCount, 3);
-      // The individual film must remain selectable.
+      // The individual film stays selectable.
       assert.ok(line.candidates.some((c) => c.mediaType === 'movie'));
-      // People are not importable.
+      // People aren't importable.
       assert.ok(!line.candidates.some((c) => c.mediaType === 'person'));
     });
 
@@ -816,7 +891,7 @@ describe('watch lists', () => {
       const poster = (tmdbId: number) =>
         stored.find((item) => item.tmdbId === tmdbId)?.posterPath;
       assert.equal(poster(710), '/aB3_x-9.jpg');
-      // Not stored as given; filled in later from TMDB itself.
+      // Not stored as given; filled in later from TMDB.
       assert.notEqual(poster(711), '/../../api/v1/user/1');
       assert.notEqual(poster(712), '/x.jpg?https://elsewhere.test/');
     });
@@ -878,8 +953,8 @@ describe('watch lists', () => {
     });
 
     it('re-requests media that was deleted from the library', async () => {
-      // A title removed in the past is missing, not handled. Its old request
-      // is history and must not block a new one.
+      // A title removed earlier is missing, not handled. Its old request is
+      // history and must not block a new one.
       const id = await createList();
       const removed = await getRepository(Media).save(
         new Media({
@@ -1002,11 +1077,243 @@ describe('watch lists', () => {
     });
   });
 
+  describe('requesting what is added', () => {
+    type Added = {
+      added: boolean;
+      request?: { outcome: string; message?: string };
+    };
+
+    const requestsFor = (tmdbId: number) =>
+      getRepository(MediaRequest).find({
+        where: { media: { tmdbId } },
+        relations: { requestedBy: true, seasons: true },
+      });
+
+    // Requests need the TMDB details a request is made from.
+    beforeEach(() => {
+      const details = (id: number, extra: object) => ({
+        id,
+        poster_path: `/r${id}.jpg`,
+        external_ids: { tvdb_id: id + 90000 },
+        ...extra,
+      });
+      Object.defineProperty(TheMovieDb.prototype, 'getMovie', {
+        configurable: true,
+        set() {},
+        get() {
+          return async ({ movieId }: { movieId: number }) =>
+            details(movieId, { title: `Glasswing ${movieId}` });
+        },
+      });
+      Object.defineProperty(TheMovieDb.prototype, 'getTvShow', {
+        configurable: true,
+        set() {},
+        get() {
+          return async ({ tvId }: { tvId: number }) =>
+            details(tvId, {
+              name: `Static Garden ${tvId}`,
+              seasons: [
+                { season_number: 0, episode_count: 3 },
+                { season_number: 1, episode_count: 8 },
+              ],
+            });
+        },
+      });
+    });
+
+    /** The member, after their settings changed. */
+    const reloaded = (user: User) =>
+      getRepository(User).findOneOrFail({ where: { id: user.id } });
+
+    it('requests a title new to the list in the name of whoever added it, once', async () => {
+      actingAs = member;
+      const id = await createList();
+      const other = await createList('Other List');
+
+      const first = await call<Added>('POST', `/api/v1/list/${id}/item`, {
+        tmdbId: 9101,
+        mediaType: 'movie',
+      });
+      assert.equal(first.status, 200);
+      assert.deepEqual(first.body.request, { outcome: 'requested' });
+
+      // Again on this list, and on another: nothing new.
+      await call('POST', `/api/v1/list/${id}/item`, {
+        tmdbId: 9101,
+        mediaType: 'movie',
+      });
+      const second = await call<Added>('POST', `/api/v1/list/${other}/item`, {
+        tmdbId: 9101,
+        mediaType: 'movie',
+      });
+      assert.notEqual(second.body.request?.outcome, 'requested');
+
+      const requests = await requestsFor(9101);
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].requestedBy.id, member.id);
+      assert.equal(requests[0].is4k, false);
+    });
+
+    it('requests once, without a failure, when a title is added to two lists at once', async () => {
+      actingAs = member;
+      const id = await createList();
+      const other = await createList('Other List');
+
+      const added = await Promise.all(
+        [id, other].map((list) =>
+          call<Added>('POST', `/api/v1/list/${list}/item`, {
+            tmdbId: 9102,
+            mediaType: 'movie',
+          })
+        )
+      );
+      assert.equal((await requestsFor(9102)).length, 1);
+      // The second sees the first's request instead of reporting a failure.
+      assert.deepEqual(added.map(({ body }) => body.request?.outcome).sort(), [
+        'here',
+        'requested',
+      ]);
+    });
+
+    it('requests a series with every season but specials, as import does', async () => {
+      actingAs = member;
+      const id = await createList();
+
+      await call('POST', `/api/v1/list/${id}/item`, {
+        tmdbId: 9103,
+        mediaType: 'tv',
+      });
+      const [request] = await requestsFor(9103);
+      assert.deepEqual(
+        request.seasons.map((season) => season.seasonNumber),
+        [1]
+      );
+    });
+
+    it('skips what is already in the library or blocklisted', async () => {
+      actingAs = member;
+      const id = await createList();
+      for (const [tmdbId, status] of [
+        [9104, MediaStatus.AVAILABLE],
+        [9105, MediaStatus.BLOCKLISTED],
+      ]) {
+        await getRepository(Media).save(
+          new Media({ tmdbId, mediaType: MediaType.MOVIE, status })
+        );
+        const { body } = await call<Added>('POST', `/api/v1/list/${id}/item`, {
+          tmdbId,
+          mediaType: 'movie',
+        });
+        assert.equal(body.added, true);
+        assert.equal(body.request?.outcome, 'here');
+        assert.equal((await requestsFor(tmdbId)).length, 0);
+      }
+    });
+
+    it('only adds for someone who cannot request, without an error', async () => {
+      actingAs = await makeUser('list-viewer', Permission.NONE);
+      const id = await createList();
+
+      const { status, body } = await call<Added>(
+        'POST',
+        `/api/v1/list/${id}/item`,
+        { tmdbId: 9106, mediaType: 'movie' }
+      );
+      assert.equal(status, 200);
+      assert.deepEqual(body, { added: true });
+      assert.equal((await requestsFor(9106)).length, 0);
+    });
+
+    it('only adds when the person or an admin turned it off', async () => {
+      actingAs = member;
+      const id = await createList();
+      await getRepository(UserSettings).save(
+        new UserSettings({ user: member, disabledFeatures: ['listRequests'] })
+      );
+      actingAs = await reloaded(member);
+
+      await call('POST', `/api/v1/list/${id}/item`, {
+        tmdbId: 9107,
+        mediaType: 'movie',
+      });
+      assert.equal((await requestsFor(9107)).length, 0);
+
+      actingAs = owner;
+      const owned = await createList('Owned');
+      getSettings().main.disabledFeatures = ['listRequests'];
+      try {
+        await call('POST', `/api/v1/list/${owned}/item`, {
+          tmdbId: 9108,
+          mediaType: 'movie',
+        });
+      } finally {
+        getSettings().main.disabledFeatures = [];
+      }
+      assert.equal((await requestsFor(9108)).length, 0);
+    });
+
+    it('only adds when asked not to request, as after requesting', async () => {
+      actingAs = member;
+      const id = await createList();
+      const { body } = await call<Added>('POST', `/api/v1/list/${id}/item`, {
+        tmdbId: 9109,
+        mediaType: 'movie',
+        request: false,
+      });
+      assert.deepEqual(body, { added: true });
+      assert.equal((await requestsFor(9109)).length, 0);
+    });
+
+    it('keeps the title on the list and says why when the quota is reached', async () => {
+      actingAs = member;
+      const id = await createList();
+      await getRepository(User).update(member.id, {
+        movieQuotaLimit: 1,
+        movieQuotaDays: 7,
+      });
+      actingAs = await reloaded(member);
+
+      await call('POST', `/api/v1/list/${id}/item`, {
+        tmdbId: 9110,
+        mediaType: 'movie',
+      });
+      const { status, body } = await call<Added>(
+        'POST',
+        `/api/v1/list/${id}/item`,
+        { tmdbId: 9111, mediaType: 'movie' }
+      );
+      assert.equal(status, 200);
+      assert.equal(body.added, true);
+      assert.deepEqual(body.request, {
+        outcome: 'failed',
+        message: 'Your request limit has been reached.',
+      });
+      assert.equal(
+        await getRepository(MediaListItem).countBy({
+          listId: id,
+          tmdbId: 9111,
+        }),
+        1
+      );
+      assert.equal((await requestsFor(9111)).length, 0);
+    });
+
+    it('leaves an import to its own option', async () => {
+      actingAs = member;
+      const id = await createList();
+      await call('POST', `/api/v1/list/${id}/import`, {
+        items: [{ tmdbId: 9112, mediaType: 'movie' }],
+        request: false,
+      });
+      assert.equal((await requestsFor(9112)).length, 0);
+    });
+  });
+
   describe('series progress', () => {
     it('is reachable through the API', async () => {
       // Mounts the router directly, so this covers the route and its access
-      // check. Its OpenAPI declaration is covered by the spec tests, which
-      // put the real validator in front.
+      // check; the spec tests cover its OpenAPI declaration with the real
+      // validator.
       const id = await createList();
 
       const { status, body } = await call<Record<string, unknown>>(
@@ -1080,6 +1387,55 @@ describe('watch lists', () => {
   });
 
   describe('collections on import', () => {
+    it('add a collection’s films, leaving those already on the list', async () => {
+      const id = await createList();
+      await call('POST', `/api/v1/list/${id}/item`, {
+        tmdbId: 8002,
+        mediaType: 'movie',
+      });
+      const { body } = await call<{ added: number; skipped: number }>(
+        'POST',
+        `/api/v1/list/${id}/import`,
+        { items: [{ tmdbId: 500, mediaType: 'collection' }], request: false }
+      );
+      assert.deepEqual(body, {
+        added: 2,
+        skipped: 1,
+        requested: 0,
+        requestFailed: 0,
+        notRequested: 0,
+      });
+      const onList = await getRepository(MediaListItem).find({
+        where: { listId: id },
+        order: { tmdbId: 'ASC' },
+      });
+      assert.deepEqual(
+        onList.map((item) => item.tmdbId),
+        [8001, 8002, 8003]
+      );
+    });
+
+    it('tell the others on a shared list once, not once per film', async () => {
+      const id = await createList();
+      await call('PUT', `/api/v1/list/${id}`, { memberIds: [member.id] });
+      notified = [];
+
+      actingAs = member;
+      const { body } = await call<{ added: number }>(
+        'POST',
+        `/api/v1/list/${id}/import`,
+        {
+          items: [8001, 8002, 8003].map((tmdbId) => ({
+            tmdbId,
+            mediaType: 'movie',
+          })),
+          request: false,
+        }
+      );
+      assert.equal(body.added, 3);
+      assert.deepEqual(notified, ['list-owner']);
+    });
+
     it('count each film towards the 500-title limit', async () => {
       const id = await createList();
       const { body } = await call<{ added: number; skipped: number }>(
@@ -1115,7 +1471,10 @@ describe('watch lists', () => {
         const kept = getSettings().tautulli;
         t.after(() => {
           getSettings().tautulli = kept;
+          getSettings().main.mediaServerType = MediaServerType.NOT_CONFIGURED;
         });
+        // Tautulli is Plex's watch history, read while Plex is connected.
+        getSettings().main.mediaServerType = MediaServerType.PLEX;
         getSettings().tautulli = {
           hostname: 'tautulli.invalid',
           port: 8181,
@@ -1149,7 +1508,7 @@ describe('watch lists', () => {
           })
         );
 
-        // Tautulli answers only when the test lets it.
+        // Tautulli responds only when the test allows.
         let asked = 0;
         let answer: () => void = () => undefined;
         const answered = new Promise<void>((resolve) => (answer = resolve));
@@ -1180,7 +1539,7 @@ describe('watch lists', () => {
           }
         };
 
-        // Answered while Tautulli has not: the check runs behind.
+        // Answered before Tautulli: the check runs in the background.
         const first = await call<unknown[]>('GET', '/api/v1/list/suggestions');
         assert.equal(first.status, 200);
         assert.deepEqual(first.body, [], 'nothing stored yet');

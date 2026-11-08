@@ -30,10 +30,7 @@ export const useDeletingLabel = () => {
   };
 };
 
-/**
- * The poster marker: same size and shape as the list and notify markers
- * beside it, in red.
- */
+/** Red poster marker, matching the list and notify markers. */
 export const DeletingSoonMarker = ({
   tmdbId,
   mediaType,
@@ -53,7 +50,7 @@ export const DeletingSoonMarker = ({
 
   return (
     <span
-      className="flex h-4 w-4 items-center justify-center rounded-full border border-red-500 bg-red-600/90 shadow-md sm:h-5 sm:w-5"
+      className="flex h-4 w-4 items-center justify-center rounded-full border border-red-500 bg-red-600/90 shadow-md light:bg-red-600 sm:h-5 sm:w-5"
       title={label(when)}
     >
       <ClockIcon className="h-2.5 w-2.5 text-white sm:h-3 sm:w-3" />
@@ -90,8 +87,8 @@ export const DeletingSoonBadge = ({
 };
 
 /**
- * Keep: postpones the deletion. Shown wherever the Request button would be,
- * to anyone signed in, when the admin allows it.
+ * Postpones the deletion. Shown in the Request button's place to any
+ * signed-in user, when the admin allows it.
  */
 export const KeepButton = ({
   tmdbId,
@@ -103,7 +100,7 @@ export const KeepButton = ({
   tmdbId: number;
   mediaType: string;
   title: string;
-  /** The poster's small button rather than a title page's. */
+  /** The small poster variant. */
   compact?: boolean;
   className?: string;
 }) => {

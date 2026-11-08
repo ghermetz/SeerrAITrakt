@@ -1,3 +1,4 @@
+import CardFooter from '@app/components/Settings/CardFooter';
 import type { DVRTestResponse } from '@app/components/Settings/SettingsServices';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
@@ -12,6 +13,7 @@ import type {
   SonarrSettings,
 } from '@server/lib/settings';
 import type { Keyword } from '@server/models/common';
+import { parseRuleCertifications } from '@server/utils/ruleCertification';
 import axios from 'axios';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -32,9 +34,22 @@ const messages = defineMessages('components.Settings.OverrideRuleTile', {
   genre: 'Genre',
   language: 'Language',
   keywords: 'Keywords',
+  certification: 'Age Ratings',
+  country: 'Production Countries',
   conditions: 'Conditions',
   settings: 'Settings',
 });
+
+/** A rule's age ratings, country by country: [["US", ["G", "PG"]]]. */
+const ratingsByCountry = (value: string): [string, string[]][] => {
+  const entries = parseRuleCertifications(value);
+  return [...new Set(entries.map((entry) => entry.country))].map((country) => [
+    country,
+    entries
+      .filter((entry) => entry.country === country)
+      .map((entry) => entry.certification),
+  ]);
+};
 
 interface OverrideRuleTilesProps {
   rules: OverrideRule[];
@@ -149,16 +164,16 @@ const OverrideRuleTiles = ({
       {rules.map((rule) => (
         <li className="flex h-full flex-col rounded-lg bg-gray-800 text-left shadow ring-1 ring-gray-500">
           <div className="flex w-full flex-1 items-center justify-between space-x-6 p-6">
-            <div className="flex-1 truncate">
+            <div className="min-w-0 flex-1">
               <span className="text-lg">
                 {intl.formatMessage(messages.conditions)}
               </span>
               {rule.users && (
-                <p className="truncate text-sm leading-5 text-gray-300">
+                <p className="break-words text-sm leading-5 text-gray-300">
                   <span className="mr-2 font-bold">
                     {intl.formatMessage(messages.users)}
                   </span>
-                  <div className="inline-flex gap-2">
+                  <div className="inline-flex flex-wrap gap-2">
                     {rule.users.split(',').map((userId) => {
                       return (
                         <span>
@@ -173,11 +188,11 @@ const OverrideRuleTiles = ({
                 </p>
               )}
               {rule.genre && (
-                <p className="truncate text-sm leading-5 text-gray-300">
+                <p className="break-words text-sm leading-5 text-gray-300">
                   <span className="mr-2 font-bold">
                     {intl.formatMessage(messages.genre)}
                   </span>
-                  <div className="inline-flex gap-2">
+                  <div className="inline-flex flex-wrap gap-2">
                     {rule.genre.split(',').map((genreId) => (
                       <span>
                         {genres?.find((g) => g.id === Number(genreId))?.name}
@@ -187,11 +202,11 @@ const OverrideRuleTiles = ({
                 </p>
               )}
               {rule.language && (
-                <p className="truncate text-sm leading-5 text-gray-300">
+                <p className="break-words text-sm leading-5 text-gray-300">
                   <span className="mr-2 font-bold">
                     {intl.formatMessage(messages.language)}
                   </span>
-                  <div className="inline-flex gap-2">
+                  <div className="inline-flex flex-wrap gap-2">
                     {rule.language
                       .split('|')
                       .filter((languageId) => languageId !== 'server')
@@ -211,11 +226,11 @@ const OverrideRuleTiles = ({
                 </p>
               )}
               {rule.keywords && (
-                <p className="truncate text-sm leading-5 text-gray-300">
+                <p className="break-words text-sm leading-5 text-gray-300">
                   <span className="mr-2 font-bold">
                     {intl.formatMessage(messages.keywords)}
                   </span>
-                  <div className="inline-flex gap-2">
+                  <div className="inline-flex flex-wrap gap-2">
                     {rule.keywords.split(',').map((keywordId) => {
                       return (
                         <span>
@@ -228,6 +243,44 @@ const OverrideRuleTiles = ({
                       );
                     })}
                   </div>
+                </p>
+              )}
+              {rule.certification && (
+                <p className="break-words text-sm leading-5 text-gray-300">
+                  <span className="mr-2 font-bold">
+                    {intl.formatMessage(messages.certification)}
+                  </span>
+                  <span className="inline-flex flex-wrap gap-2">
+                    {ratingsByCountry(rule.certification).map(
+                      ([country, certifications]) => (
+                        <span key={country}>
+                          {`${
+                            intl.formatDisplayName(country, {
+                              type: 'region',
+                              fallback: 'none',
+                            }) ?? country
+                          }: ${certifications.join(', ')}`}
+                        </span>
+                      )
+                    )}
+                  </span>
+                </p>
+              )}
+              {rule.country && (
+                <p className="break-words text-sm leading-5 text-gray-300">
+                  <span className="mr-2 font-bold">
+                    {intl.formatMessage(messages.country)}
+                  </span>
+                  <span className="inline-flex flex-wrap gap-2">
+                    {rule.country.split(',').map((code) => (
+                      <span key={code}>
+                        {intl.formatDisplayName(code, {
+                          type: 'region',
+                          fallback: 'none',
+                        }) ?? code}
+                      </span>
+                    ))}
+                  </span>
                 </p>
               )}
               <span className="text-lg">
@@ -250,7 +303,7 @@ const OverrideRuleTiles = ({
                 </p>
               )}
               {rule.rootFolder && (
-                <p className="truncate text-sm leading-5 text-gray-300">
+                <p className="break-words text-sm leading-5 text-gray-300">
                   <span className="mr-2 font-bold">
                     {intl.formatMessage(messages.rootfolder)}
                   </span>
@@ -258,7 +311,7 @@ const OverrideRuleTiles = ({
                 </p>
               )}
               {rule.sonarrServiceId != null && rule.seriesType && (
-                <p className="truncate text-sm leading-5 text-gray-300">
+                <p className="break-words text-sm leading-5 text-gray-300">
                   <span className="mr-2 font-bold">
                     {intl.formatMessage(messages.seriesType)}
                   </span>
@@ -274,7 +327,7 @@ const OverrideRuleTiles = ({
               {rule.radarrServiceId != null &&
                 (rule.seriesType === 'anime' ||
                   rule.seriesType === 'standard') && (
-                  <p className="truncate text-sm leading-5 text-gray-300">
+                  <p className="break-words text-sm leading-5 text-gray-300">
                     <span className="mr-2 font-bold">
                       {intl.formatMessage(messages.movieAnime)}
                     </span>
@@ -286,11 +339,11 @@ const OverrideRuleTiles = ({
                   </p>
                 )}
               {rule.tags && rule.tags.length > 0 && (
-                <p className="truncate text-sm leading-5 text-gray-300">
+                <p className="break-words text-sm leading-5 text-gray-300">
                   <span className="mr-2 font-bold">
                     {intl.formatMessage(messages.tags)}
                   </span>
-                  <div className="inline-flex gap-2">
+                  <div className="inline-flex flex-wrap gap-2">
                     {rule.tags.split(',').map((tag) => (
                       <span>
                         {testResponses
@@ -310,31 +363,24 @@ const OverrideRuleTiles = ({
               )}
             </div>
           </div>
-          <div className="border-t border-gray-500">
-            <div className="-mt-px flex">
-              <div className="flex w-0 flex-1 border-r border-gray-500">
-                <button
-                  onClick={() => setOverrideRuleModal({ open: true, rule })}
-                  className="focus:ring-blue relative -mr-px inline-flex w-0 flex-1 items-center justify-center rounded-bl-lg border border-transparent py-4 text-sm font-medium leading-5 text-gray-200 transition duration-150 ease-in-out hover:text-white focus:z-10 focus:border-gray-500 focus:outline-none"
-                >
-                  <PencilIcon className="mr-2 h-5 w-5" />
-                  <span>{intl.formatMessage(globalMessages.edit)}</span>
-                </button>
-              </div>
-              <div className="-ml-px flex w-0 flex-1">
-                <button
-                  onClick={async () => {
-                    await axios.delete(`/api/v1/overrideRule/${rule.id}`);
-                    revalidate();
-                  }}
-                  className="focus:ring-blue relative inline-flex w-0 flex-1 items-center justify-center rounded-br-lg border border-transparent py-4 text-sm font-medium leading-5 text-gray-200 transition duration-150 ease-in-out hover:text-white focus:z-10 focus:border-gray-500 focus:outline-none"
-                >
-                  <TrashIcon className="mr-2 h-5 w-5" />
-                  <span>{intl.formatMessage(globalMessages.delete)}</span>
-                </button>
-              </div>
-            </div>
-          </div>
+          <CardFooter
+            room={2}
+            actions={[
+              {
+                label: intl.formatMessage(globalMessages.edit),
+                icon: PencilIcon,
+                onClick: () => setOverrideRuleModal({ open: true, rule }),
+              },
+              {
+                label: intl.formatMessage(globalMessages.delete),
+                icon: TrashIcon,
+                onClick: async () => {
+                  await axios.delete(`/api/v1/overrideRule/${rule.id}`);
+                  revalidate();
+                },
+              },
+            ]}
+          />
         </li>
       ))}
     </>

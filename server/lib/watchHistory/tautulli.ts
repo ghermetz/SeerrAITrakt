@@ -1,6 +1,6 @@
 import type { TautulliHistoryRecord } from '@server/api/tautulli';
 import TautulliAPI from '@server/api/tautulli';
-import { MediaType } from '@server/constants/media';
+import { MediaType, VIDEO_MEDIA_TYPES } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { User } from '@server/entity/User';
@@ -8,7 +8,6 @@ import type { TautulliSettings } from '@server/lib/settings';
 import type { Play, WatchSource } from '@server/lib/watchHistory/types';
 import { In } from 'typeorm';
 
-/** A Tautulli history record as a play. */
 export const playOf = (record: TautulliHistoryRecord): Play => {
   const movie = record.media_type === 'movie';
   return {
@@ -27,7 +26,7 @@ export const playOf = (record: TautulliHistoryRecord): Play => {
   };
 };
 
-/** Plex, through Tautulli, which keeps every play. */
+/** Plex history via Tautulli, which keeps every play. */
 export class TautulliWatchSource implements WatchSource {
   public readonly kind = 'tautulli' as const;
   public readonly label = 'Tautulli';
@@ -41,17 +40,25 @@ export class TautulliWatchSource implements WatchSource {
     return user.plexId ? String(user.plexId) : undefined;
   }
 
+  /** Deduped: regular and 4K can be the same Plex item. */
   public titleIdsOf(media: Media): string[] {
-    return [media.ratingKey, media.ratingKey4k].filter(
-      (key): key is string => !!key
-    );
+    return [
+      ...new Set(
+        [media.ratingKey, media.ratingKey4k].filter(
+          (key): key is string => !!key
+        )
+      ),
+    ];
   }
 
   public async mediaFor(titleIds: string[]): Promise<Map<string, Media>> {
     const found = new Map<string, Media>();
     if (!titleIds.length) return found;
     const media = await getRepository(Media).find({
-      where: [{ ratingKey: In(titleIds) }, { ratingKey4k: In(titleIds) }],
+      where: [
+        { mediaType: In(VIDEO_MEDIA_TYPES), ratingKey: In(titleIds) },
+        { mediaType: In(VIDEO_MEDIA_TYPES), ratingKey4k: In(titleIds) },
+      ],
     });
     for (const item of media) {
       for (const key of this.titleIdsOf(item)) found.set(key, item);

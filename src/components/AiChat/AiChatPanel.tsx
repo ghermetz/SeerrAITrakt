@@ -5,10 +5,13 @@ import SlideOver from '@app/components/Common/SlideOver';
 import VoiceInputButton, {
   useVoiceInput,
 } from '@app/components/Common/VoiceInput';
+import ArtistCard from '@app/components/Music/ArtistCard';
+import MusicCard from '@app/components/Music/MusicCard';
 import useAi, { aiErrorMessage } from '@app/hooks/useAi';
 import useFeature from '@app/hooks/useFeature';
 import { Permission, useUser } from '@app/hooks/useUser';
 import defineMessages from '@app/utils/defineMessages';
+import { safeRedirect } from '@app/utils/loginRedirect';
 import type { ShrunkPhoto } from '@app/utils/shrinkPhoto';
 import { shrinkPhoto } from '@app/utils/shrinkPhoto';
 import {
@@ -21,6 +24,7 @@ import {
   XMarkIcon,
 } from '@heroicons/react/24/outline';
 import { MediaStatus } from '@server/constants/media';
+import type { MusicAlbumResult, MusicArtistResult } from '@server/models/Music';
 import type { MovieResult, TvResult } from '@server/models/Search';
 import axios from 'axios';
 import { useRouter } from 'next/router';
@@ -31,25 +35,29 @@ const messages = defineMessages('components.AiChat.AiChatPanel', {
   title: 'AI',
   remaining: '{count, plural, one {# answer} other {# answers}} left today',
   intro:
-    'Describe what you are looking for, ask for something, or have a whole franchise put on a list or requested. Anything it finds can be opened, added to a list or requested.',
+    'Describe what you’re after, even a whole franchise. Open, add to a list or request what it finds.',
+  introMusic:
+    'Describe a film, series, album or artist, even a whole franchise. Open or request what it finds, and add films and series to a list.',
   example1: 'the movie where a man relives the same day',
   example2: 'something like the last series I watched, but lighter',
+  exampleMusic: 'albums for a long road trip',
   example3: 'add every Pixar film to a new list',
   example4: 'request all of Christopher Nolan’s films',
   introFix:
-    'You can also report a problem with something on the server, and it is fixed for you: missing or wrong subtitles, missing episodes, a file that won’t play, or the wrong episode.',
+    'Or report a problem, like bad subtitles, missing episodes or a file that won’t play, and it gets fixed.',
   fixExample1: 'get English subtitles for Spirited Away',
   fixExample2: 'season 2 episode 5 of Breaking Bad is the wrong episode',
   fixExample3: 'Interstellar has no sound',
-  introPhoto:
-    'Or send a photo of a poster, a cover, a screen or a message, and it finds what is in it.',
+  introPhoto: 'Or send a photo of a poster or screen to find what’s in it.',
+  introPhotoMusic:
+    'Or send a photo of a poster, album cover or screen to find what’s in it.',
   attachPhoto: 'Send a Photo',
   removePhoto: 'Remove the Photo',
   photoAlt: 'The photo sent',
   photoUnreadable: 'That photo could not be opened. Try a JPEG or PNG.',
-  placeholderPhoto: 'Ask about the photo, or just send it…',
-  placeholder: 'Describe it, or ask for something…',
-  placeholderFix: 'Describe it, ask for something, or report a problem…',
+  placeholderPhoto: 'Ask about the photo…',
+  placeholder: 'Describe it or ask…',
+  placeholderFix: 'Ask, or report a problem…',
   send: 'Send',
   thinking: 'Thinking…',
   nothingFound: 'Nothing matched. Try describing it another way.',
@@ -77,31 +85,45 @@ type Title = MovieResult | TvResult;
 
 const keyOf = (title: Title) => `${title.mediaType}:${title.id}`;
 
+interface TurnMusic {
+  albums: MusicAlbumResult[];
+  artists: MusicArtistResult[];
+}
+
+/** Music labels sent back as context so it isn't offered again. */
+const musicLabels = (music?: TurnMusic): string[] => [
+  ...(music?.albums ?? []).map((album) =>
+    album.artistName ? `${album.title} by ${album.artistName}` : album.title
+  ),
+  ...(music?.artists ?? []).map((artist) => artist.name),
+];
+
 interface Turn {
   ask: string;
-  /** A small copy of the photo sent with it, if any. */
+  /** Thumbnail of the attached photo. */
   photo?: string;
   reply?: string;
   results?: Title[];
-  /** A whole set read from TMDB: its name, and whether it was cut short. */
+  music?: TurnMusic;
+  /** A full TMDB set: its name and whether it was truncated. */
   source?: { name: string; more: boolean };
-  /** A fix that was done or started, and the page that follows it. */
+  /** A fix that ran or started, with a link to follow it. */
   fix?: { kind: string; ok: boolean; link?: string };
-  /** A fix that replaces files, offered, waiting for them to confirm it. */
+  /** A fix awaiting the user's confirmation. */
   confirm?: Record<string, unknown>;
   error?: string;
 }
 
-/** As long as the server reads a message, or an earlier one sent back. */
+/** Server-side limit for a message, including earlier ones sent back. */
 const MAX_ASK = 500;
 
-/** Cards shown for a whole set before "Show all". */
+/** Cards shown for a full set before "Show all". */
 const SET_PREVIEW = 12;
 
 interface ChatAction {
   do: 'list' | 'request';
   name?: string;
-  /** About titles offered in an earlier answer, not this one's. */
+  /** Refers to titles from an earlier answer. */
   earlier: boolean;
 }
 
@@ -112,10 +134,9 @@ interface Sheet {
 }
 
 /**
- * The panel the AI button opens: a short conversation that ends in titles to
- * open or request, and picking for a room. Loaded the first time it is
- * opened, then kept as it is while someone moves around the app; gone when
- * they sign out.
+ * AI chat panel: conversation ending in titles to open or request, plus pick
+ * for a room. Loaded on first open, kept across navigation, cleared on sign
+ * out.
  */
 const AiChatPanel = ({
   open,
@@ -132,6 +153,7 @@ const AiChatPanel = ({
   const router = useRouter();
   const { remaining, refresh } = useAi();
   const canFix = useFeature('autoFix');
+  const musicOn = useFeature('music');
   const [turns, setTurns] = useState<Turn[]>([]);
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
@@ -144,7 +166,7 @@ const AiChatPanel = ({
     keys: Set<string>;
   }>();
   const [sheet, setSheet] = useState<Sheet>();
-  // Answers whose whole set is shown, not just the first few.
+  // Turns showing their full set.
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const { hasPermission } = useUser();
   const canRequest = hasPermission(
@@ -153,8 +175,7 @@ const AiChatPanel = ({
   );
   const end = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLInputElement>(null);
-  // Spoken words fill the box; sending stays with the person, so a misheard
-  // word can be put right first.
+  // Voice fills the box but never sends, so misheard words can be fixed.
   const voice = useVoiceInput(
     useCallback((heard: string) => {
       if (heard) {
@@ -163,10 +184,16 @@ const AiChatPanel = ({
     }, [])
   );
 
-  // Opening a title from the panel goes to its page; the panel steps aside.
+  // Close the panel and any sheet on navigation so the sheet doesn't reappear
+  // with it.
   useEffect(() => {
-    router.events.on('routeChangeStart', onClose);
-    return () => router.events.off('routeChangeStart', onClose);
+    const leave = () => {
+      setSheet(undefined);
+      setChoosing(undefined);
+      onClose();
+    };
+    router.events.on('routeChangeStart', leave);
+    return () => router.events.off('routeChangeStart', leave);
   }, [router.events, onClose]);
 
   useEffect(() => {
@@ -198,8 +225,7 @@ const AiChatPanel = ({
     setPhoto(undefined);
     setPhotoProblem(false);
     setBusy(true);
-    // Only what was asked and offered goes back as context, not the cards
-    // or the photos.
+    // Context is text only: no cards or photos.
     const earlier = turns
       .filter((t) => !t.error)
       .slice(-3)
@@ -209,7 +235,10 @@ const AiChatPanel = ({
           MAX_ASK
         ),
         reply: t.reply,
-        offered: (t.results ?? []).slice(0, 8).map(resultLabel),
+        offered: [
+          ...(t.results ?? []).slice(0, 8).map(resultLabel),
+          ...musicLabels(t.music),
+        ].slice(0, 10),
       }));
     const shown = withPhoto?.thumbnail;
     setTurns((all) => [...all, { ask, photo: shown }]);
@@ -217,6 +246,7 @@ const AiChatPanel = ({
       const response = await axios.post<{
         reply: string;
         results: Title[];
+        music?: TurnMusic;
         source?: Turn['source'];
         action?: ChatAction;
         fix?: Turn['fix'];
@@ -228,12 +258,13 @@ const AiChatPanel = ({
           image: { type: withPhoto.type, data: withPhoto.data },
         }),
       });
-      const { reply, results, source, action, fix, confirm } = response.data;
+      const { reply, results, music, source, action, fix, confirm } =
+        response.data;
       setTurns((all) => [
         ...all.slice(0, -1),
-        { ask, photo: shown, reply, results, source, fix, confirm },
+        { ask, photo: shown, reply, results, music, source, fix, confirm },
       ]);
-      // Asked to list or request titles: set it up to confirm, never more.
+      // List or request actions only open a confirm sheet, never act directly.
       if (action) {
         const titles = action.earlier
           ? ([...turns].reverse().find((t) => t.results?.length)?.results ?? [])
@@ -257,8 +288,7 @@ const AiChatPanel = ({
     }
   };
 
-  // A fix that replaces files, confirmed: filed and started, and the
-  // answer it was offered in says so.
+  // Start a confirmed fix and update the turn that offered it.
   const confirmFix = async (index: number) => {
     const turn = turns[index];
     if (!turn?.confirm || busy) {
@@ -297,8 +327,8 @@ const AiChatPanel = ({
         : messages.placeholder
   );
 
-  // The microphone until there is something to send, then Send; a photo on
-  // its own can be sent too. While listening it stays, so it can be stopped.
+  // Mic until there is text or a photo to send; stays while listening so it can
+  // be stopped.
   const showMic =
     voice.available && (voice.listening || (!text.trim() && !photo));
 
@@ -324,14 +354,14 @@ const AiChatPanel = ({
                 type="button"
                 onClick={() => setPhoto(undefined)}
                 aria-label={intl.formatMessage(messages.removePhoto)}
-                className="absolute -right-2 -top-2 flex h-6 w-6 items-center justify-center rounded-full bg-gray-800 text-gray-200 ring-1 ring-gray-600 hover:text-white"
+                className="absolute -right-2 -top-2 flex h-6 w-6 items-center justify-center rounded-full bg-gray-800 text-gray-200 ring-1 ring-gray-600 hover:text-strong"
               >
                 <XMarkIcon className="h-4 w-4" />
               </button>
             </div>
           )}
           {photoProblem && (
-            <p className="text-xs text-red-300">
+            <p className="text-xs text-red-300 light:text-danger-text">
               {intl.formatMessage(messages.photoUnreadable)}
             </p>
           )}
@@ -350,7 +380,7 @@ const AiChatPanel = ({
             maxLength={500}
             value={text}
             onChange={(e) => setText(e.target.value)}
-            // A picture copied on a computer can be pasted straight in.
+            // Accept pasted images.
             onPaste={(e) => {
               const file = [...e.clipboardData.files].find((f) =>
                 f.type.startsWith('image/')
@@ -361,9 +391,9 @@ const AiChatPanel = ({
               }
             }}
             placeholder={placeholder}
-            className="w-full rounded-full border border-gray-600 bg-gray-900/80 px-4 py-2 text-white placeholder-gray-400 focus:border-gray-500 focus:outline-none focus:ring-0"
+            className="w-full rounded-full border border-gray-600 bg-gray-900/80 px-4 py-2 text-strong placeholder-gray-400 focus:border-gray-500 focus:outline-none focus:ring-0"
           />
-          {/* On a phone this offers the camera or the photo library. */}
+          {/* On phones this offers the camera or photo library. */}
           <input
             ref={picker}
             type="file"
@@ -381,17 +411,16 @@ const AiChatPanel = ({
           disabled={busy}
           aria-label={intl.formatMessage(messages.attachPhoto)}
           title={intl.formatMessage(messages.attachPhoto)}
-          className="flex h-10 w-10 flex-none items-center justify-center rounded-full border border-gray-600 bg-gray-900/80 text-gray-300 transition hover:text-white disabled:opacity-50"
+          className="flex h-10 w-10 flex-none items-center justify-center rounded-full border border-gray-600 bg-gray-900/80 text-gray-300 transition hover:text-strong disabled:opacity-50"
         >
           <CameraIcon className="h-5 w-5" />
         </button>
-        {/* One button: the microphone until there is something to send. */}
         {showMic ? (
           <VoiceInputButton
             className={`h-10 w-10 ${
               voice.listening
                 ? ''
-                : 'bg-indigo-600 !text-white hover:bg-indigo-500'
+                : 'bg-accent !text-on-accent hover:bg-accent-hover'
             }`}
             listening={voice.listening}
             onToggle={() => {
@@ -405,7 +434,7 @@ const AiChatPanel = ({
           <button
             type="submit"
             disabled={busy || (!text.trim() && !photo)}
-            className="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-indigo-600 text-white transition hover:bg-indigo-500 disabled:opacity-50"
+            className="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-accent text-on-accent transition hover:bg-accent-hover disabled:opacity-50"
             aria-label={intl.formatMessage(messages.send)}
           >
             <PaperAirplaneIcon className="h-5 w-5" />
@@ -438,8 +467,8 @@ const AiChatPanel = ({
               onClick={() => setView(tab)}
               className={`rounded-full px-3 py-1 text-sm ${
                 showing === tab
-                  ? 'bg-indigo-600 text-white'
-                  : 'bg-gray-900/60 text-gray-300 ring-1 ring-gray-700 hover:text-white'
+                  ? 'bg-accent text-on-accent'
+                  : 'bg-gray-900/60 text-gray-300 ring-1 ring-gray-700 hover:text-strong'
               }`}
             >
               {intl.formatMessage(
@@ -452,13 +481,12 @@ const AiChatPanel = ({
       {showing === 'pick' ? (
         <PickForRoom />
       ) : (
-        // The conversation scrolls; the message box is the panel's footer,
-        // so it stays put however long the conversation gets.
+        // Only the conversation scrolls; the message box is the footer.
         <div className="flex flex-col" data-testid="ai-chat">
           {turns.length > 0 && (
             <button
               type="button"
-              className="mb-3 self-end text-xs text-gray-400 hover:text-white"
+              className="mb-3 self-end text-xs text-gray-400 hover:text-strong"
               onClick={() => {
                 setTurns([]);
                 setChoosing(undefined);
@@ -472,12 +500,20 @@ const AiChatPanel = ({
           <div className="space-y-6 pb-4">
             {turns.length === 0 && (
               <div className="space-y-3 text-sm text-gray-300">
-                <p>{intl.formatMessage(messages.intro)}</p>
+                <p>
+                  {intl.formatMessage(
+                    musicOn ? messages.introMusic : messages.intro
+                  )}
+                </p>
                 {canFix && <p>{intl.formatMessage(messages.introFix)}</p>}
-                <p>{intl.formatMessage(messages.introPhoto)}</p>
+                <p>
+                  {intl.formatMessage(
+                    musicOn ? messages.introPhotoMusic : messages.introPhoto
+                  )}
+                </p>
                 {[
                   messages.example1,
-                  messages.example2,
+                  musicOn ? messages.exampleMusic : messages.example2,
                   messages.example3,
                   messages.example4,
                   ...(canFix
@@ -511,13 +547,13 @@ const AiChatPanel = ({
                     />
                   )}
                   {turn.ask && (
-                    <div className="w-full rounded-lg bg-indigo-700/60 px-3 py-2 text-sm text-white">
+                    <div className="w-full rounded-lg bg-indigo-700/60 px-3 py-2 text-sm text-on-accent light:bg-accent">
                       {turn.ask}
                     </div>
                   )}
                 </div>
                 {turn.error && (
-                  <div className="rounded-lg border border-red-700 bg-red-900/40 px-3 py-2 text-sm text-red-100">
+                  <div className="rounded-lg border border-red-700 bg-red-900/40 px-3 py-2 text-sm text-red-100 light:bg-danger-soft/15 light:text-danger-text">
                     {turn.error}
                   </div>
                 )}
@@ -532,6 +568,7 @@ const AiChatPanel = ({
                     )}
                     {turn.reply ||
                       (!turn.results?.length &&
+                        !turn.music &&
                         intl.formatMessage(messages.nothingFound))}
                   </div>
                 )}
@@ -540,7 +577,7 @@ const AiChatPanel = ({
                     type="button"
                     disabled={busy}
                     onClick={() => confirmFix(i)}
-                    className="inline-flex items-center gap-1.5 rounded-full bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-indigo-500 disabled:opacity-50"
+                    className="inline-flex items-center gap-1.5 rounded-full bg-accent px-3 py-1.5 text-sm font-medium text-on-accent transition hover:bg-accent-hover disabled:opacity-50"
                   >
                     <WrenchScrewdriverIcon className="h-4 w-4" />
                     {intl.formatMessage(messages.confirmFix)}
@@ -549,8 +586,8 @@ const AiChatPanel = ({
                 {turn.fix?.link && (
                   <button
                     type="button"
-                    onClick={() => router.push(turn.fix!.link!)}
-                    className="text-sm font-semibold text-indigo-300 hover:text-indigo-200"
+                    onClick={() => router.push(safeRedirect(turn.fix!.link))}
+                    className="text-sm font-semibold text-indigo-300 hover:text-indigo-200 light:text-accent-text light:hover:text-accent-text"
                   >
                     {intl.formatMessage(messages.openFix)} →
                   </button>
@@ -585,8 +622,8 @@ const AiChatPanel = ({
                           >
                             <AiTitleCard result={result} />
                             {picking && (
-                              // While choosing, a tap chooses the title
-                              // rather than opening it.
+                              // While choosing, a tap selects instead of
+                              // opening.
                               <button
                                 type="button"
                                 aria-pressed={picked}
@@ -617,7 +654,7 @@ const AiChatPanel = ({
                                 <CheckCircleIcon
                                   className={`h-7 w-7 rounded-full ${
                                     picked
-                                      ? 'bg-indigo-500 text-white'
+                                      ? 'bg-indigo-500 text-on-accent'
                                       : 'bg-gray-900/70 text-gray-400'
                                   }`}
                                 />
@@ -633,7 +670,7 @@ const AiChatPanel = ({
                       choosing?.turn !== i && (
                         <button
                           type="button"
-                          className="text-sm font-semibold text-indigo-300 hover:text-indigo-200"
+                          className="text-sm font-semibold text-indigo-300 hover:text-indigo-200 light:text-accent-text light:hover:text-accent-text"
                           onClick={() =>
                             setExpanded((now) => new Set(now).add(i))
                           }
@@ -660,6 +697,22 @@ const AiChatPanel = ({
                     />
                   </>
                 )}
+                {turn.music && (
+                  // Music is requested per tile; bulk actions are for films and
+                  // series.
+                  <ul className="cards-vertical">
+                    {turn.music.artists.map((artist) => (
+                      <li key={`artist-${artist.id}`}>
+                        <ArtistCard artist={artist} canExpand />
+                      </li>
+                    ))}
+                    {turn.music.albums.map((album) => (
+                      <li key={`album-${album.id}`}>
+                        <MusicCard album={album} showArtist canExpand />
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </div>
             ))}
             {busy && (
@@ -667,7 +720,7 @@ const AiChatPanel = ({
                 {intl.formatMessage(messages.thinking)}
               </div>
             )}
-            {/* Scrolled to after each answer. */}
+            {/* Scroll target after each answer. */}
             <div ref={end} />
           </div>
         </div>
@@ -708,10 +761,7 @@ const AiChatPanel = ({
   );
 };
 
-/**
- * Under an answer's titles: put them on a list or request them, all of
- * them, or only the ones chosen.
- */
+/** List or request all of an answer's titles, or only the chosen ones. */
 const ResultActions = ({
   titles,
   choosing,
@@ -740,8 +790,8 @@ const ResultActions = ({
         aria-pressed={!!choosing}
         className={`${chip} ${
           choosing
-            ? 'bg-indigo-600 text-white'
-            : 'bg-gray-900/60 text-gray-300 ring-1 ring-gray-700 hover:text-white'
+            ? 'bg-accent text-on-accent'
+            : 'bg-gray-900/60 text-gray-300 ring-1 ring-gray-700 hover:text-strong'
         }`}
       >
         {choosing
@@ -753,7 +803,7 @@ const ResultActions = ({
         type="button"
         disabled={none}
         onClick={() => onOpen('list', picked)}
-        className={`${chip} bg-gray-900/60 text-gray-200 ring-1 ring-gray-700 hover:text-white`}
+        className={`${chip} bg-gray-900/60 text-gray-200 ring-1 ring-gray-700 hover:text-strong`}
       >
         <BookmarkIcon className="h-4 w-4" />
         {choosing
@@ -765,7 +815,7 @@ const ResultActions = ({
           type="button"
           disabled={none}
           onClick={() => onOpen('request', picked)}
-          className={`${chip} bg-indigo-600/80 text-white hover:bg-indigo-600`}
+          className={`${chip} bg-accent/accent-fill text-on-accent hover:bg-accent`}
         >
           <ArrowDownTrayIcon className="h-4 w-4" />
           {choosing

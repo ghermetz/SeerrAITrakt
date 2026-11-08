@@ -108,9 +108,13 @@ interface DiscoverMovieOptions {
   studio?: string;
   keywords?: string;
   excludeKeywords?: string;
+  /** ISO 3166-1, matched against TMDB's origin country. */
+  originCountry?: string;
   sortBy?: MovieSortOptions;
   watchRegion?: string;
   watchProviders?: string;
+  /** Exclude titles on these services ("8|9") in watchRegion. */
+  excludeWatchProviders?: string;
   certification?: string;
   certificationGte?: string;
   certificationLte?: string;
@@ -122,6 +126,10 @@ interface DiscoverTvOptions {
   language?: string;
   firstAirDateGte?: string;
   firstAirDateLte?: string;
+  /** An episode airs on or after this day. */
+  airDateGte?: string;
+  /** An episode airs on or before this day. */
+  airDateLte?: string;
   withRuntimeGte?: string;
   withRuntimeLte?: string;
   voteAverageGte?: string;
@@ -134,9 +142,13 @@ interface DiscoverTvOptions {
   network?: number;
   keywords?: string;
   excludeKeywords?: string;
+  /** ISO 3166-1, matched against TMDB's origin country. */
+  originCountry?: string;
   sortBy?: TvSortOptions;
   watchRegion?: string;
   watchProviders?: string;
+  /** Exclude titles on these services ("8|9") in watchRegion. */
+  excludeWatchProviders?: string;
   withStatus?: string; // Returning Series: 0 Planned: 1 In Production: 2 Ended: 3 Cancelled: 4 Pilot: 5
   certification?: string;
   certificationGte?: string;
@@ -166,7 +178,7 @@ type ExternalIdLookup =
       language?: string;
     };
 
-// Nothing anywhere reads aggregate_credits.crew or credits.cast.
+// Nothing reads aggregate_credits.crew or credits.cast.
 const stripUnreadTvCredits = <T>(data: T): T => {
   const show = data as {
     aggregate_credits?: { crew?: unknown };
@@ -180,8 +192,8 @@ const stripUnreadTvCredits = <T>(data: T): T => {
 };
 
 /*
- * A search TMDB does not answer finds nothing, so the page still shows; the
- * log says why, so that it does not pass for a search with no matches.
+ * A failed search returns nothing so the page still renders; log it so it
+ * isn't mistaken for a search with no matches.
  */
 const searchFailed = (what: string, e: unknown) => {
   logger.warn(`TMDB did not answer a ${what} search`, {
@@ -395,7 +407,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     }
   };
 
-  /** A movie with its keywords, for telling anime apart (utils/isAnime). */
+  /** A movie with its keywords, for anime detection (utils/isAnime). */
   public getMovieForScan = async ({
     movieId,
     language = this.locale,
@@ -717,6 +729,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     studio,
     keywords,
     excludeKeywords,
+    originCountry,
     withRuntimeGte,
     withRuntimeLte,
     voteAverageGte,
@@ -724,6 +737,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     voteCountGte,
     voteCountLte,
     watchProviders,
+    excludeWatchProviders,
     watchRegion,
     certification,
     certificationGte,
@@ -755,8 +769,8 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
               : originalLanguage === 'all'
                 ? undefined
                 : this.originalLanguage,
-          // Set our release date values, but check if one is set and not the other,
-          // so we can force a past date or a future date. TMDB Requires both values if one is set!
+          // TMDB needs both bounds if one is set; fill the other to force a
+          // past or future range.
           'primary_release_date.gte':
             !primaryReleaseDateGte && primaryReleaseDateLte
               ? defaultPastDate
@@ -769,6 +783,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
           with_companies: studio,
           with_keywords: keywords,
           without_keywords: excludeKeywords,
+          with_origin_country: originCountry,
           'with_runtime.gte': withRuntimeGte,
           'with_runtime.lte': withRuntimeLte,
           'vote_average.gte': voteAverageGte,
@@ -777,6 +792,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
           'vote_count.lte': voteCountLte,
           watch_region: watchRegion,
           with_watch_providers: watchProviders,
+          without_watch_providers: excludeWatchProviders,
           certification: certification,
           'certification.gte': certificationGte,
           'certification.lte': certificationLte,
@@ -798,12 +814,15 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     language = this.locale,
     firstAirDateGte,
     firstAirDateLte,
+    airDateGte,
+    airDateLte,
     includeEmptyReleaseDate = false,
     originalLanguage,
     genre,
     network,
     keywords,
     excludeKeywords,
+    originCountry,
     withRuntimeGte,
     withRuntimeLte,
     voteAverageGte,
@@ -811,6 +830,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     voteCountGte,
     voteCountLte,
     watchProviders,
+    excludeWatchProviders,
     watchRegion,
     withStatus,
     certification,
@@ -835,8 +855,8 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
           page,
           language,
           region: this.discoverRegion || '',
-          // Set our release date values, but check if one is set and not the other,
-          // so we can force a past date or a future date. TMDB Requires both values if one is set!
+          // TMDB needs both bounds if one is set; fill the other to force a
+          // past or future range.
           'first_air_date.gte':
             !firstAirDateGte && firstAirDateLte
               ? defaultPastDate
@@ -845,6 +865,8 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
             !firstAirDateLte && firstAirDateGte
               ? defaultFutureDate
               : firstAirDateLte,
+          'air_date.gte': airDateGte,
+          'air_date.lte': airDateLte,
           with_original_language:
             originalLanguage && originalLanguage !== 'all'
               ? originalLanguage
@@ -856,6 +878,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
           with_networks: network,
           with_keywords: keywords,
           without_keywords: excludeKeywords,
+          with_origin_country: originCountry,
           'with_runtime.gte': withRuntimeGte,
           'with_runtime.lte': withRuntimeLte,
           'vote_average.gte': voteAverageGte,
@@ -863,6 +886,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
           'vote_count.gte': voteCountGte,
           'vote_count.lte': voteCountLte,
           with_watch_providers: watchProviders,
+          without_watch_providers: excludeWatchProviders,
           watch_region: watchRegion,
           with_status: withStatus,
           certification: certification,
@@ -1005,7 +1029,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     return this.findByExternalId(lookup, this.scanCache, SCAN_TTL);
   }
 
-  // Omitting ttl here silently falls back to DEFAULT_TTL, regardless of tier.
+  // Omitting ttl falls back to DEFAULT_TTL, regardless of tier.
   private async findByExternalId(
     { externalId, type, language = this.locale }: ExternalIdLookup,
     cache?: CacheStore,
@@ -1463,15 +1487,25 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
 
   public async searchPerson({
     query,
+    page,
     language = this.locale,
   }: {
     query: string;
+    page?: number;
     language?: string;
   }): Promise<TmdbSearchPersonResponse> {
     try {
       return await this.get<TmdbSearchPersonResponse>(
         '/search/person',
-        { params: { query, language, include_adult: false } },
+        {
+          params: {
+            query,
+            // Page 1 is asked for as before, sharing its cached reply.
+            ...(page !== undefined && page > 1 ? { page } : {}),
+            language,
+            include_adult: false,
+          },
+        },
         86400 // 24 hours
       );
     } catch (e) {

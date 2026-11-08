@@ -3,6 +3,7 @@ import ApproveModal from '@app/components/Backfill/SeriesReview/ApproveModal';
 import CoverageMap from '@app/components/Backfill/SeriesReview/CoverageMap';
 import StartSearchModal from '@app/components/Backfill/StartSearchModal';
 import {
+  JobFollowUpNote,
   JobStatusBadge,
   ProtocolBadge,
   SCROLL_LIST,
@@ -12,6 +13,7 @@ import {
   appName,
   episodeLabel,
   formatBytes,
+  titleHref,
 } from '@app/components/Backfill/shared';
 import type {
   CandidateView,
@@ -23,6 +25,7 @@ import Badge from '@app/components/Common/Badge';
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import PageTitle from '@app/components/Common/PageTitle';
+import useScrollToHash from '@app/hooks/useScrollToHash';
 import ErrorPage from '@app/pages/_error';
 import defineMessages from '@app/utils/defineMessages';
 import {
@@ -48,12 +51,12 @@ const messages = defineMessages('components.Backfill.SeriesReview', {
   profile: 'Profile: {name}',
   episodes: '{count, plural, one {# episode} other {# episodes}}',
   searchAgain: 'Search again',
-  searching: 'Searching…',
   ignore: 'Ignore series',
   mediaPage: 'Media page',
   askAgent: 'Get it with AI',
   askAgentFailed: 'The admin agent could not be started.',
   ignoreMovie: 'Ignore movie',
+  ignoreAlbum: 'Ignore album',
   unignore: 'Stop ignoring',
   openJob: 'Open the running backfill',
   searchingNow:
@@ -69,11 +72,13 @@ const messages = defineMessages('components.Backfill.SeriesReview', {
   movieBelowCutoff: 'below the profile’s cutoff',
   why: 'Why {app} missed this',
   whyTitle:
-    'The best pack’s title has no episode numbers Sonarr can read, so Sonarr’s own searches never saw it. Backfill matched it by the {count} file names inside.',
+    'Sonarr can’t read this pack’s title, so it missed it. Backfill matched the {count} files inside.',
   whyMovieTitle:
-    'Radarr does not match the best release’s title to this movie, so its own searches passed it over. Backfill matched it by the file inside.',
+    'Radarr didn’t match the release’s title to this movie. Backfill matched it by the file inside.',
+  whyAlbumTitle:
+    'Lidarr didn’t match the release’s title to this album. Backfill matched its {count} files to the album’s tracks.',
   whyNone:
-    'Nothing on your indexers mentions this title under the names searched: {names}. Add the name release groups use and search again.',
+    'Your indexers have nothing under {names}. Add the name release groups use and search again.',
   titleBadge: 'Title',
   whyRejected: '{count} {count, plural, one {pack} other {packs}}: {reason}',
   whyNotSearched: 'Backfill hasn’t searched for this yet.',
@@ -107,19 +112,27 @@ const messages = defineMessages('components.Backfill.SeriesReview', {
   rejectFiles: 'Not usable',
   episodesCount: '{count, plural, one {# episode} other {# episodes}}',
   filesCount: '{count, plural, one {# file} other {# files}}',
+  tracksCount: '{count, plural, one {# track} other {# tracks}}',
   willDelete:
-    '{count} existing {count, plural, one {file} other {files}} will be permanently deleted when their replacements import.',
+    '{count} existing {count, plural, one {file is} other {files are}} deleted for good when replacements import.',
   approve: 'Approve & download…',
   skipPack: 'Skip this pack',
   aiMatched:
-    '{count} {count, plural, one {file was} other {files were}} placed by the AI second opinion, not by its name. Check {count, plural, one {it} other {them}} under Show files before approving.',
+    '{count, plural, one {# file was} other {# files were}} placed by the AI, not by name. Check under Show files before approving.',
   aiBadge: 'AI',
+  byTitleBadge: 'By title',
   aiWhy: 'AI: {why}',
   matchedHow:
-    'Files are matched by the episode number in their names and judged by Sonarr, so the pack’s own season split doesn’t matter.',
+    'Files are matched by episode number, or by episode title when the two disagree, and checked by Sonarr, whatever the pack’s season split.',
   movieMatchedHow:
-    'Files are matched by the movie’s name and year and judged by Radarr; from a collection, only this movie is downloaded.',
+    'Matched by name and year and checked by Radarr. From a collection, only this movie is downloaded.',
   movieLabel: 'Movie',
+  trackLabel: 'Track {number}',
+  albumMatchedHow:
+    'Files are matched to the album’s tracks by title, or by number when there is one file for each track, in the edition Lidarr imports them into.',
+  albumTracks: 'Tracks',
+  trackOnDisk: 'Here, {quality}',
+  trackMissing: 'Missing',
   history: 'Backfills',
   noHistory: 'None yet.',
   imported: '{count} imported',
@@ -136,8 +149,8 @@ const verdictOf = (c: CandidateView, bestId?: number) => {
 };
 
 const ACTION_STYLE = {
-  fill: 'bg-red-500/20 text-red-200',
-  upgrade: 'bg-yellow-500/20 text-yellow-200',
+  fill: 'bg-red-500/20 text-red-200 light:text-danger-text',
+  upgrade: 'bg-yellow-500/20 text-yellow-200 light:text-warning-text',
   skip: 'bg-gray-600/40 text-gray-300',
   reject: 'bg-gray-700/60 text-gray-400',
 } as const;
@@ -149,7 +162,7 @@ const SeriesReview = () => {
   const [selectedId, setSelectedId] = useState<number>();
   const [expanded, setExpanded] = useState<number>();
   const [approving, setApproving] = useState(false);
-  // The pack the Approve dialog was opened for, as it was then.
+  // Snapshot of the pack the Approve dialog opened for.
   const [approveTarget, setApproveTarget] = useState<CandidateView>();
   const [searchOpen, setSearchOpen] = useState(false);
   const [problem, setProblem] = useState<string>();
@@ -165,7 +178,7 @@ const SeriesReview = () => {
     }
   );
 
-  // The same answer the agent's section on the page reads.
+  // Same key as the page's agent section, so SWR shares it.
   const { data: agentData } = useSWR<AgentOverview>(
     data
       ? `/api/v1/agent?kind=${data.series.kind}&serverId=${data.series.serverId}&arrId=${data.series.arrId}`
@@ -187,16 +200,21 @@ const SeriesReview = () => {
     [data]
   );
   const bestId = ranked[0]?.id;
+  // Notifications link a pack via ?pack=; it shows until another is picked.
+  const linked = Number(router.query.pack) || undefined;
   const selected =
-    data?.candidates.find((c) => c.id === selectedId && c.status === 'ready') ??
-    ranked[0];
+    data?.candidates.find(
+      (c) => c.id === (selectedId ?? linked) && c.status === 'ready'
+    ) ?? ranked[0];
 
-  // Keep the pack on show, even when the page refreshes and another ranks
-  // above it, so Approve and Skip act on the pack the admin is reading. It
-  // changes only when they pick another, or when it stops being usable.
+  // Pin the shown pack across refreshes so Approve and Skip act on what the
+  // admin is reading; it changes only on a new pick or once unusable.
   useEffect(() => {
     if (selected && selected.id !== selectedId) setSelectedId(selected.id);
   }, [selected, selectedId]);
+
+  // Notifications link to #review.
+  useScrollToHash(!!data);
 
   if (error && !data) {
     return (
@@ -205,13 +223,14 @@ const SeriesReview = () => {
   }
   if (!data) return <LoadingSpinner />;
 
-  const { series, sonarr, movie } = data;
+  const { series, sonarr, movie, album } = data;
   const app = appName(series.kind);
-  const names = sonarr?.names ?? movie?.names;
+  const names = sonarr?.names ?? movie?.names ?? album?.names;
+  const mediaHref = titleHref(series);
   const activeJob = data.jobs.find((j) => ACTIVE_JOB.includes(j.status));
-  // A series can have more than one download running, for other episodes;
-  // a movie only the one.
-  const blocked = !!activeJob && series.kind === 'movie';
+  // Series may run several downloads at once; movies and albums only one.
+  const blocked =
+    !!activeJob && (series.kind === 'movie' || series.kind === 'album');
 
   const act = async (fn: () => Promise<unknown>) => {
     setProblem(undefined);
@@ -240,7 +259,7 @@ const SeriesReview = () => {
     }
   }
 
-  // The dialog's pack as it is now, while it can still be approved.
+  // The dialog's pack in its latest state, while still approvable.
   const approveCandidate = data.candidates.find(
     (c) => c.id === approveTarget?.id && c.status === 'ready'
   );
@@ -264,7 +283,7 @@ const SeriesReview = () => {
         <div className="min-w-0 flex-1">
           <div className="flex flex-col justify-between gap-3 xl:flex-row">
             <div>
-              <h1 className="text-3xl font-bold text-white">
+              <h1 className="text-3xl font-bold text-strong">
                 {series.title}
                 {series.year && !series.title.includes(String(series.year)) && (
                   <span className="font-medium text-gray-400">
@@ -276,10 +295,10 @@ const SeriesReview = () => {
               <div className="mt-2 flex flex-wrap gap-2">
                 <TypeBadge kind={series.kind} seriesType={series.seriesType} />
                 <SeriesStatusBadge status={series.status} />
-                {(sonarr ?? movie) && (
+                {(sonarr ?? movie ?? album) && (
                   <Badge badgeType="dark">
                     {intl.formatMessage(messages.profile, {
-                      name: (sonarr ?? movie)!.profile,
+                      name: (sonarr ?? movie ?? album)!.profile,
                     })}
                   </Badge>
                 )}
@@ -292,15 +311,9 @@ const SeriesReview = () => {
                 )}
               </div>
             </div>
-            <div className="flex flex-wrap items-start gap-2">
-              {series.tmdbId && (
-                <Link
-                  href={`/${series.kind === 'movie' ? 'movie' : 'tv'}/${
-                    series.tmdbId
-                  }`}
-                  passHref
-                  legacyBehavior
-                >
+            <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-start xl:flex-none xl:flex-nowrap">
+              {mediaHref && (
+                <Link href={mediaHref} passHref legacyBehavior>
                   <Button as="a" buttonType="default">
                     <FilmIcon />
                     <span>{intl.formatMessage(messages.mediaPage)}</span>
@@ -351,25 +364,14 @@ const SeriesReview = () => {
                   </Button>
                 </Link>
               )}
-              {!blocked && (
+              {/* While searching, the badge and note below say so. */}
+              {!blocked && series.status !== 'searching' && (
                 <Button
                   onClick={() => setSearchOpen(true)}
-                  disabled={
-                    !data.readiness.ready || series.status === 'searching'
-                  }
+                  disabled={!data.readiness.ready}
                 >
-                  <ArrowPathIcon
-                    className={
-                      series.status === 'searching' ? 'animate-spin' : undefined
-                    }
-                  />
-                  <span>
-                    {intl.formatMessage(
-                      series.status === 'searching'
-                        ? messages.searching
-                        : messages.searchAgain
-                    )}
-                  </span>
+                  <ArrowPathIcon />
+                  <span>{intl.formatMessage(messages.searchAgain)}</span>
                 </Button>
               )}
               <Button
@@ -389,7 +391,9 @@ const SeriesReview = () => {
                       ? messages.unignore
                       : series.kind === 'movie'
                         ? messages.ignoreMovie
-                        : messages.ignore
+                        : series.kind === 'album'
+                          ? messages.ignoreAlbum
+                          : messages.ignore
                   )}
                 </span>
               </Button>
@@ -471,7 +475,7 @@ const SeriesReview = () => {
         <div className="flex min-w-0 flex-col gap-4">
           {sonarr && (
             <section className="rounded-lg bg-gray-800 ring-1 ring-gray-700">
-              <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-white">
+              <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-strong">
                 {intl.formatMessage(messages.coverage)}
               </h2>
               <div className="p-5">
@@ -483,9 +487,48 @@ const SeriesReview = () => {
               </div>
             </section>
           )}
+          {album && (
+            <section className="rounded-lg bg-gray-800 ring-1 ring-gray-700">
+              <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-strong">
+                {intl.formatMessage(messages.albumTracks)}
+              </h2>
+              <ol className="divide-y divide-gray-700 px-5 py-2 text-sm">
+                {album.tracks.map((track) => (
+                  <li key={track.id} className="flex items-center gap-3 py-1.5">
+                    <span className="w-8 shrink-0 text-right tabular-nums text-gray-500">
+                      {track.number}
+                    </span>
+                    {/* Green: the chosen pack covers it. */}
+                    <span
+                      className={`min-w-0 flex-1 break-words ${
+                        covered.has(track.id)
+                          ? 'text-green-300 light:text-success-text'
+                          : 'text-gray-200'
+                      }`}
+                    >
+                      {track.title}
+                    </span>
+                    <span
+                      className={`shrink-0 ${
+                        track.state === 'missing'
+                          ? 'text-yellow-400 light:text-warning-text'
+                          : 'text-gray-400'
+                      }`}
+                    >
+                      {track.state === 'missing'
+                        ? intl.formatMessage(messages.trackMissing)
+                        : intl.formatMessage(messages.trackOnDisk, {
+                            quality: track.quality ?? '—',
+                          })}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            </section>
+          )}
           {movie && (
             <section className="rounded-lg bg-gray-800 ring-1 ring-gray-700">
-              <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-white">
+              <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-strong">
                 {intl.formatMessage(messages.movieOnDisk)}
               </h2>
               <p className="p-5 text-sm text-gray-200">
@@ -510,7 +553,7 @@ const SeriesReview = () => {
             </section>
           )}
           <section className="flex-1 rounded-lg bg-gray-800 ring-1 ring-gray-700">
-            <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-white">
+            <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-strong">
               {intl.formatMessage(messages.why, { app })}
             </h2>
             <ul className="space-y-3 p-5 text-sm text-gray-200">
@@ -525,9 +568,12 @@ const SeriesReview = () => {
                   <span>
                     {series.kind === 'movie'
                       ? intl.formatMessage(messages.whyMovieTitle)
-                      : intl.formatMessage(messages.whyTitle, {
-                          count: fileCount(ranked[0]),
-                        })}
+                      : intl.formatMessage(
+                          series.kind === 'album'
+                            ? messages.whyAlbumTitle
+                            : messages.whyTitle,
+                          { count: fileCount(ranked[0]) }
+                        )}
                   </span>
                 </li>
               )}
@@ -562,8 +608,11 @@ const SeriesReview = () => {
           </section>
         </div>
 
-        <section className="rounded-lg bg-gray-800 ring-1 ring-gray-700">
-          <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-white">
+        <section
+          id="review"
+          className="scroll-mt-[calc(5rem+env(safe-area-inset-top))] rounded-lg bg-gray-800 ring-1 ring-gray-700"
+        >
+          <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-strong">
             {intl.formatMessage(messages.plan)}
           </h2>
           <div className="space-y-4 p-5">
@@ -573,7 +622,7 @@ const SeriesReview = () => {
               </p>
             ) : (
               <>
-                <div className="break-all text-sm font-semibold text-white">
+                <div className="break-all text-sm font-semibold text-strong">
                   {selected.title}
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -598,11 +647,13 @@ const SeriesReview = () => {
                         <span className={`h-3 w-3 rounded-sm ${dot}`} />
                         {intl.formatMessage(label)}
                       </dt>
-                      <dd className="whitespace-nowrap font-semibold text-white">
+                      <dd className="whitespace-nowrap font-semibold text-strong">
                         {intl.formatMessage(
                           series.kind === 'movie'
                             ? messages.filesCount
-                            : messages.episodesCount,
+                            : series.kind === 'album'
+                              ? messages.tracksCount
+                              : messages.episodesCount,
                           { count: selected.summary![key] }
                         )}
                       </dd>
@@ -660,7 +711,9 @@ const SeriesReview = () => {
                   {intl.formatMessage(
                     series.kind === 'movie'
                       ? messages.movieMatchedHow
-                      : messages.matchedHow
+                      : series.kind === 'album'
+                        ? messages.albumMatchedHow
+                        : messages.matchedHow
                   )}
                 </p>
               </>
@@ -680,7 +733,7 @@ const SeriesReview = () => {
       />
 
       <section className="mt-4 rounded-lg bg-gray-800 ring-1 ring-gray-700">
-        <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-white">
+        <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-strong">
           {intl.formatMessage(messages.candidates)}
         </h2>
         {!data.candidates.length ? (
@@ -743,7 +796,7 @@ const SeriesReview = () => {
                           />
                         </td>
                         <td className="min-w-[16rem] max-w-xl px-4 py-3 align-top">
-                          <div className="break-all font-semibold text-white">
+                          <div className="break-all font-semibold text-strong">
                             {c.title}
                           </div>
                           <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-gray-400">
@@ -753,7 +806,7 @@ const SeriesReview = () => {
                             {!!c.plan?.length && (
                               <button
                                 type="button"
-                                className="inline-flex items-center gap-1 text-indigo-400 hover:text-indigo-300"
+                                className="inline-flex items-center gap-1 text-indigo-400 hover:text-indigo-300 light:text-accent-text light:hover:text-accent-text"
                                 onClick={() =>
                                   setExpanded(
                                     expanded === c.id ? undefined : c.id
@@ -832,7 +885,14 @@ const SeriesReview = () => {
                                         ? intl.formatMessage(
                                             messages.movieLabel
                                           )
-                                        : '—')}
+                                        : entry.episodeIds.length &&
+                                            series.kind === 'album' &&
+                                            entry.episode
+                                          ? intl.formatMessage(
+                                              messages.trackLabel,
+                                              { number: entry.episode }
+                                            )
+                                          : '—')}
                                   </span>
                                   <span className="min-w-0 flex-1 break-all text-gray-400">
                                     {entry.name}
@@ -846,8 +906,15 @@ const SeriesReview = () => {
                                     {entry.score}
                                   </span>
                                   {entry.matchedBy === 'ai' && (
-                                    <span className="rounded bg-purple-500/20 px-2 py-0.5 text-purple-200">
+                                    <span className="rounded bg-purple-500/20 px-2 py-0.5 text-purple-200 light:text-purple-700">
                                       {intl.formatMessage(messages.aiBadge)}
+                                    </span>
+                                  )}
+                                  {entry.matchedBy === 'title' && (
+                                    <span className="rounded bg-gray-500/20 px-2 py-0.5 text-gray-300 light:text-gray-700">
+                                      {intl.formatMessage(
+                                        messages.byTitleBadge
+                                      )}
                                     </span>
                                   )}
                                   <span
@@ -856,7 +923,7 @@ const SeriesReview = () => {
                                     {intl.formatMessage(messages[entry.action])}
                                   </span>
                                   {entry.matchedBy === 'ai' && entry.why && (
-                                    <span className="basis-full pl-[7.75rem] text-purple-200/80">
+                                    <span className="basis-full pl-[7.75rem] text-purple-200/80 light:text-purple-700">
                                       {intl.formatMessage(messages.aiWhy, {
                                         why: entry.why,
                                       })}
@@ -882,7 +949,7 @@ const SeriesReview = () => {
       </section>
 
       <section className="mt-4 rounded-lg bg-gray-800 ring-1 ring-gray-700">
-        <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-white">
+        <h2 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-strong">
           {intl.formatMessage(messages.history)}
         </h2>
         <ul className={`divide-y divide-gray-700 ${SCROLL_LIST}`}>
@@ -901,12 +968,15 @@ const SeriesReview = () => {
                 progress={job.progress}
                 kind={series.kind}
               />
-              <Link
-                href={`/backfill/jobs/${job.id}`}
-                className="min-w-0 flex-1 truncate text-gray-200 hover:underline"
-              >
-                {job.title}
-              </Link>
+              <div className="min-w-0 flex-1">
+                <Link
+                  href={`/backfill/jobs/${job.id}`}
+                  className="block text-gray-200 [overflow-wrap:anywhere] hover:underline"
+                >
+                  {job.title}
+                </Link>
+                <JobFollowUpNote job={job} className="text-xs" />
+              </div>
               <span className="whitespace-nowrap text-gray-400">
                 {intl.formatMessage(messages.imported, { count: job.imported })}
               </span>

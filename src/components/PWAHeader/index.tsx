@@ -1,3 +1,7 @@
+import { useTheme } from '@app/context/ThemeContext';
+import { themeColour } from '@app/utils/theme';
+import Head from 'next/head';
+
 interface PWAHeaderProps {
   applicationTitle?: string;
 }
@@ -31,6 +35,47 @@ const PWAHeader = ({ applicationTitle = 'Seerr AI' }: PWAHeaderProps) => {
         rel="apple-touch-startup-image"
         href="/apple-splash-2732-2048.jpg"
         media="(device-width: 1024px) and (device-height: 1366px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)"
+      />
+      {/* iPad Pro 13" and 11" (M4), iPad Air 11" and iPad, iPad mini */}
+      <link
+        rel="apple-touch-startup-image"
+        href="/apple-splash-2064-2752.jpg"
+        media="(device-width: 1032px) and (device-height: 1376px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)"
+      />
+      <link
+        rel="apple-touch-startup-image"
+        href="/apple-splash-2752-2064.jpg"
+        media="(device-width: 1032px) and (device-height: 1376px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)"
+      />
+      <link
+        rel="apple-touch-startup-image"
+        href="/apple-splash-1668-2420.jpg"
+        media="(device-width: 834px) and (device-height: 1210px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)"
+      />
+      <link
+        rel="apple-touch-startup-image"
+        href="/apple-splash-2420-1668.jpg"
+        media="(device-width: 834px) and (device-height: 1210px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)"
+      />
+      <link
+        rel="apple-touch-startup-image"
+        href="/apple-splash-1640-2360.jpg"
+        media="(device-width: 820px) and (device-height: 1180px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)"
+      />
+      <link
+        rel="apple-touch-startup-image"
+        href="/apple-splash-2360-1640.jpg"
+        media="(device-width: 820px) and (device-height: 1180px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)"
+      />
+      <link
+        rel="apple-touch-startup-image"
+        href="/apple-splash-1488-2266.jpg"
+        media="(device-width: 744px) and (device-height: 1133px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)"
+      />
+      <link
+        rel="apple-touch-startup-image"
+        href="/apple-splash-2266-1488.jpg"
+        media="(device-width: 744px) and (device-height: 1133px) and (-webkit-device-pixel-ratio: 2) and (orientation: landscape)"
       />
       <link
         rel="apple-touch-startup-image"
@@ -218,9 +263,32 @@ const PWAHeader = ({ applicationTitle = 'Seerr AI' }: PWAHeaderProps) => {
       />
       <meta name="format-detection" content="telephone=no" />
       <meta name="mobile-web-app-capable" content="yes" />
-      <meta name="theme-color" content="#1f2937" />
       <meta name="application-name" content={applicationTitle} />
     </>
+  );
+};
+
+/**
+ * theme-color metas matching the top bar, per mode the look can show. A
+ * separate <Head> because it reads the theme context.
+ */
+export const ThemeColour = () => {
+  const { appearance, season } = useTheme();
+  const colours = themeColour(appearance, season);
+  const modes = Object.keys(colours) as (keyof typeof colours)[];
+  return (
+    <Head>
+      {modes.map((mode) => (
+        <meta
+          key={`theme-color-${mode}`}
+          name="theme-color"
+          content={colours[mode]}
+          media={
+            modes.length > 1 ? `(prefers-color-scheme: ${mode})` : undefined
+          }
+        />
+      ))}
+    </Head>
   );
 };
 

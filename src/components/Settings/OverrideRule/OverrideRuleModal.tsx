@@ -5,6 +5,8 @@ import {
   KeywordSelector,
   UserSelector,
 } from '@app/components/Selector';
+import CertificationPicker from '@app/components/Settings/OverrideRule/CertificationPicker';
+import CountryPicker from '@app/components/Settings/OverrideRule/CountryPicker';
 import type { DVRTestResponse } from '@app/components/Settings/SettingsServices';
 import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
@@ -28,14 +30,22 @@ const messages = defineMessages('components.Settings.OverrideRuleModal', {
   selectService: 'Select service',
   conditions: 'Conditions',
   conditionsDescription:
-    'Specifies conditions before applying parameter changes. Each field must be validated for the rules to be applied (AND operation). A field is considered verified if any of its properties match (OR operation).',
+    'Applies when every field matches; a field matches if any of its values do.',
   settings: 'Settings',
-  settingsDescription:
-    'Specifies which settings will be changed when the above conditions are met.',
+  settingsDescription: 'What changes when the conditions above match.',
   users: 'Users',
   genres: 'Genres',
   languages: 'Languages',
   keywords: 'Keywords',
+  certification: 'Age Ratings',
+  certificationTip:
+    'Matches any chosen rating, for the Discover Region ({region}), else the US rating. Unrated titles never match.',
+  certificationTipUs:
+    'Matches any chosen rating, for the Discover Region ({region}). Unrated titles never match.',
+  countries: 'Production Countries',
+  countriesTip:
+    'Matches if the title was made in any chosen country, as TMDB lists it.',
+  selectCountries: 'Select countries',
   rootfolder: 'Root Folder',
   selectRootFolder: 'Select root folder',
   qualityprofile: 'Quality Profile',
@@ -43,14 +53,14 @@ const messages = defineMessages('components.Settings.OverrideRuleModal', {
   tags: 'Tags',
   seriesType: 'Series Type',
   seriesTypeTip:
-    'How Sonarr numbers the series. Anime also sends it with the anime folder, profiles and tags for anything this rule leaves unset.',
+    'How Sonarr numbers the series. Anime uses the anime folder, profiles and tags where this rule sets none.',
   seriesTypeUnchanged: 'Leave to anime detection',
   seriesTypeStandard: 'Standard',
   seriesTypeDaily: 'Daily',
   seriesTypeAnime: 'Anime',
   movieAnime: 'Anime',
   movieAnimeTip:
-    'Whether the movie goes to Radarr as anime. Anime also sends it with the anime folder, profile and tags for anything this rule leaves unset.',
+    'Whether the movie goes to Radarr as anime. Anime uses the anime folder, profile and tags where this rule sets none.',
   movieAnimeYes: 'Anime',
   movieAnimeNo: 'Not anime',
   notagoptions: 'No tags.',
@@ -71,10 +81,7 @@ interface OverrideRuleModalProps {
   sonarrServices: SonarrSettings[];
 }
 
-/**
- * The series type a rule sets: any for a Sonarr rule, anime or not for a
- * Radarr one.
- */
+/** The series type a rule sets: any for Sonarr, anime or standard for Radarr. */
 const ruleSeriesType = (values: {
   radarrServiceId?: number | null;
   sonarrServiceId?: number | null;
@@ -96,7 +103,9 @@ const OverrideRuleModal = ({
   const intl = useIntl();
   const { addToast } = useToasts();
   const { currentSettings } = useSettings();
-  const [isValidated, setIsValidated] = useState(rule ? true : false);
+  // Ratings are read for the server's Discover region; see overrideRules.
+  const region = currentSettings.discoverRegion || 'US';
+  const [isValidated, setIsValidated] = useState(!!rule);
   const [isTesting, setIsTesting] = useState(false);
   const [testResponse, setTestResponse] = useState<DVRTestResponse>({
     profiles: [],
@@ -183,6 +192,8 @@ const OverrideRuleModal = ({
           genre: rule?.genre,
           language: rule?.language,
           keywords: rule?.keywords,
+          certification: rule?.certification,
+          country: rule?.country,
           profileId: rule?.profileId,
           rootFolder: rule?.rootFolder,
           tags: rule?.tags,
@@ -195,6 +206,8 @@ const OverrideRuleModal = ({
               genre: values.genre || null,
               language: values.language || null,
               keywords: values.keywords || null,
+              certification: values.certification || null,
+              country: values.country || null,
               profileId: Number(values.profileId) || null,
               rootFolder: values.rootFolder || null,
               tags: values.tags || null,
@@ -247,7 +260,9 @@ const OverrideRuleModal = ({
                 (!values.users &&
                   !values.genre &&
                   !values.language &&
-                  !values.keywords) ||
+                  !values.keywords &&
+                  !values.certification &&
+                  !values.country) ||
                 (!values.rootFolder &&
                   !values.profileId &&
                   !values.tags &&
@@ -283,6 +298,16 @@ const OverrideRuleModal = ({
                         }
                         onChange={(e) => {
                           const id = Number(e.target.value.split('-')[1]);
+                          // Films and series are rated differently; chosen ratings don't carry over.
+                          if (
+                            values.certification &&
+                            e.target.value.split('-')[0] !==
+                              (values.radarrServiceId != null
+                                ? 'radarr'
+                                : 'sonarr')
+                          ) {
+                            setFieldValue('certification', null);
+                          }
                           if (e.target.value.startsWith('radarr-')) {
                             setFieldValue('radarrServiceId', id);
                             setFieldValue('sonarrServiceId', null);
@@ -353,6 +378,7 @@ const OverrideRuleModal = ({
                   <div className="form-input-area">
                     <div className="form-input-field">
                       <UserSelector
+                        inputId="users"
                         defaultValue={values.users}
                         isDisabled={!isValidated || isTesting}
                         isMulti
@@ -378,6 +404,7 @@ const OverrideRuleModal = ({
                   <div className="form-input-area">
                     <div className="form-input-field">
                       <GenreSelector
+                        inputId="genre"
                         type={
                           values.radarrServiceId != null
                             ? 'movie'
@@ -433,6 +460,7 @@ const OverrideRuleModal = ({
                   <div className="form-input-area">
                     <div className="form-input-field">
                       <KeywordSelector
+                        inputId="keywords"
                         defaultValue={values.keywords}
                         isMulti
                         isDisabled={!isValidated || isTesting}
@@ -449,6 +477,67 @@ const OverrideRuleModal = ({
                       typeof errors.keywords === 'string' && (
                         <div className="error">{errors.keywords}</div>
                       )}
+                  </div>
+                </div>
+                <div className="form-row">
+                  <span id="certification-label" className="text-label">
+                    {intl.formatMessage(messages.certification)}
+                    <span className="label-tip">
+                      {intl.formatMessage(
+                        region === 'US'
+                          ? messages.certificationTipUs
+                          : messages.certificationTip,
+                        {
+                          region:
+                            intl.formatDisplayName(region, {
+                              type: 'region',
+                              fallback: 'none',
+                            }) ?? region,
+                        }
+                      )}
+                    </span>
+                  </span>
+                  <div className="form-input-area">
+                    <div className="form-input-field">
+                      {values.radarrServiceId != null ||
+                      values.sonarrServiceId != null ? (
+                        <CertificationPicker
+                          type={values.radarrServiceId != null ? 'movie' : 'tv'}
+                          region={region}
+                          value={values.certification}
+                          labelledBy="certification-label"
+                          isDisabled={!isValidated || isTesting}
+                          onChange={(value) =>
+                            setFieldValue('certification', value)
+                          }
+                        />
+                      ) : (
+                        <p className="text-sm text-gray-500">
+                          {intl.formatMessage(messages.selectService)}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label htmlFor="country" className="text-label">
+                    {intl.formatMessage(messages.countries)}
+                    <span className="label-tip">
+                      {intl.formatMessage(messages.countriesTip)}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    <div className="form-input-field">
+                      <CountryPicker
+                        inputId="country"
+                        value={values.country}
+                        placeholder={intl.formatMessage(
+                          messages.selectCountries
+                        )}
+                        isDisabled={!isValidated || isTesting}
+                        onChange={(value) => setFieldValue('country', value)}
+                      />
+                    </div>
                   </div>
                 </div>
                 <h3 className="mt-4 text-lg font-bold leading-8 text-gray-100">
@@ -590,6 +679,7 @@ const OverrideRuleModal = ({
                   </label>
                   <div className="form-input-area">
                     <Select<OptionType, true>
+                      inputId="tags"
                       options={testResponse.tags.map((tag) => ({
                         label: tag.label,
                         value: tag.id,

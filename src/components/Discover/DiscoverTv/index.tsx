@@ -19,8 +19,7 @@ import { useRouter } from 'next/router';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 
-// The filter panel, with its date pickers and selectors, is most of this
-// page's code; it is fetched when first opened.
+// The filter panel is most of this page's code, so it loads on first open.
 const FilterSlideover = dynamic(
   () => import('@app/components/Discover/FilterSlideover'),
   { ssr: false }
@@ -84,7 +83,7 @@ const DiscoverTv = () => {
         <Header>{title}</Header>
         <div className="mt-2 flex flex-grow flex-col sm:flex-row lg:flex-grow-0">
           <div className="mb-2 flex flex-grow sm:mb-0 sm:mr-2 lg:flex-grow-0">
-            <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-gray-100 sm:text-sm">
+            <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-surface px-3 text-gray-100 sm:text-sm">
               <BarsArrowDownIcon className="h-6 w-6" />
             </span>
             <select
@@ -154,6 +153,7 @@ const DiscoverTv = () => {
           isLoadingInitialData || (isLoadingMore && (titles?.length ?? 0) > 0)
         }
         onScrollBottom={fetchMore}
+        searchAllType="tv"
       />
     </>
   );

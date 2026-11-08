@@ -1,0 +1,377 @@
+import type LidarrAPI from '@server/api/servarr/lidarr';
+import type { LidarrTrack } from '@server/api/servarr/lidarr';
+import {
+  MediaRequestStatus,
+  MediaStatus,
+  MediaType,
+} from '@server/constants/media';
+import dataSource, { getRepository } from '@server/datasource';
+import AlbumRequest from '@server/entity/AlbumRequest';
+import Media from '@server/entity/Media';
+import { MediaRequest } from '@server/entity/MediaRequest';
+import MusicAlbum from '@server/entity/MusicAlbum';
+import SongRequest from '@server/entity/SongRequest';
+import { lidarrApi } from '@server/lib/music/access';
+import { songFetchProblem } from '@server/lib/music/songFetchReady';
+import { normalizeTitle } from '@server/lib/music/songs';
+import {
+  claimDelivery,
+  notifyRequestWatchers,
+  releaseDelivery,
+} from '@server/lib/notificationDelivery';
+import { Notification } from '@server/lib/notifications';
+import { requestAvailableEvent } from '@server/lib/notifications/eventTitles';
+import { markUndispatchable } from '@server/lib/requestDispatch';
+import { getSettings } from '@server/lib/settings';
+import logger from '@server/logger';
+import { In } from 'typeorm';
+
+/*
+ * Completes music requests once their albums and songs arrive, and notifies.
+ *
+ * Runs from the music scans after they save, not a save hook: albums change
+ * via update(), which hooks never see, and an artist's status doesn't say
+ * which albums arrived.
+ *
+ * An album is done when available or deleted (like a series' season). A
+ * song is done when its source is available, or partly available with this
+ * song on file in Lidarr. Only fully available requests notify, not ones
+ * finished by deletion. Notifications are claimed first so this and the
+ * catch-up pass never both send.
+ */
+
+const DONE = [MediaStatus.AVAILABLE, MediaStatus.DELETED];
+
+/** Requests that can still complete: approved, or failed to send. */
+const OPEN = [MediaRequestStatus.APPROVED, MediaRequestStatus.FAILED];
+
+/** A request's non-declined albums. */
+const wantedAlbums = (request: Pick<MediaRequest, 'albums'>): AlbumRequest[] =>
+  (request.albums ?? []).filter(
+    (album) => album.status !== MediaRequestStatus.DECLINED
+  );
+
+/** A request's non-declined songs. */
+const wantedSongs = (request: Pick<MediaRequest, 'songs'>): SongRequest[] =>
+  (request.songs ?? []).filter(
+    (song) => song.status !== MediaRequestStatus.DECLINED
+  );
+
+/** The single a song is fetched through, or the album it's taken from. */
+const sourceOf = (
+  song: Pick<SongRequest, 'singleMbid' | 'sourceAlbumMbid'>
+): string | null => song.singleMbid ?? song.sourceAlbumMbid;
+
+/** Source statuses that count as arrived for a completed song. */
+const HERE = [MediaStatus.AVAILABLE, MediaStatus.PARTIALLY_AVAILABLE];
+
+/**
+ * True when every requested album is available and every song is completed
+ * with its source arrived.
+ */
+export const musicRequestAvailable = (
+  request: Pick<MediaRequest, 'albums' | 'songs'>,
+  rows: Pick<MusicAlbum, 'mbId' | 'status'>[]
+): boolean => {
+  const albums = wantedAlbums(request);
+  const songs = wantedSongs(request);
+  const statusOf = (mbId?: string | null) =>
+    rows.find((row) => row.mbId === mbId)?.status;
+  return (
+    albums.length + songs.length > 0 &&
+    albums.every(
+      (album) => statusOf(album.albumMbid) === MediaStatus.AVAILABLE
+    ) &&
+    songs.every(
+      (song) =>
+        song.status === MediaRequestStatus.COMPLETED &&
+        HERE.includes(statusOf(sourceOf(song)) as MediaStatus)
+    )
+  );
+};
+
+/** Max length difference between a track and the song. */
+const SAME_LENGTH_MS = 10_000;
+
+/**
+ * Whether Lidarr has a file for this song on its source: by recording id,
+ * else by name and length (an edition with other recording ids; not a live
+ * take or edit of the same name). Undefined when unknowable: no Lidarr, or
+ * no album files at all (a media server may list it without Lidarr). Null
+ * when Lidarr fails, so the next scan retries.
+ */
+const songOnFile = async (
+  song: SongRequest,
+  lidarr: LidarrAPI | undefined,
+  lidarrAlbumId: number | null | undefined
+): Promise<boolean | undefined | null> => {
+  if (!lidarr || !lidarrAlbumId) {
+    return undefined;
+  }
+  try {
+    const tracks = await lidarr.getTracks(lidarrAlbumId);
+    const named = normalizeTitle(songName(song));
+    const sameLength = (t: LidarrTrack) =>
+      !song.length ||
+      !t.duration ||
+      Math.abs(t.duration - song.length) <= SAME_LENGTH_MS;
+    const track =
+      tracks.find((t) => t.foreignRecordingId === song.recordingMbid) ??
+      tracks.find(
+        (t) =>
+          sameLength(t) &&
+          (normalizeTitle(t.title) === named ||
+            (!song.version &&
+              normalizeTitle(t.title) === normalizeTitle(song.title)))
+      );
+    if (track?.hasFile) return true;
+    return tracks.some((t) => t.hasFile) ? false : undefined;
+  } catch (e) {
+    logger.debug('Lidarr did not list an album’s tracks', {
+      label: 'Music Scan',
+      lidarrAlbumId,
+      errorMessage: e instanceof Error ? e.message : String(e),
+    });
+    return null;
+  }
+};
+
+/** Track name for a song: "Song (radio edit)". */
+const songName = (song: Pick<SongRequest, 'title' | 'version'>): string =>
+  song.version ? `${song.title} (${song.version})` : song.title;
+
+/**
+ * Notifies the requester and watchers once, only when the whole request is
+ * available.
+ */
+export const notifyAvailableMusic = async (
+  request: MediaRequest
+): Promise<void> => {
+  if (!request.media?.id) {
+    return;
+  }
+  const media = await getRepository(Media).findOne({
+    where: { id: request.media.id },
+  });
+  if (!media) {
+    return;
+  }
+  const rows = await getRepository(MusicAlbum).find({
+    select: { id: true, mbId: true, status: true },
+    where: { mediaId: media.id },
+  });
+  if (!musicRequestAvailable(request, rows)) {
+    return;
+  }
+
+  if (!(await claimDelivery(request.id, Notification.MEDIA_AVAILABLE))) {
+    return;
+  }
+
+  const event = requestAvailableEvent(MediaType.MUSIC, false);
+  const sent = await MediaRequest.sendNotification(
+    request,
+    media,
+    Notification.MEDIA_AVAILABLE,
+    event
+  );
+  if (!sent) {
+    // Already logged; the catch-up pass retries.
+    await releaseDelivery(request.id, Notification.MEDIA_AVAILABLE);
+    return;
+  }
+
+  await notifyRequestWatchers(request.id, (watcher) =>
+    MediaRequest.sendNotification(
+      request,
+      media,
+      Notification.MEDIA_AVAILABLE,
+      event,
+      undefined,
+      watcher
+    )
+  );
+};
+
+/** Ids per query; well under SQLite's 999 bound parameters. */
+const CHUNK = 400;
+
+/**
+ * Completes albums, songs and requests for these artists and notifies for
+ * finished requests. Each request's changes are written in one transaction.
+ * Returns the completed request ids.
+ */
+export const completeMusicRequests = async (
+  mediaIds: Iterable<number>
+): Promise<number[]> => {
+  const ids = [...new Set(mediaIds)];
+  const completed: number[] = [];
+
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+    const requests = await getRepository(MediaRequest).find({
+      where: {
+        type: MediaType.MUSIC,
+        status: In(OPEN),
+        media: { id: In(chunk) },
+      },
+    });
+    if (!requests.length) {
+      continue;
+    }
+    const artistIds = [...new Set(requests.map((r) => r.media.id))];
+    const rows = await getRepository(MusicAlbum).find({
+      select: {
+        id: true,
+        mediaId: true,
+        mbId: true,
+        status: true,
+        lidarrAlbumId: true,
+      },
+      where: { mediaId: In(artistIds) },
+    });
+    // Each artist's Lidarr, to check partly available sources.
+    const servers = new Map(
+      (
+        await getRepository(Media).find({
+          select: { id: true, serviceId: true },
+          where: { id: In(artistIds) },
+        })
+      ).map((media) => [media.id, media.serviceId])
+    );
+    const settings = getSettings();
+
+    for (const request of requests) {
+      const own = rows.filter((row) => row.mediaId === request.media.id);
+      const statusOf = (mbId: string) =>
+        own.find((row) => row.mbId === mbId)?.status;
+      const wanted = wantedAlbums(request);
+      const finished = wanted.filter(
+        (album) =>
+          album.status !== MediaRequestStatus.COMPLETED &&
+          DONE.includes(statusOf(album.albumMbid) as MediaStatus)
+      );
+      const songs = wantedSongs(request);
+      const server = settings.lidarr.find(
+        (s) => s.id === servers.get(request.media.id)
+      );
+      const lidarr = server ? lidarrApi(server) : undefined;
+      const songsFinished: SongRequest[] = [];
+      // Source available, but Lidarr's edition lacks this version.
+      const songsMissing: SongRequest[] = [];
+      for (const song of songs) {
+        if (song.status === MediaRequestStatus.COMPLETED || !sourceOf(song)) {
+          continue;
+        }
+        const row = own.find((r) => r.mbId === sourceOf(song));
+        if (!row) {
+          continue;
+        }
+        if (row.status === MediaStatus.DELETED) {
+          songsFinished.push(song);
+        } else if (row.status === MediaStatus.AVAILABLE) {
+          const onFile = await songOnFile(song, lidarr, row.lidarrAlbumId);
+          if (onFile === null) {
+            continue;
+          } else if (onFile !== false) {
+            songsFinished.push(song);
+          } else if (
+            song.singleMbid &&
+            song.status === MediaRequestStatus.APPROVED &&
+            !songFetchProblem()
+          ) {
+            // Lidarr's edition of the single lacks it; singleFallback takes
+            // it from an album instead.
+            continue;
+          } else if (song.status !== MediaRequestStatus.FAILED) {
+            songsMissing.push(song);
+          }
+        } else if (
+          row.status === MediaStatus.PARTIALLY_AVAILABLE &&
+          (await songOnFile(song, lidarr, row.lidarrAlbumId))
+        ) {
+          songsFinished.push(song);
+        }
+      }
+      if (songsMissing.length) {
+        const song = songsMissing[0];
+        const from = song.singleTitle ?? song.sourceAlbumTitle ?? '';
+        await getRepository(SongRequest).update(
+          { id: In(songsMissing.map((s) => s.id)) },
+          { status: MediaRequestStatus.FAILED }
+        );
+        songsMissing.forEach((s) => (s.status = MediaRequestStatus.FAILED));
+        if (request.status === MediaRequestStatus.APPROVED) {
+          await markUndispatchable(
+            request,
+            `${from} is here, but Lidarr took an edition without “${songName(song)}”.`
+          );
+        }
+      }
+      const allDone =
+        wanted.length + songs.length > 0 &&
+        wanted.every(
+          (album) =>
+            album.status === MediaRequestStatus.COMPLETED ||
+            finished.includes(album)
+        ) &&
+        songs.every(
+          (song) =>
+            song.status === MediaRequestStatus.COMPLETED ||
+            songsFinished.includes(song)
+        );
+      if (!finished.length && !songsFinished.length && !allDone) {
+        continue;
+      }
+
+      await dataSource.transaction(async (manager) => {
+        if (finished.length) {
+          await manager.update(
+            AlbumRequest,
+            { id: In(finished.map((album) => album.id)) },
+            { status: MediaRequestStatus.COMPLETED }
+          );
+        }
+        if (songsFinished.length) {
+          await manager.update(
+            SongRequest,
+            { id: In(songsFinished.map((song) => song.id)) },
+            { status: MediaRequestStatus.COMPLETED }
+          );
+        }
+        if (allDone) {
+          await manager.update(MediaRequest, request.id, {
+            status: MediaRequestStatus.COMPLETED,
+          });
+        }
+      });
+      finished.forEach(
+        (album) => (album.status = MediaRequestStatus.COMPLETED)
+      );
+      songsFinished.forEach(
+        (song) => (song.status = MediaRequestStatus.COMPLETED)
+      );
+
+      if (allDone) {
+        request.status = MediaRequestStatus.COMPLETED;
+        completed.push(request.id);
+        logger.info('A music request is complete', {
+          label: 'Music Scan',
+          requestId: request.id,
+          mediaId: request.media.id,
+        });
+        try {
+          await notifyAvailableMusic(request);
+        } catch (e) {
+          logger.error('Could not say a music request is here', {
+            label: 'Notifications',
+            requestId: request.id,
+            errorMessage: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    }
+  }
+
+  return completed;
+};

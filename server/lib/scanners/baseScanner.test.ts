@@ -11,9 +11,9 @@ import { describe, it, mock } from 'node:test';
 setupTestDb();
 
 /*
- * What a media server scan does to titles beyond the one it finds: the
- * title a re-matched item leaves no longer has it, and downloads shown as
- * "being added" stop showing once the media server lists the title.
+ * Scan effects beyond the found title: the title a re-matched item leaves
+ * loses it, and "being added" downloads stop showing once the media server
+ * lists the title.
  */
 
 class ProbeScanner extends BaseScanner<unknown> {
@@ -43,33 +43,33 @@ describe('a media server scan', () => {
   it('takes an item away from the title it was wrongly matched to', async () => {
     const scanner = new ProbeScanner();
     scanner.begin();
-    // Plex first took the new "Carrie" for "The Carrie Diaries".
-    await scanner.seeShow(46157, '126741');
+    // Plex first mismatches the new "Wrenna" as "The Wrenna Diaries".
+    await scanner.seeShow(57284, '126741');
     const wrong = await getRepository(Media).findOneOrFail({
-      where: { tmdbId: 46157, mediaType: MediaType.TV },
+      where: { tmdbId: 57284, mediaType: MediaType.TV },
       relations: { seasons: true },
     });
     assert.equal(wrong.status, MediaStatus.PARTIALLY_AVAILABLE);
 
-    // Corrected, the same item is now Carrie (2026), which Sonarr has.
+    // After correction the same item is Wrenna (2026), which Sonarr has.
     await getRepository(Media).save(
       new Media({
-        tmdbId: 288673,
+        tmdbId: 375182,
         mediaType: MediaType.TV,
         status: MediaStatus.PROCESSING,
         serviceId: 0,
         externalServiceId: 1286,
       })
     );
-    await scanner.seeShow(288673, '126741');
+    await scanner.seeShow(375182, '126741');
 
     const right = await getRepository(Media).findOneOrFail({
-      where: { tmdbId: 288673, mediaType: MediaType.TV },
+      where: { tmdbId: 375182, mediaType: MediaType.TV },
     });
     assert.equal(right.ratingKey, '126741');
     assert.equal(right.status, MediaStatus.PARTIALLY_AVAILABLE);
     const left = await getRepository(Media).findOneOrFail({
-      where: { tmdbId: 46157, mediaType: MediaType.TV },
+      where: { tmdbId: 57284, mediaType: MediaType.TV },
       relations: { seasons: true },
     });
     assert.equal(left.ratingKey, null);
@@ -98,6 +98,29 @@ describe('a media server scan', () => {
       where: { tmdbId: 9001, mediaType: MediaType.MOVIE },
     });
     assert.equal(other.ratingKey, null);
+    assert.equal(other.status, MediaStatus.AVAILABLE);
+  });
+
+  it('leaves a title another server still has as it is', async () => {
+    const scanner = new ProbeScanner();
+    scanner.begin();
+    await getRepository(Media).save(
+      new Media({
+        tmdbId: 9011,
+        mediaType: MediaType.TV,
+        status: MediaStatus.AVAILABLE,
+        ratingKey: '556',
+        jellyfinMediaId: 'jf-9011',
+        seasons: [],
+      })
+    );
+    // Plex's item is now another show; Jellyfin still has this one.
+    await scanner.seeShow(9012, '556');
+    const other = await getRepository(Media).findOneOrFail({
+      where: { tmdbId: 9011, mediaType: MediaType.TV },
+    });
+    assert.equal(other.ratingKey, null);
+    assert.equal(other.jellyfinMediaId, 'jf-9011');
     assert.equal(other.status, MediaStatus.AVAILABLE);
   });
 

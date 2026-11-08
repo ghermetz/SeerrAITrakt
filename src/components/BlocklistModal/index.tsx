@@ -14,14 +14,14 @@ interface BlocklistModalProps {
   tmdbId: number;
   type: 'movie' | 'tv' | 'collection';
   show: boolean;
-  /** Called with the reason typed, if any, when the blocklist is confirmed. */
+  /** Called on confirm with the typed reason, if any. */
   onComplete?: (reason?: string) => void;
   onCancel?: () => void;
   isUpdating?: boolean;
   /**
-   * The title is already requested or downloaded, so blocklisting it will
-   * also remove it from Radarr/Sonarr and delete its files. Shown as a
-   * warning, with the button saying so, because it cannot be undone.
+   * The title is requested or downloaded, so blocklisting also removes it
+   * from Radarr/Sonarr and deletes its files. Shown as a warning since it
+   * can't be undone.
    */
   removesFiles?: boolean;
 }
@@ -32,7 +32,7 @@ const messages = defineMessages('component.BlocklistModal', {
   reason: 'Reason',
   reasonplaceholder: 'Reason (optional)',
   removesfiles:
-    'This will also remove it from {arr} and permanently delete its files, and decline any open requests for it. This cannot be undone.',
+    'Also removes it from {arr}, deletes its files and declines open requests. This can’t be undone.',
 });
 
 const isCollection = (
@@ -69,8 +69,7 @@ const BlocklistModal = ({
   const [reason, setReason] = useState('');
 
   useEffect(() => {
-    // Each opening starts blank, so a reason typed for one title never
-    // carries over to the next.
+    // Reset on open so a reason never carries over to the next title.
     if (show) {
       setReason('');
     }
@@ -131,7 +130,7 @@ const BlocklistModal = ({
         backdrop={`https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${data?.backdropPath}`}
       >
         {removesFiles && (
-          <p className="mb-4 text-sm text-red-300">
+          <p className="mb-4 text-sm text-red-300 light:text-danger-text">
             {intl.formatMessage(messages.removesfiles, {
               arr: type === 'movie' ? 'Radarr' : 'Sonarr',
             })}

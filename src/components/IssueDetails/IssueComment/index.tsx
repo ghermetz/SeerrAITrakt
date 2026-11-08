@@ -59,11 +59,9 @@ const IssueComment = ({
     try {
       await axios.delete(`/api/v1/issueComment/${comment.id}`);
     } catch {
-      // something went wrong deleting the comment
+      // Ignored; onUpdate refreshes the list either way.
     } finally {
-      if (onUpdate) {
-        onUpdate();
-      }
+      onUpdate?.();
     }
   };
 
@@ -146,7 +144,7 @@ const IssueComment = ({
                                 onClick={() => setIsEditing(true)}
                                 className={`block w-full px-4 py-2 text-left text-sm ${
                                   active
-                                    ? 'bg-gray-600 text-white'
+                                    ? 'bg-gray-600 text-strong'
                                     : 'text-gray-100'
                                 }`}
                               >
@@ -161,7 +159,7 @@ const IssueComment = ({
                               onClick={() => setShowDeleteModal(true)}
                               className={`block w-full px-4 py-2 text-left text-sm ${
                                 active
-                                  ? 'bg-gray-600 text-white'
+                                  ? 'bg-gray-600 text-strong'
                                   : 'text-gray-100'
                               }`}
                             >
@@ -190,9 +188,7 @@ const IssueComment = ({
                     message: values.newMessage,
                   });
 
-                  if (onUpdate) {
-                    onUpdate();
-                  }
+                  onUpdate?.();
 
                   setIsEditing(false);
                 }}
@@ -258,7 +254,7 @@ const IssueComment = ({
                     href={
                       isActiveUser ? '/profile' : `/users/${comment.user.id}`
                     }
-                    className="font-semibold text-gray-100 transition duration-300 hover:text-white hover:underline"
+                    className="font-semibold text-gray-100 transition duration-300 hover:text-strong hover:underline"
                   >
                     {comment.user.displayName}
                   </Link>

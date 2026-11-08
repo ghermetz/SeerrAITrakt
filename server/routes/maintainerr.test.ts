@@ -23,8 +23,8 @@ import path from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
 /*
- * Maintainerr integration against two fake Maintainerr servers that speak its
- * real API shapes, with Seerr's routes behind the real OpenAPI validator.
+ * Maintainerr integration against two fake Maintainerr servers using its real
+ * API shapes, with Seerr's routes behind the real OpenAPI validator.
  */
 
 setupTestDb();
@@ -52,6 +52,8 @@ interface Fake {
   collections: FakeCollection[];
   media: Record<number, FakeMedia[]>;
   postpones: { collectionId: number; mediaId: string; days?: number }[];
+  /** How many times its rules were read. */
+  reads: number;
   server: http.Server;
   port: number;
 }
@@ -62,6 +64,7 @@ const makeFake = async (): Promise<Fake> => {
     collections: [],
     media: {},
     postpones: [],
+    reads: 0,
   } as unknown as Fake;
   fake.server = http.createServer((req, res) => {
     if (!fake.up) {
@@ -74,7 +77,10 @@ const makeFake = async (): Promise<Fake> => {
       res.end(JSON.stringify(body));
     };
     if (url.pathname === '/api/settings/version') return send('2.20.0');
-    if (url.pathname === '/api/collections') return send(fake.collections);
+    if (url.pathname === '/api/collections') {
+      fake.reads += 1;
+      return send(fake.collections);
+    }
     if (url.pathname === '/api/collections/media/') {
       return send(
         fake.media[Number(url.searchParams.get('collectionId'))] ?? []
@@ -116,6 +122,7 @@ const seed = () => {
   for (const fake of [a, b]) {
     fake.up = true;
     fake.postpones = [];
+    fake.reads = 0;
   }
   a.collections = [
     {
@@ -255,7 +262,7 @@ const seed = () => {
       },
     ],
   };
-  // A second server also holds movie 101, sooner; and one title of its own.
+  // A second server also holds movie 101, sooner, plus one title of its own.
   b.collections = [
     {
       id: 40,
@@ -635,6 +642,35 @@ describe('Keep', () => {
     assert.equal(status, 404);
   });
 
+  it('does not ask Maintainerr again each time someone keeps what is not scheduled', async () => {
+    for (let i = 0; i < 3; i++) {
+      const { status } = await call('POST', '/api/v1/maintainerr/keep', {
+        tmdbId: 999 + i,
+        mediaType: 'movie',
+      });
+      assert.equal(status, 404);
+    }
+    assert.equal(a.reads, 1, 'read once, when first asked');
+  });
+
+  it('leaves alone a server that does not allow it, even when its deletion is further off', async () => {
+    // B deletes 101 tomorrow, but its window is shorter still, so only A's
+    // deletion counts as soon and Keep is offered.
+    getSettings().maintainerr = [
+      server(a, 0),
+      server(b, 1, { allowKeep: false, soonDays: 0 }),
+    ];
+    assert.equal(find((await deleting()).items, 101)!.canKeep, true);
+
+    const { status } = await call('POST', '/api/v1/maintainerr/keep', {
+      tmdbId: 101,
+      mediaType: 'movie',
+    });
+    assert.equal(status, 200);
+    assert.deepEqual(a.postpones, [{ collectionId: 1, mediaId: 'a-101' }]);
+    assert.deepEqual(b.postpones, []);
+  });
+
   it('reports a Maintainerr failure without pretending it worked', async () => {
     await deleting();
     a.up = false;
@@ -674,8 +710,8 @@ describe('Maintainerr servers in settings', () => {
       '/api/v1/settings/maintainerr',
       { ...server(b, 0), id: undefined, name: 'Third' }
     );
-    // Titles may still carry the removed server's id, so the new one must
-    // not take it over.
+    // Titles may still carry the removed server's id, so the new one must not
+    // reuse it.
     assert.equal(third.body.id, 2, 'one past the highest it has ever had');
 
     const { body } = await call<MaintainerrSettings[]>(

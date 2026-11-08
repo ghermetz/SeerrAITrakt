@@ -32,7 +32,7 @@ class TestExternalAPI extends ExternalAPI {
   }
 }
 
-// constructed before any test configures the proxy, like BaseScanner.tmdb
+// Constructed before any test configures the proxy, like BaseScanner.tmdb.
 const preProxyClient = new TestExternalAPI();
 
 const proxySettings: ProxySettings = {
@@ -68,5 +68,22 @@ describe('proxy routing (construction-order independence)', () => {
     await createCustomProxyAgent(proxySettings);
     const agent = await new TestExternalAPI().resolvedHttpsAgent();
     assert.ok(agent instanceof HttpsProxyAgent);
+  });
+
+  it('stops routing through the proxy once it is turned off, with no restart', async () => {
+    await createCustomProxyAgent(proxySettings);
+    assert.ok(
+      (await preProxyClient.resolvedHttpsAgent()) instanceof HttpsProxyAgent
+    );
+
+    await createCustomProxyAgent({ ...proxySettings, enabled: false });
+    const agent = await preProxyClient.resolvedHttpsAgent();
+    assert.ok(!(agent instanceof HttpsProxyAgent));
+
+    await createCustomProxyAgent({ ...proxySettings, port: 3129 });
+    const moved = await preProxyClient.resolvedHttpsAgent();
+    assert.ok(moved instanceof HttpsProxyAgent);
+    assert.equal((moved as HttpsProxyAgent<string>).proxy.port, '3129');
+    await createCustomProxyAgent({ ...proxySettings, enabled: false });
   });
 });

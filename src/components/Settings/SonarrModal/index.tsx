@@ -1,6 +1,8 @@
 import Modal from '@app/components/Common/Modal';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
+import ProfileFolders from '@app/components/Settings/ProfileFolders';
 import type { SonarrTestResponse } from '@app/components/Settings/SettingsServices';
+import { arrTestFailure } from '@app/components/Settings/arrTestFailure';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
@@ -21,6 +23,11 @@ type OptionType = {
 };
 
 const messages = defineMessages('components.Settings.SonarrModal', {
+  seriesTypeStandard: 'Standard',
+  seriesTypeDaily: 'Daily',
+  seriesTypeAnime: 'Anime',
+  monitorAll: 'All',
+  monitorNone: 'None',
   createsonarr: 'Add New Sonarr Server',
   create4ksonarr: 'Add New 4K Sonarr Server',
   editsonarr: 'Edit Sonarr Server',
@@ -53,8 +60,7 @@ const messages = defineMessages('components.Settings.SonarrModal', {
   animerootfolder: 'Anime Root Folder',
   seasonfolders: 'Season Folders',
   server4k: '4K Server',
-  server4kHelp:
-    'Only if you have a separate 4K instance. Leave unchecked for a single server.',
+  server4kHelp: 'Only for a separate 4K instance.',
   selectQualityProfile: 'Select quality profile',
   selectRootFolder: 'Select root folder',
   selectLanguageProfile: 'Select language profile',
@@ -70,8 +76,7 @@ const messages = defineMessages('components.Settings.SonarrModal', {
   externalUrl: 'External URL',
   enableSearch: 'Enable Automatic Search',
   tagRequests: 'Tag Requests',
-  tagRequestsInfo:
-    "Automatically add an additional tag with the requester's user ID & display name",
+  tagRequestsInfo: 'Tag each title with the requester’s user ID and name',
   validationApplicationUrl: 'You must provide a valid URL',
   validationApplicationUrlTrailingSlash: 'URL must not end in a trailing slash',
   validationBaseUrlLeadingSlash: 'Base URL must have a leading slash',
@@ -82,16 +87,15 @@ const messages = defineMessages('components.Settings.SonarrModal', {
   selecttags: 'Select tags',
   monitorNewItems: 'Monitor New Seasons',
   monitorNewItemsHelp:
-    'Whether Sonarr should monitor (All) or not (None) new seasons when a series is added.',
+    'Whether Sonarr monitors new seasons (All) or not (None).',
   apiKeyHelp: 'Find it in Sonarr: Settings > General > Security > API Key',
   baseUrlHelp:
-    'If you set a URL Base in Sonarr (Settings > General > Host), enter it here (e.g. /sonarr). Leave blank otherwise.',
+    'Only if Sonarr has a URL Base (Settings > General > Host), such as /sonarr.',
   externalUrlHelp:
-    'For clickable links on media pages when the hostname is not reachable from outside your network.',
+    'For links on title pages, if the address above isn’t reachable from outside.',
   syncEnabledHelp:
-    'Scan Sonarr for existing media and request status so users cannot request content already available.',
-  enableSearchHelp:
-    'Automatically trigger a search in Sonarr when a request is approved.',
+    'Mark what Sonarr already has as available, so it isn’t requested again.',
+  enableSearchHelp: 'Search in Sonarr as soon as a request is approved.',
 });
 
 interface SonarrModalProps {
@@ -104,7 +108,7 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
   const intl = useIntl();
   const initialLoad = useRef(false);
   const { addToast } = useToasts();
-  const [isValidated, setIsValidated] = useState(sonarr ? true : false);
+  const [isValidated, setIsValidated] = useState(!!sonarr);
   const [isTesting, setIsTesting] = useState(false);
   const [testResponse, setTestResponse] = useState<SonarrTestResponse>({
     profiles: [],
@@ -196,13 +200,16 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
             autoDismiss: true,
           });
         }
-      } catch {
+      } catch (e) {
         setIsValidated(false);
         if (initialLoad.current) {
-          addToast(intl.formatMessage(messages.toastSonarrTestFailure), {
-            appearance: 'error',
-            autoDismiss: true,
-          });
+          addToast(
+            arrTestFailure(intl, e, 'Sonarr', messages.toastSonarrTestFailure),
+            {
+              appearance: 'error',
+              autoDismiss: true,
+            }
+          );
         }
       } finally {
         setIsTesting(false);
@@ -261,6 +268,7 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
           syncEnabled: sonarr?.syncEnabled ?? false,
           enableSearch: !sonarr?.preventSearch,
           tagRequests: sonarr?.tagRequests ?? false,
+          profileFolders: sonarr?.profileFolders ?? [],
           monitorNewItems: sonarr?.monitorNewItems ?? 'all',
         }}
         validationSchema={SonarrSettingsSchema}
@@ -305,6 +313,7 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
               syncEnabled: values.syncEnabled,
               preventSearch: !values.enableSearch,
               tagRequests: values.tagRequests,
+              profileFolders: values.profileFolders,
               monitorNewItems: values.monitorNewItems,
             };
             if (!sonarr) {
@@ -571,8 +580,12 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
                         name="seriesType"
                         disabled={!isValidated || isTesting}
                       >
-                        <option value="standard">Standard</option>
-                        <option value="daily">Daily</option>
+                        <option value="standard">
+                          {intl.formatMessage(messages.seriesTypeStandard)}
+                        </option>
+                        <option value="daily">
+                          {intl.formatMessage(messages.seriesTypeDaily)}
+                        </option>
                       </Field>
                     </div>
                   </div>
@@ -725,6 +738,7 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
                   </label>
                   <div className="form-input-area">
                     <Select<OptionType, true>
+                      inputId="tags"
                       options={
                         isValidated
                           ? testResponse.tags.map((tag) => ({
@@ -791,8 +805,12 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
                         name="animeSeriesType"
                         disabled={!isValidated || isTesting}
                       >
-                        <option value="anime">Anime</option>
-                        <option value="standard">Standard</option>
+                        <option value="anime">
+                          {intl.formatMessage(messages.seriesTypeAnime)}
+                        </option>
+                        <option value="standard">
+                          {intl.formatMessage(messages.seriesTypeStandard)}
+                        </option>
                       </Field>
                     </div>
                   </div>
@@ -937,11 +955,12 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
                   </div>
                 )}
                 <div className="form-row">
-                  <label htmlFor="tags" className="text-label">
+                  <label htmlFor="animeTags" className="text-label">
                     {intl.formatMessage(messages.animeTags)}
                   </label>
                   <div className="form-input-area">
                     <Select<OptionType, true>
+                      inputId="animeTags"
                       options={
                         isValidated
                           ? testResponse.tags.map((tag) => ({
@@ -1026,8 +1045,12 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
                         name="monitorNewItems"
                         disabled={!isValidated || isTesting}
                       >
-                        <option value="all">All</option>
-                        <option value="none">None</option>
+                        <option value="all">
+                          {intl.formatMessage(messages.monitorAll)}
+                        </option>
+                        <option value="none">
+                          {intl.formatMessage(messages.monitorNone)}
+                        </option>
                       </Field>
                     </div>
                   </div>
@@ -1035,6 +1058,13 @@ const SonarrModal = ({ onClose, sonarr, onSave }: SonarrModalProps) => {
                     <div className="error">{errors.monitorNewItems}</div>
                   )}
                 </div>
+                <ProfileFolders
+                  profiles={testResponse.profiles}
+                  rootFolders={testResponse.rootFolders}
+                  value={values.profileFolders}
+                  onChange={(value) => setFieldValue('profileFolders', value)}
+                  disabled={!isValidated || isTesting}
+                />
                 <div className="form-row">
                   <label htmlFor="externalUrl" className="text-label">
                     {intl.formatMessage(messages.externalUrl)}

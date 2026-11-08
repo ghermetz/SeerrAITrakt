@@ -1,4 +1,5 @@
 import { magnetHash, parseTorrent } from '@server/lib/backfill/bencode';
+import { isMissing } from '@server/lib/backfill/engine';
 import type { SeriesContext } from '@server/lib/backfill/matcher';
 import {
   judgePack,
@@ -9,13 +10,21 @@ import {
   canonicalName,
   isExtra,
   readNumbers,
+  releaseGroup,
   releaseTags,
 } from '@server/lib/backfill/naming';
-import { packingOf, parseNzb, readNzb } from '@server/lib/backfill/nzb';
+import {
+  nzbWith,
+  packingOf,
+  parseNzb,
+  readNzb,
+} from '@server/lib/backfill/nzb';
 import type { PlanEntry } from '@server/lib/backfill/plan';
 import {
   decide,
   dedupe,
+  filmOutAWhile,
+  filmOutSince,
   multiMustWait,
   rankCandidates,
   selectEntries,
@@ -29,15 +38,16 @@ import type {
   SonarrParseResult,
   SonarrQualityProfile,
 } from '@server/lib/backfill/sonarr';
+import { getSettings } from '@server/lib/settings';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { describe, it } from 'node:test';
 
 /*
- * The canonical names below are the ones Sonarr was asked about on the live
- * server while this was built: Sonarr maps them to the right episode and
- * scores them as the real release (Judas's Naruto 202 as Bluray-1080p, +700;
- * HuangSubs' Perfect World 131 under its 2021 title, +403).
+ * The canonical names below were checked against a live Sonarr: it maps
+ * them to the right episode and scores them as the real release (Tengu's
+ * Kitsuraga 202 as Bluray-1080p, +700; LiangSubs' Ninefold Sky 131 under its
+ * 2021 title, +403).
  */
 
 /** The fork's "Anime 1080p" profile, as Sonarr returns it, trimmed. */
@@ -83,12 +93,12 @@ const q = (id: number, name: string, version = 1) => ({
   revision: { version, real: 0 },
 });
 
-const JUDAS_PACK =
-  '[Judas] Naruto (Complete Series) [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]';
+const TENGU_PACK =
+  '[Tengu] Kitsuraga (Complete Series) [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]';
 
 describe('Backfill: reading names', () => {
   it('takes the absolute number in brackets after a pack’s own SxxEyy', () => {
-    assert.deepEqual(readNumbers('[Judas] Naruto - S05E17 (202)'), {
+    assert.deepEqual(readNumbers('[Tengu] Kitsuraga - S05E17 (202)'), {
       season: 5,
       episode: 17,
       absolute: 202,
@@ -98,9 +108,9 @@ describe('Backfill: reading names', () => {
   it('reads a file holding several episodes, however the range is written', () => {
     const range = { season: 6, episode: 1, through: 2 };
     for (const name of [
-      'Shaun the Sheep - S06E01-02 - Baa-gherita + Get Your Goat.mkv',
-      'Shaun.the.Sheep.S06E01E02.1080p.mkv',
-      'Shaun.the.Sheep.S06E01-E02.720p.mkv',
+      'Bramwell the Goat - S06E01-02 - Bleat-ballad + Hold Your Hooves.mkv',
+      'Bramwell.the.Goat.S06E01E02.1080p.mkv',
+      'Bramwell.the.Goat.S06E01-E02.720p.mkv',
     ]) {
       assert.deepEqual(readNumbers(name), range, name);
     }
@@ -117,41 +127,53 @@ describe('Backfill: reading names', () => {
 
   it('reads " - 131v3" as episode 131, version 3', () => {
     assert.deepEqual(
-      readNumbers('[HuangSubs] Perfect World - 131v3 (1080P HEVC AAC)'),
+      readNumbers('[LiangSubs] Ninefold Sky - 131v3 (1080P HEVC AAC)'),
       { absolute: 131, version: 3 }
     );
   });
 
   it('keeps a pack’s quality tags and drops what describes the pack', () => {
     assert.equal(
-      releaseTags(JUDAS_PACK),
+      releaseTags(TENGU_PACK),
       '[BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]'
     );
     assert.equal(
-      releaseTags('Baggage.S01-S04.480p.WEB-DL.x264-GRP'),
+      releaseTags('Carryall.S01-S04.480p.WEB-DL.x264-GRP'),
       '480p WEB-DL x264'
     );
+  });
+
+  it('reads tags and group from very long bracket- or dash-heavy names quickly', () => {
+    const started = performance.now();
+    assert.equal(releaseTags(`${'('.repeat(20_000)}Glasswing`), '');
+    assert.ok(releaseTags(`Glasswing ${'[1080p'.repeat(5_000)}]`).length > 0);
+    assert.equal(releaseGroup(`Glasswing${'-a['.repeat(8_000)}`), undefined);
+    assert.equal(
+      releaseGroup(`${'Static.Garden.'.repeat(2_000)}1080p.WEB-GRP`),
+      'GRP'
+    );
+    assert.ok(performance.now() - started < 1000);
   });
 
   it('builds the names Sonarr was shown to judge correctly', () => {
     assert.equal(
       canonicalName({
-        fileName: '[Judas] Naruto - S05E17 (202)',
-        packTitle: JUDAS_PACK,
-        seriesTitle: 'Naruto',
+        fileName: '[Tengu] Kitsuraga - S05E17 (202)',
+        packTitle: TENGU_PACK,
+        seriesTitle: 'Kitsuraga',
         number: { absolute: 202 },
       }),
-      '[Judas] Naruto - 202 [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]'
+      '[Tengu] Kitsuraga - 202 [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]'
     );
     assert.equal(
       canonicalName({
-        fileName: '[HuangSubs] Perfect World - 131v3 (1080P HEVC AAC)',
-        packTitle: '[HuangSubs] Perfect World (1080p)',
-        seriesTitle: 'Perfect World (2021)',
+        fileName: '[LiangSubs] Ninefold Sky - 131v3 (1080P HEVC AAC)',
+        packTitle: '[LiangSubs] Ninefold Sky (1080p)',
+        seriesTitle: 'Ninefold Sky (2021)',
         number: { absolute: 131 },
         version: 3,
       }),
-      '[HuangSubs] Perfect World 2021 - 131v3 (1080P HEVC AAC)'
+      '[LiangSubs] Ninefold Sky 2021 - 131v3 (1080P HEVC AAC)'
     );
   });
 
@@ -161,24 +183,24 @@ describe('Backfill: reading names', () => {
       episode: 1,
       through: 2,
     });
-    // Both names were checked with Sonarr's own parser on the live server.
+    // Both names checked against a live Sonarr's parser.
     assert.equal(
       canonicalName({
         fileName: 'Show.S01E01E02.1080p.WEB-DL-GRP',
-        packTitle: 'Perfect World 2021 S01 1080p WEB-DL-GRP',
-        seriesTitle: 'Perfect World (2021)',
+        packTitle: 'Ninefold Sky 2021 S01 1080p WEB-DL-GRP',
+        seriesTitle: 'Ninefold Sky (2021)',
         number: { season: 1, episode: 1, through: 2 },
       }),
-      'Perfect World 2021 S01E01-E02 1080p WEB-DL-GRP'
+      'Ninefold Sky 2021 S01E01-E02 1080p WEB-DL-GRP'
     );
     assert.equal(
       canonicalName({
-        fileName: '[Judas] Naruto - 01-02.mkv',
-        packTitle: JUDAS_PACK,
-        seriesTitle: 'Naruto',
+        fileName: '[Tengu] Kitsuraga - 01-02.mkv',
+        packTitle: TENGU_PACK,
+        seriesTitle: 'Kitsuraga',
         number: { absolute: 1, through: 2 },
       }),
-      '[Judas] Naruto - 01-02 [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]'
+      '[Tengu] Kitsuraga - 01-02 [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]'
     );
   });
 
@@ -186,15 +208,15 @@ describe('Backfill: reading names', () => {
     assert.ok(isExtra('Show/Extras/Making of.mkv'));
     assert.ok(isExtra('Show - 01 sample.mkv'));
     assert.ok(isExtra('[Group] Show - NCOP1.mkv'));
-    assert.ok(!isExtra('[Judas] Naruto - S05E17 (202).mkv'));
+    assert.ok(!isExtra('[Tengu] Kitsuraga - S05E17 (202).mkv'));
   });
 
   it('tells this show from one that only starts the same way', () => {
-    const names = ['Naruto', 'Naruto (2002)'];
-    assert.ok(sameShow('Naruto', names));
-    assert.ok(sameShow('Naruto 2002', names));
-    assert.ok(!sameShow('Naruto Shippuuden', names));
-    assert.ok(mentionsShow('[Erai-raws] Naruto Shippuuden - 080', names));
+    const names = ['Kitsuraga', 'Kitsuraga (2002)'];
+    assert.ok(sameShow('Kitsuraga', names));
+    assert.ok(sameShow('Kitsuraga 2002', names));
+    assert.ok(!sameShow('Kitsuraga Tsumuuden', names));
+    assert.ok(mentionsShow('[Kaze-raws] Kitsuraga Tsumuuden - 080', names));
   });
 });
 
@@ -225,17 +247,17 @@ const ben = (value: unknown): Buffer => {
 describe('Backfill: torrents and NZBs', () => {
   it('lists a torrent’s files, folder first, and works out its hash', () => {
     const info = {
-      name: '[Judas] Naruto',
+      name: '[Tengu] Kitsuraga',
       'piece length': 4194304,
       pieces: Buffer.alloc(20),
       files: [
         {
           length: 476_000_000,
-          path: ['S5', '[Judas] Naruto - S05E17 (202).mkv'],
+          path: ['S5', '[Tengu] Kitsuraga - S05E17 (202).mkv'],
         },
         {
           length: 274_000_000,
-          path: ['S1', '[Judas] Naruto - S01E02 (002).mkv'],
+          path: ['S1', '[Tengu] Kitsuraga - S01E02 (002).mkv'],
         },
       ],
     };
@@ -248,12 +270,12 @@ describe('Backfill: torrents and NZBs', () => {
     assert.deepEqual(meta.files, [
       {
         index: 0,
-        path: '[Judas] Naruto/S5/[Judas] Naruto - S05E17 (202).mkv',
+        path: '[Tengu] Kitsuraga/S5/[Tengu] Kitsuraga - S05E17 (202).mkv',
         size: 476_000_000,
       },
       {
         index: 1,
-        path: '[Judas] Naruto/S1/[Judas] Naruto - S01E02 (002).mkv',
+        path: '[Tengu] Kitsuraga/S1/[Tengu] Kitsuraga - S01E02 (002).mkv',
         size: 274_000_000,
       },
     ]);
@@ -286,6 +308,40 @@ describe('Backfill: torrents and NZBs', () => {
     assert.ok(Date.now() - started < 1000);
   });
 
+  it('reads an NZB whose subject has a character number no character has', () => {
+    const files = parseNzb(
+      '<nzb><file subject="&#99999999; &#x41;&quot;show.s01e01.mkv&quot;"><segment bytes="5">a@b</segment></file></nzb>'
+    );
+    assert.deepEqual(files, [{ index: 0, name: 'show.s01e01.mkv', size: 5 }]);
+  });
+
+  it('reads a subject with a very long unspaced run at once', () => {
+    const started = performance.now();
+    const files = parseNzb(
+      `<nzb><file subject="${'a'.repeat(1_000_000)}"><segment bytes="5">a@b</segment></file></nzb>`
+    );
+    assert.ok(performance.now() - started < 50);
+    assert.deepEqual(files, []);
+  });
+
+  it('reads an unquoted file name from a subject, after any folder', () => {
+    const named = (subject: string) =>
+      parseNzb(
+        `<nzb><file subject="${subject}"><segment bytes="5">a@b</segment></file></nzb>`
+      )[0]?.name;
+    assert.equal(
+      named('[01/12] - Harbour.Lights.S01E01.1080p.mkv yEnc (1/50)'),
+      'Harbour.Lights.S01E01.1080p.mkv'
+    );
+    assert.equal(
+      named('Glasswing/Static.Garden/03.Lantern.flac (1/2)'),
+      '03.Lantern.flac'
+    );
+    assert.equal(named('Static.Garden.part01.rar'), 'Static.Garden.part01.rar');
+    assert.equal(named('Lantern.flac/ yEnc'), undefined);
+    assert.equal(named('no name here'), undefined);
+  });
+
   it('reads a magnet link’s hash, hex or base32', () => {
     assert.equal(
       magnetHash(
@@ -299,18 +355,88 @@ describe('Backfill: torrents and NZBs', () => {
     );
   });
 
+  it('reads a magnet’s hash only from a single agreeing xt parameter', () => {
+    const one = 'ab'.repeat(20);
+    const two = 'cd'.repeat(20);
+    assert.equal(magnetHash(`magnet:?dn=Glasswing&xt=urn:btih:${one}`), one);
+    assert.equal(
+      magnetHash(`magnet:?xt=urn:btih:${one}&xt=urn:btih:${one.toUpperCase()}`),
+      one
+    );
+    assert.equal(
+      magnetHash(`magnet:?dn=Glasswing.xt=urn:btih:${one}&xt=urn:btih:${two}`),
+      two
+    );
+    assert.equal(
+      magnetHash(`magnet:?xt=urn:btih:${one}&xt=urn:btih:${two}`),
+      undefined
+    );
+    assert.equal(magnetHash(`magnet:?dn=xt=urn:btih:${one}`), undefined);
+    assert.equal(magnetHash(`magnet:?xt=urn:btih:${one}0`), undefined);
+    assert.equal(
+      magnetHash(`https://example.invalid/?xt=urn:btih:${one}`),
+      undefined
+    );
+  });
+
+  it('reads a torrent whose keys are named like object properties as plain keys', () => {
+    const info = Buffer.concat([
+      Buffer.from('d9:__proto__'),
+      ben({ files: [{ length: 5, path: ['Static Garden.mkv'] }] }),
+      Buffer.from('6:lengthi10e4:name14:Harbour Lights12:piece lengthi16384e'),
+      Buffer.from('6:pieces20:'),
+      Buffer.alloc(20),
+      Buffer.from('e'),
+    ]);
+    const meta = parseTorrent(
+      Buffer.concat([Buffer.from('d4:info'), info, Buffer.from('e')])
+    );
+    assert.deepEqual(meta.files, [
+      { index: 0, path: 'Harbour Lights', size: 10 },
+    ]);
+    assert.equal(meta.infoHash, createHash('sha1').update(info).digest('hex'));
+  });
+
+  it('refuses a torrent with a repeated key', () => {
+    const info = ben({
+      name: 'Static Garden',
+      'piece length': 16384,
+      pieces: Buffer.alloc(20),
+      length: 10,
+    });
+    const other = ben({
+      name: 'Lantern Song',
+      'piece length': 16384,
+      pieces: Buffer.alloc(20),
+      length: 20,
+    });
+    assert.throws(
+      () =>
+        parseTorrent(
+          Buffer.concat([
+            Buffer.from('d4:info'),
+            info,
+            Buffer.from('4:info'),
+            other,
+            Buffer.from('e'),
+          ])
+        ),
+      /repeats/
+    );
+  });
+
   it('reads an NZB’s files from their subjects, and spots RAR posts', () => {
     const nzb = `<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
-      <file poster="p" date="1" subject="[1/3] - &quot;[HuangSubs] Perfect World - 153 (1080p HEVC AAC).mkv&quot; yEnc (1/2)">
+      <file poster="p" date="1" subject="[1/3] - &quot;[LiangSubs] Ninefold Sky - 153 (1080p HEVC AAC).mkv&quot; yEnc (1/2)">
         <segments><segment bytes="700000" number="1">a@b</segment><segment bytes="300000" number="2">c@d</segment></segments>
       </file>
-      <file poster="p" date="1" subject="[2/3] - &quot;Perfect.World.153.par2&quot; yEnc (1/1)">
+      <file poster="p" date="1" subject="[2/3] - &quot;Ninefold.Sky.153.par2&quot; yEnc (1/1)">
         <segments><segment bytes="1000" number="1">e@f</segment></segments>
       </file></nzb>`;
     const files = parseNzb(nzb);
     assert.deepEqual(files[0], {
       index: 0,
-      name: '[HuangSubs] Perfect World - 153 (1080p HEVC AAC).mkv',
+      name: '[LiangSubs] Ninefold Sky - 153 (1080p HEVC AAC).mkv',
       size: 1_000_000,
     });
     assert.equal(packingOf(readNzb(nzb)), undefined);
@@ -323,6 +449,40 @@ describe('Backfill: torrents and NZBs', () => {
         unnamedBytes: 0,
       }),
       'archives'
+    );
+    // An album's post names its songs.
+    assert.equal(
+      packingOf({
+        files: [
+          { index: 0, name: '01 - Opening.flac', size: 30_000_000 },
+          { index: 1, name: '02 - Lantern Song.flac', size: 40_000_000 },
+          { index: 2, name: 'album.par2', size: 1 },
+          { index: 3, name: 'album.nfo', size: 1 },
+        ],
+        unnamedBytes: 0,
+      }),
+      undefined
+    );
+  });
+
+  it('keeps only the files asked for, and its head', () => {
+    const file = (subject: string, bytes: number) =>
+      `<file poster="p" date="1" subject="${subject}"><groups><group>a.b.music</group></groups><segments><segment bytes="${bytes}" number="1">x@y</segment></segments></file>`;
+    const nzb = `<?xml version="1.0"?><nzb><head><meta type="title">Album</meta></head>${[
+      file('[1/3] - &quot;01 - Opening.flac&quot; yEnc (1/1)', 30),
+      file('[2/3] - &quot;02 - Lantern Song.flac&quot; yEnc (1/1)', 40),
+      file('[3/3] - &quot;album.par2&quot; yEnc (1/1)', 1),
+    ].join('')}</nzb>`;
+    const only = nzbWith(nzb, (f) => f.index === 1)!;
+    assert.deepEqual(
+      readNzb(only).files.map((f) => f.name),
+      ['02 - Lantern Song.flac']
+    );
+    assert.match(only, /<head><meta type="title">Album<\/meta><\/head>/);
+    assert.match(only, /<\/nzb>$/);
+    assert.equal(
+      nzbWith(nzb, () => false),
+      undefined
     );
   });
 
@@ -356,8 +516,7 @@ describe('Backfill: torrents and NZBs', () => {
       }),
       'scrambled'
     );
-    // Only repair data and a note, and no video: nothing to hide, just
-    // nothing in it.
+    // Only repair data and a note: not packed, just empty.
     assert.equal(
       packingOf({
         files: [
@@ -521,6 +680,81 @@ describe('Backfill: what Sonarr would take', () => {
     );
   });
 
+  it('leaves an episode that aired under 12 hours ago to Sonarr, and fills one aired before', () => {
+    const hoursAgo = (h: number) =>
+      new Date(Date.now() - h * 3_600_000).toISOString();
+    const fresh = new Map(episodes);
+    fresh.set(1, { ...episodes.get(1)!, airDateUtc: hoursAgo(2) });
+    const skipped = decide(entry(0, [1]), ANIME_1080P, fresh, files);
+    assert.equal(skipped.action, 'skip');
+    assert.match(skipped.reason ?? '', /Aired under 12 hours ago/);
+    assert.equal(isMissing(fresh.get(1)!, false), false);
+
+    fresh.set(1, { ...episodes.get(1)!, airDateUtc: hoursAgo(13) });
+    assert.equal(
+      decide(entry(0, [1]), ANIME_1080P, fresh, files).action,
+      'fill'
+    );
+    assert.equal(isMissing(fresh.get(1)!, false), true);
+  });
+
+  it('dates a film’s release by its Minimum Availability', () => {
+    const film = {
+      inCinemas: '2026-10-16T00:00:00Z',
+      releaseDate: '2027-01-14T00:00:00Z',
+      digitalRelease: '2027-01-14T00:00:00Z',
+      physicalRelease: '2027-02-01T00:00:00Z',
+    };
+    assert.equal(
+      filmOutSince({ ...film, minimumAvailability: 'released' }),
+      '2027-01-14T00:00:00Z'
+    );
+    assert.equal(
+      filmOutSince({ ...film, minimumAvailability: 'inCinemas' }),
+      '2026-10-16T00:00:00Z'
+    );
+    assert.equal(
+      filmOutSince({
+        minimumAvailability: 'released',
+        physicalRelease: '2027-02-01T00:00:00Z',
+        digitalRelease: '2027-01-20T00:00:00Z',
+      }),
+      '2027-01-20T00:00:00Z'
+    );
+    assert.equal(
+      filmOutSince({ ...film, minimumAvailability: 'announced' }),
+      undefined
+    );
+    // Nothing to wait from: Radarr has had it since it was added.
+    assert.equal(filmOutAWhile({ minimumAvailability: 'released' }), true);
+  });
+
+  it('waits as long as its setting says', (t) => {
+    const settings = getSettings();
+    const saved = settings.backfill;
+    t.after(() => {
+      settings.backfill = saved;
+    });
+    const waitFor = (hours: number) => {
+      settings.backfill = { ...saved, newReleaseWaitHours: hours };
+    };
+    const aired = {
+      ...episodes.get(1)!,
+      airDateUtc: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+    };
+    waitFor(1);
+    assert.equal(isMissing(aired, false), true);
+    waitFor(3);
+    assert.equal(isMissing(aired, false), false);
+    assert.match(
+      decide(entry(0, [1]), ANIME_1080P, new Map([[1, aired]]), files).reason ??
+        '',
+      /Aired under 3 hours ago/
+    );
+    waitFor(0);
+    assert.equal(isMissing(aired, false), true);
+  });
+
   it('ranks packs of files holding several episodes last, and takes them only when nothing else fills', () => {
     const fill = (index: number, ids: number[]): PlanEntry => ({
       ...entry(index, ids),
@@ -542,6 +776,25 @@ describe('Backfill: what Sonarr would take', () => {
     assert.equal(multiMustWait(doubles, [doubles, single, nothing]), true);
     assert.equal(multiMustWait(doubles, [doubles, nothing]), false);
     assert.equal(multiMustWait(single, [doubles, single]), false);
+  });
+
+  it('ranks a torrent nobody seeds after one somebody does, whatever else it fills', () => {
+    const fill = (index: number, ids: number[]): PlanEntry => ({
+      ...entry(index, ids),
+      action: 'fill',
+      replaces: 0,
+    });
+    const whole = summarize([fill(0, [1]), fill(1, [2]), fill(2, [3])]);
+    const one = summarize([fill(0, [1])]);
+    const packs = [
+      { title: 'unseeded', protocol: 'torrent', seeders: 0, summary: whole },
+      { title: 'seeded', protocol: 'torrent', seeders: 3, summary: one },
+      { title: 'usenet', protocol: 'usenet', seeders: null, summary: one },
+    ];
+    assert.deepEqual(
+      rankCandidates(packs).map((c) => c.title),
+      ['seeded', 'usenet', 'unseeded']
+    );
   });
 
   it('rejects what the profile does not allow, or scores too low', () => {
@@ -628,17 +881,17 @@ describe('Backfill: what Sonarr would take', () => {
 describe('Backfill: judging a pack', () => {
   /** What Sonarr answered on the live server, for these names. */
   const answers: Record<string, SonarrParseResult> = {
-    '[Judas] Naruto - S05E17 (202)': {
-      title: '[Judas] Naruto - S05E17 (202)',
+    '[Tengu] Kitsuraga - S05E17 (202)': {
+      title: '[Tengu] Kitsuraga - S05E17 (202)',
       parsedEpisodeInfo: {
-        seriesTitle: 'Naruto',
+        seriesTitle: 'Kitsuraga',
         quality: q(0, 'Unknown'),
         seasonNumber: 5,
         episodeNumbers: [17],
         absoluteEpisodeNumbers: [],
-        releaseGroup: 'Judas',
+        releaseGroup: 'Tengu',
       },
-      series: { id: 1279, title: 'Naruto' },
+      series: { id: 1279, title: 'Kitsuraga' },
       episodes: [
         {
           id: 145130,
@@ -653,16 +906,16 @@ describe('Backfill: judging a pack', () => {
       ],
       customFormatScore: 0,
     },
-    '[Judas] Naruto - 202 [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]':
+    '[Tengu] Kitsuraga - 202 [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]':
       {
         title: '',
         parsedEpisodeInfo: {
-          seriesTitle: 'Naruto',
+          seriesTitle: 'Kitsuraga',
           quality: q(7, 'Bluray-1080p'),
           absoluteEpisodeNumbers: [202],
-          releaseGroup: 'Judas',
+          releaseGroup: 'Tengu',
         },
-        series: { id: 1279, title: 'Naruto' },
+        series: { id: 1279, title: 'Kitsuraga' },
         episodes: [
           {
             id: 145136,
@@ -678,10 +931,10 @@ describe('Backfill: judging a pack', () => {
         languages: [{ id: 8, name: 'Japanese' }],
         customFormatScore: 700,
       },
-    '[Erai-raws] Naruto Shippuuden - 080 [1080p]': {
+    '[Kaze-raws] Kitsuraga Tsumuuden - 080 [1080p]': {
       title: '',
       parsedEpisodeInfo: {
-        seriesTitle: 'Naruto Shippuuden',
+        seriesTitle: 'Kitsuraga Tsumuuden',
         absoluteEpisodeNumbers: [80],
       },
       customFormatScore: 0,
@@ -691,12 +944,12 @@ describe('Backfill: judging a pack', () => {
   const ctx = (): SeriesContext => ({
     series: {
       id: 1279,
-      title: 'Naruto',
+      title: 'Kitsuraga',
       year: 2002,
-      tvdbId: 78857,
+      tvdbId: 63914,
       seriesType: 'anime',
       qualityProfileId: 13,
-      path: '/anime/Naruto',
+      path: '/anime/Kitsuraga',
     },
     episodes: [
       {
@@ -722,7 +975,7 @@ describe('Backfill: judging a pack', () => {
     ],
     files: [],
     profile: ANIME_1080P,
-    names: ['Naruto'],
+    names: ['Kitsuraga'],
     sonarr: {
       parse: async (title: string) => {
         const answer = answers[title];
@@ -732,17 +985,17 @@ describe('Backfill: judging a pack', () => {
     } as unknown as SeriesContext['sonarr'],
   });
 
-  it('maps a Judas file by its absolute number, not the pack’s SxxEyy', async () => {
+  it('maps a Tengu file by its absolute number, not the pack’s SxxEyy', async () => {
     const { plan, summary } = await judgePack(
       [
         {
           index: 0,
-          path: '[Judas] Naruto/S5/[Judas] Naruto - S05E17 (202).mkv',
+          path: '[Tengu] Kitsuraga/S5/[Tengu] Kitsuraga - S05E17 (202).mkv',
           size: 476e6,
         },
-        { index: 1, path: '[Judas] Naruto/S5/sample.mkv', size: 30e6 },
+        { index: 1, path: '[Tengu] Kitsuraga/S5/sample.mkv', size: 30e6 },
       ],
-      JUDAS_PACK,
+      TENGU_PACK,
       ctx()
     );
     assert.equal(plan.length, 1, 'the sample is passed over');
@@ -758,20 +1011,20 @@ describe('Backfill: judging a pack', () => {
       [
         {
           index: 0,
-          path: '[Erai-raws] Naruto Shippuuden - 080 [1080p].mkv',
+          path: '[Kaze-raws] Kitsuraga Tsumuuden - 080 [1080p].mkv',
           size: 500e6,
         },
       ],
-      '[Erai-raws] Naruto Shippuuden - 080 ~ 500 [1080p]',
+      '[Kaze-raws] Kitsuraga Tsumuuden - 080 ~ 500 [1080p]',
       ctx()
     );
     assert.equal(plan[0].action, 'reject');
-    assert.equal(plan[0].reason, 'Named as another show: Naruto Shippuuden');
+    assert.equal(plan[0].reason, 'Named as another show: Kitsuraga Tsumuuden');
   });
 });
 
 describe('Backfill: a two-part finale the scene numbers as one', () => {
-  // Blue Mountain State S03: the scene's S03E12 is TVDB's E12 and E13, as
+  // Grey Summit State S03: the scene's S03E12 is TVDB's E12 and E13, as
   // Sonarr answered on the live server, but the pack has a file for each.
   const ep = (id: number, episodeNumber: number, hasFile: boolean) => ({
     id,
@@ -788,12 +1041,12 @@ describe('Backfill: a two-part finale the scene numbers as one', () => {
   const ctx = (): SeriesContext => ({
     series: {
       id: 1243,
-      title: 'Blue Mountain State',
+      title: 'Grey Summit State',
       year: 2010,
-      tvdbId: 134511,
+      tvdbId: 245622,
       seriesType: 'standard',
       qualityProfileId: 13,
-      path: '/tv/Blue Mountain State',
+      path: '/tv/Grey Summit State',
     },
     episodes: [e12, e13],
     files: [
@@ -806,18 +1059,18 @@ describe('Backfill: a two-part finale the scene numbers as one', () => {
       },
     ],
     profile: ANIME_1080P,
-    names: ['Blue Mountain State'],
+    names: ['Grey Summit State'],
     sonarr: {
       parse: async (title: string) => ({
         title,
         parsedEpisodeInfo: {
-          seriesTitle: 'Blue Mountain State (2010)',
+          seriesTitle: 'Grey Summit State (2010)',
           quality: q(3, 'WEBDL-1080p'),
           seasonNumber: 3,
           episodeNumbers: [/S03E12/.test(title) ? 12 : 13],
-          releaseGroup: 'Panda',
+          releaseGroup: 'Koala',
         },
-        series: { id: 1243, title: 'Blue Mountain State' },
+        series: { id: 1243, title: 'Grey Summit State' },
         episodes: /S03E12/.test(title) ? [e13, e12] : [e13],
         customFormatScore: 885000,
       }),
@@ -829,16 +1082,16 @@ describe('Backfill: a two-part finale the scene numbers as one', () => {
       [
         {
           index: 11,
-          path: 'Blue Mountain State (2010) - S03E12 - The Corn Field (1) (1080p WEB-DL x265 Panda).mkv',
+          path: 'Grey Summit State (2010) - S03E12 - The Barley Patch (1) (1080p WEB-DL x265 Koala).mkv',
           size: 627e6,
         },
         {
           index: 12,
-          path: 'Blue Mountain State (2010) - S03E13 - The Corn Field (2) (1080p WEB-DL x265 Panda).mkv',
+          path: 'Grey Summit State (2010) - S03E13 - The Barley Patch (2) (1080p WEB-DL x265 Koala).mkv',
           size: 627e6,
         },
       ],
-      'Blue Mountain State (2010) Season 3 S03 (1080p WEB-DL x265 Panda)',
+      'Grey Summit State (2010) Season 3 S03 (1080p WEB-DL x265 Koala)',
       ctx()
     );
     const byIndex = new Map(plan.map((e) => [e.index, e]));
@@ -854,14 +1107,216 @@ describe('Backfill: a two-part finale the scene numbers as one', () => {
       [
         {
           index: 0,
-          path: 'Blue Mountain State (2010) - S03E12 - The Corn Field (1080p WEB-DL x265 Panda).mkv',
+          path: 'Grey Summit State (2010) - S03E12 - The Barley Patch (1080p WEB-DL x265 Koala).mkv',
           size: 1.2e9,
         },
       ],
-      'Blue Mountain State (2010) S03E12 (1080p WEB-DL x265 Panda)',
+      'Grey Summit State (2010) S03E12 (1080p WEB-DL x265 Koala)',
       ctx()
     );
     assert.deepEqual([...plan[0].episodeIds].sort(), [142107, 142108]);
+  });
+});
+
+describe('Backfill: a name whose episode title is another episode', () => {
+  // A made-up series Sonarr numbers by the scene (TheXEM): library S08E01
+  // is the scene's S06E15, and the scene's S08E01 is library S09E01. Some
+  // groups name files by the library's numbers, some count the special as
+  // S03E01; the episode title in the name says which episode it is.
+  const ep = (
+    id: number,
+    season: number,
+    episode: number,
+    title: string,
+    hasFile: boolean,
+    scene?: [number, number]
+  ): SonarrEpisode => ({
+    id,
+    seriesId: 77,
+    seasonNumber: season,
+    episodeNumber: episode,
+    title,
+    hasFile,
+    monitored: true,
+    episodeFileId: hasFile ? id + 1000 : 0,
+    ...(scene
+      ? { sceneSeasonNumber: scene[0], sceneEpisodeNumber: scene[1] }
+      : {}),
+  });
+  const atoll = ep(941, 8, 1, 'Atoll Exile', false, [6, 15]);
+  const river = ep(948, 9, 1, 'River Bend', true, [8, 1]);
+  const map = ep(863, 0, 1, 'Beyond the Map', false);
+  const ochre = ep(893, 3, 1, 'Ochre Canyon', true);
+  const kiln = ep(895, 3, 3, 'Into the Kiln', false);
+  const salt = ep(912, 5, 2, 'Salt Flats', false);
+  const wayOut = ep(920, 1, 2, 'The Long Way Out', false);
+  const reckoning = ep(927, 1, 7, 'Reckoning', true);
+  const dayOne = ep(940, 0, 9, 'Day One', false);
+  const episodes = [
+    atoll,
+    river,
+    map,
+    ochre,
+    kiln,
+    salt,
+    wayOut,
+    reckoning,
+    dayOne,
+  ];
+
+  const ctx = (): SeriesContext => ({
+    series: {
+      id: 77,
+      title: 'Remote Reach',
+      year: 2010,
+      tvdbId: 999001,
+      seriesType: 'standard',
+      qualityProfileId: 13,
+      path: '/tv/Remote Reach',
+    },
+    episodes,
+    files: [river, ochre].map((e) => ({
+      id: e.episodeFileId,
+      seasonNumber: e.seasonNumber,
+      size: 300e6,
+      quality: q(4, 'HDTV-720p'),
+      customFormatScore: 0,
+    })),
+    profile: ANIME_1080P,
+    names: ['Remote Reach'],
+    sonarr: {
+      // Sonarr on a scene-numbered series: scene numbers first, then TVDB's
+      // for episodes the scene doesn't renumber. Nothing for season 5.
+      parse: async (title: string) => {
+        const m = /S(\d+)E(\d+)/i.exec(title);
+        if (!m) {
+          return {
+            title,
+            parsedEpisodeInfo: { seriesTitle: 'Remote Reach' },
+            customFormatScore: 0,
+          };
+        }
+        const season = Number(m[1]);
+        const episode = Number(m[2]);
+        const found =
+          season === 5
+            ? undefined
+            : (episodes.find(
+                (e) =>
+                  e.sceneSeasonNumber === season &&
+                  e.sceneEpisodeNumber === episode
+              ) ??
+              episodes.find(
+                (e) =>
+                  e.sceneSeasonNumber === undefined &&
+                  e.seasonNumber === season &&
+                  e.episodeNumber === episode
+              ));
+        return {
+          title,
+          parsedEpisodeInfo: {
+            seriesTitle: 'Remote Reach',
+            quality: q(3, 'WEBDL-1080p'),
+            seasonNumber: season,
+            episodeNumbers: [episode],
+            releaseGroup: 'GRP',
+          },
+          series: { id: 77, title: 'Remote Reach' },
+          episodes: found ? [found] : [],
+          customFormatScore: 500,
+        };
+      },
+    } as unknown as SeriesContext['sonarr'],
+  });
+
+  const PACK = 'Remote.Reach.Complete.1080p.WEB-DL-GRP';
+  const file = (index: number, name: string) => ({
+    index,
+    path: `${PACK}/${name}.mkv`,
+    size: 900e6,
+  });
+
+  it('takes a file by its title when Sonarr reads its number as another episode', async () => {
+    const { plan } = await judgePack(
+      [file(0, 'Remote.Reach.S08E01.Atoll.Exile.1080p.WEB-DL-GRP')],
+      PACK,
+      ctx()
+    );
+    assert.deepEqual(plan[0].episodeIds, [atoll.id], 'not River Bend');
+    assert.equal(plan[0].season, 8);
+    assert.equal(plan[0].episode, 1);
+    assert.equal(plan[0].matchedBy, 'title');
+    assert.equal(plan[0].action, 'fill');
+  });
+
+  it('takes a special a group numbered as a season’s first episode', async () => {
+    const { plan } = await judgePack(
+      [file(0, 'Remote.Reach.S03E01.Beyond.the.Map.1080p.WEB-DL-GRP')],
+      PACK,
+      ctx()
+    );
+    assert.deepEqual(plan[0].episodeIds, [map.id], 'not Ochre Canyon');
+    assert.equal(plan[0].season, 0);
+    assert.equal(plan[0].matchedBy, 'title');
+    assert.equal(plan[0].action, 'fill');
+  });
+
+  it('takes a special named only by its title', async () => {
+    const { plan } = await judgePack(
+      [
+        file(0, 'Specials/Remote Reach - Beyond the Map'),
+        file(1, 'Specials/Remote Reach - Salt Flats'),
+      ],
+      PACK,
+      ctx()
+    );
+    const byIndex = new Map(plan.map((e) => [e.index, e]));
+    assert.deepEqual(byIndex.get(0)?.episodeIds, [map.id]);
+    assert.equal(byIndex.get(0)?.matchedBy, 'title');
+    assert.equal(byIndex.get(0)?.action, 'fill');
+    // Sonarr has nothing for season 5.
+    assert.equal(byIndex.get(1)?.action, 'reject');
+  });
+
+  it('goes by the number when the title only shares a word with another episode’s', async () => {
+    const { plan } = await judgePack(
+      [
+        file(0, 'Remote.Reach.S01E02.The.Reckoning.Begins.1080p.WEB-DL-GRP'),
+        // Not an episode, though it holds one's title.
+        file(1, 'Specials/Remote Reach - Day One Interview'),
+      ],
+      PACK,
+      ctx()
+    );
+    const byIndex = new Map(plan.map((e) => [e.index, e]));
+    assert.deepEqual(byIndex.get(0)?.episodeIds, [wayOut.id]);
+    assert.equal(byIndex.get(0)?.matchedBy, undefined);
+    assert.equal(byIndex.get(1)?.action, 'reject');
+    assert.deepEqual(byIndex.get(1)?.episodeIds, []);
+  });
+
+  it('leaves a file whose number and title agree as it was', async () => {
+    const { plan } = await judgePack(
+      [file(0, 'Remote.Reach.S03E03.Into.the.Kiln.1080p.WEB-DL-GRP')],
+      PACK,
+      ctx()
+    );
+    assert.deepEqual(plan[0].episodeIds, [kiln.id]);
+    assert.equal(plan[0].matchedBy, undefined);
+  });
+
+  it('turns a file down when Sonarr won’t read it as the episode its title is', async () => {
+    const { plan } = await judgePack(
+      [file(0, 'Remote.Reach.S03E01.Salt.Flats.1080p.WEB-DL-GRP')],
+      PACK,
+      ctx()
+    );
+    assert.equal(plan[0].action, 'reject');
+    assert.deepEqual(plan[0].episodeIds, []);
+    assert.equal(
+      plan[0].reason,
+      'Its title is S05E02 "Salt Flats", which Sonarr won\'t read it as'
+    );
   });
 });
 
@@ -886,7 +1341,7 @@ describe('Backfill: the AI second opinion', () => {
     seasonNumber: 5,
     episodeNumber: 23,
     absoluteEpisodeNumber: 202,
-    title: 'The Battle Begins: Naruto vs. Sasuke',
+    title: 'The Battle Begins: Kitsuraga vs. Ryomaru',
     hasFile: false,
     monitored: true,
     episodeFileId: 0,
@@ -894,52 +1349,52 @@ describe('Backfill: the AI second opinion', () => {
   const festival = special(
     145157,
     3,
-    'Naruto OVA 3: Hidden Leaf Village Grand Sports Festival'
+    'Kitsuraga OVA 3: Misty Pine Village Grand Sports Festival'
   );
   const clover = special(
     145155,
     1,
-    'Naruto OVA: Find the Crimson Four-Leaf Clover!'
+    'Kitsuraga OVA: Find the Amber Four-Leaf Clover!'
   );
 
   /** Answers Sonarr gave on the live server for these exact names. */
   const sonarrAnswers: Record<string, SonarrParseResult> = {
-    '[Judas] Naruto - Hidden Leaf Village Grand Sports Festival': {
-      title: '[Judas] Naruto - Hidden Leaf Village Grand Sports Festival',
+    '[Tengu] Kitsuraga - Misty Pine Village Grand Sports Festival': {
+      title: '[Tengu] Kitsuraga - Misty Pine Village Grand Sports Festival',
       customFormatScore: 0,
     },
-    '[Judas] Naruto - Crimson Clover': {
-      title: '[Judas] Naruto - Crimson Clover',
+    '[Tengu] Kitsuraga - Amber Clover': {
+      title: '[Tengu] Kitsuraga - Amber Clover',
       customFormatScore: 0,
     },
-    '[Judas] Naruto - S00E03 [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]':
+    '[Tengu] Kitsuraga - S00E03 [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]':
       {
         title: '',
         parsedEpisodeInfo: {
-          seriesTitle: 'Naruto',
+          seriesTitle: 'Kitsuraga',
           quality: q(7, 'Bluray-1080p'),
           seasonNumber: 0,
           episodeNumbers: [3],
-          releaseGroup: 'Judas',
+          releaseGroup: 'Tengu',
         },
-        series: { id: 1279, title: 'Naruto' },
+        series: { id: 1279, title: 'Kitsuraga' },
         episodes: [{ ...festival }],
         languages: [{ id: 8, name: 'Japanese' }],
         customFormatScore: 700,
       },
     // Sonarr maps the clover file to a different special than the one the
     // model names, so the model's match is turned down.
-    '[Judas] Naruto - S00E01 [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]':
+    '[Tengu] Kitsuraga - S00E01 [BD 1080p][HEVC x265 10bit][Multi-Audio][Multi-Subs]':
       {
         title: '',
         parsedEpisodeInfo: {
-          seriesTitle: 'Naruto',
+          seriesTitle: 'Kitsuraga',
           quality: q(7, 'Bluray-1080p'),
           seasonNumber: 0,
           episodeNumbers: [1],
-          releaseGroup: 'Judas',
+          releaseGroup: 'Tengu',
         },
-        series: { id: 1279, title: 'Naruto' },
+        series: { id: 1279, title: 'Kitsuraga' },
         episodes: [{ ...festival }],
         customFormatScore: 700,
       },
@@ -950,17 +1405,17 @@ describe('Backfill: the AI second opinion', () => {
   ): SeriesContext => ({
     series: {
       id: 1279,
-      title: 'Naruto',
+      title: 'Kitsuraga',
       year: 2002,
-      tvdbId: 78857,
+      tvdbId: 63914,
       seriesType: 'anime',
       qualityProfileId: 13,
-      path: '/anime/Naruto',
+      path: '/anime/Kitsuraga',
     },
     episodes: [ep202, festival, clover],
     files: [],
     profile: ANIME_1080P,
-    names: ['Naruto'],
+    names: ['Kitsuraga'],
     sonarr: {
       parse: async (title: string) => {
         const answer = sonarrAnswers[title];
@@ -973,7 +1428,7 @@ describe('Backfill: the AI second opinion', () => {
 
   const FESTIVAL_FILE = {
     index: 4,
-    path: '[Judas] Naruto/Specials/[Judas] Naruto - Hidden Leaf Village Grand Sports Festival.mkv',
+    path: '[Tengu] Kitsuraga/Specials/[Tengu] Kitsuraga - Misty Pine Village Grand Sports Festival.mkv',
     size: 300e6,
   };
 
@@ -981,7 +1436,7 @@ describe('Backfill: the AI second opinion', () => {
     let asked: Parameters<NonNullable<SeriesContext['secondOpinion']>>[0];
     const { plan, summary } = await judgePack(
       [FESTIVAL_FILE],
-      JUDAS_PACK,
+      TENGU_PACK,
       context(async (req) => {
         asked = req;
         return [
@@ -996,7 +1451,7 @@ describe('Backfill: the AI second opinion', () => {
     assert.equal(asked!.files.length, 1);
     assert.equal(
       asked!.files[0].name,
-      '[Judas] Naruto - Hidden Leaf Village Grand Sports Festival'
+      '[Tengu] Kitsuraga - Misty Pine Village Grand Sports Festival'
     );
     assert.equal(asked!.files[0].problem, 'No episode number in the name');
     assert.equal(plan[0].action, 'fill');
@@ -1012,11 +1467,11 @@ describe('Backfill: the AI second opinion', () => {
       [
         {
           index: 5,
-          path: '[Judas] Naruto/Specials/[Judas] Naruto - Crimson Clover.mkv',
+          path: '[Tengu] Kitsuraga/Specials/[Tengu] Kitsuraga - Amber Clover.mkv',
           size: 300e6,
         },
       ],
-      JUDAS_PACK,
+      TENGU_PACK,
       context(async () => [
         { index: 5, episodeIds: [145155], why: 'The clover OVA' },
       ])
@@ -1033,7 +1488,7 @@ describe('Backfill: the AI second opinion', () => {
   it('keeps going, and says why, when the model cannot be asked', async () => {
     const { plan, summary } = await judgePack(
       [FESTIVAL_FILE],
-      JUDAS_PACK,
+      TENGU_PACK,
       context(async () => {
         throw new Error('You have used all 20 of today’s AI answers.');
       })
@@ -1047,7 +1502,7 @@ describe('Backfill: the AI second opinion', () => {
     let asked = false;
     await judgePack(
       [],
-      JUDAS_PACK,
+      TENGU_PACK,
       context(async () => {
         asked = true;
         return [];

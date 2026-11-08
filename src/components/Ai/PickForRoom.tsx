@@ -12,11 +12,9 @@ import { useIntl } from 'react-intl';
 import useSWR from 'swr';
 
 const messages = defineMessages('components.Ai.PickForRoom', {
-  intro:
-    'Choose who is watching, and three titles you would all enjoy are picked from what each of you has been watching.',
+  intro: 'Choose who’s watching to get three titles you’d all enjoy.',
   who: 'Who is watching',
-  whoNote:
-    'People you share a watch list with can be included, unless they have turned this off.',
+  whoNote: 'Only people you share a watch list with, unless they’ve opted out.',
   you: 'You',
   kind: 'Looking for',
   any: 'Anything',
@@ -41,8 +39,8 @@ interface Pick {
 }
 
 /**
- * Three titles a group would enjoy together. Everyone listed has watch
- * history and has not turned this off for themselves.
+ * Three picks for a group. Lists only users with watch history who haven't
+ * opted out.
  */
 const PickForRoom = () => {
   const intl = useIntl();
@@ -75,14 +73,14 @@ const PickForRoom = () => {
     <div className="space-y-4 text-sm text-gray-200" data-testid="ai-pick">
       <p className="text-gray-300">{intl.formatMessage(messages.intro)}</p>
       <fieldset>
-        <legend className="mb-2 font-semibold text-white">
+        <legend className="mb-2 font-semibold text-strong">
           {intl.formatMessage(messages.who)}
         </legend>
         <p className="mb-2 text-xs text-gray-400">
           {intl.formatMessage(messages.whoNote)}
         </p>
         <div className="flex flex-wrap gap-2">
-          <span className="flex items-center gap-2 rounded-full bg-indigo-700/60 px-3 py-1">
+          <span className="flex items-center gap-2 rounded-full bg-indigo-700/60 px-3 py-1 light:bg-accent-soft/15">
             {intl.formatMessage(messages.you)}
           </span>
           {others.map((person) => (
@@ -90,7 +88,7 @@ const PickForRoom = () => {
               key={person.id}
               className={`flex cursor-pointer items-center gap-2 rounded-full px-3 py-1 ring-1 ${
                 chosen.includes(person.id)
-                  ? 'bg-indigo-700/60 ring-indigo-500'
+                  ? 'bg-indigo-700/60 ring-indigo-500 light:bg-accent-soft/15'
                   : 'bg-gray-900/60 ring-gray-700'
               }`}
             >
@@ -157,7 +155,7 @@ const PickForRoom = () => {
       </Button>
       {error && (
         <div
-          className="rounded-lg border border-red-700 bg-red-900/40 px-3 py-2 text-red-100"
+          className="rounded-lg border border-red-700 bg-red-900/40 px-3 py-2 text-red-100 light:bg-danger-soft/15 light:text-danger-text"
           role="alert"
         >
           {error}

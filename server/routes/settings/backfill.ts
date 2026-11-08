@@ -1,6 +1,7 @@
 import { isTorrentClient } from '@server/api/downloadclients';
 import ProwlarrAPI from '@server/api/prowlarr';
 import backfill from '@server/lib/backfill/engine';
+import { arrApps } from '@server/lib/backfill/indexerOrigins';
 import { GROUP_NAME, setGroupBlocked } from '@server/lib/blockedGroups';
 import { keptSecret } from '@server/lib/savedSecret';
 import type { BackfillSettings } from '@server/lib/settings';
@@ -10,24 +11,28 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 /*
- * Backfill's settings. Prowlarr's API key is never sent back; a blank one
- * keeps the saved key, but only for the same address, so the key can't be
- * sent somewhere new. With Backfill on, Prowlarr is tested before saving.
+ * Backfill settings. Prowlarr's connection is stored with them but set in
+ * Settings → Services (/prowlarr); the Backfill form omits it and keeps the
+ * saved one. Prowlarr's API key is never sent back; a blank key keeps the
+ * saved one only for the same address, so it can't be sent somewhere new.
+ * With Backfill on, Prowlarr is tested before saving.
  */
 const backfillSettingsRoutes = Router();
 
+const prowlarrBody = z.object({
+  hostname: z
+    .string()
+    .trim()
+    .regex(/^[^\s/:]*$/),
+  port: z.coerce.number().int().min(1).max(65535),
+  useSsl: z.boolean().default(false),
+  urlBase: z.string().trim().default(''),
+  apiKey: z.string().default(''),
+});
+
 const body = z.object({
   enabled: z.boolean(),
-  prowlarr: z.object({
-    hostname: z
-      .string()
-      .trim()
-      .regex(/^[^\s/:]*$/),
-    port: z.coerce.number().int().min(1).max(65535),
-    useSsl: z.boolean().default(false),
-    urlBase: z.string().trim().default(''),
-    apiKey: z.string().default(''),
-  }),
+  prowlarr: prowlarrBody.optional(),
   torrentClientId: z.number().int().nullable(),
   usenetClientId: z.number().int().nullable(),
   category: z
@@ -37,11 +42,19 @@ const body = z.object({
     .max(60)
     .regex(/^[\w.-]+$/),
   includeMovies: z.boolean().default(true),
+  includeMusic: z.boolean().default(true),
   stuckAfterHours: z.coerce
     .number()
     .int()
     .min(1)
     .max(24 * 30),
+  newReleaseWaitHours: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(24 * 30)
+    .default(12),
+  searchAfterArr: z.boolean().default(false),
   includeCutoffUnmet: z.boolean(),
   includeSpecials: z.boolean(),
   searchesPerScan: z.coerce.number().int().min(1).max(50),
@@ -52,8 +65,11 @@ const body = z.object({
     maxSizeGb: z.coerce.number().min(1).max(10000),
   }),
   maxActiveJobs: z.coerce.number().int().min(1).max(10),
+  maxMovieJobs: z.coerce.number().int().min(1).max(10).default(2),
+  maxMusicJobs: z.coerce.number().int().min(1).max(10).default(2),
   minFreeSpaceGb: z.coerce.number().min(0).max(100000),
   stallHours: z.coerce.number().int().min(0).max(720),
+  slowHours: z.coerce.number().int().min(0).max(2160).default(72),
   replaceFailed: z.boolean().default(true),
   historyDays: z.coerce.number().int().min(0).max(3650).default(90),
   agent: z
@@ -77,31 +93,43 @@ const body = z.object({
       instructions: '',
       keepDays: 30,
     }),
+  stepDown: z
+    .object({
+      enabled: z.boolean(),
+      days: z.coerce.number().int().min(7).max(365),
+    })
+    .optional(),
 });
 
 const shown = (settings: BackfillSettings) => ({
   ...settings,
-  prowlarr: {
-    ...settings.prowlarr,
-    apiKey: '',
-    hasApiKey: !!settings.prowlarr.apiKey,
-  },
+  prowlarr: prowlarrShown(settings.prowlarr),
   torrentClients: backfill.clientsFor('torrent'),
   usenetClients: backfill.clientsFor('usenet'),
 });
 
-type ProwlarrBody = z.infer<typeof body>['prowlarr'];
+type ProwlarrBody = z.infer<typeof prowlarrBody>;
 
 const keyFor = (prowlarr: ProwlarrBody): string => {
   const saved = getSettings().backfill.prowlarr;
   return keptSecret(prowlarr.apiKey, prowlarr, saved, saved.apiKey);
 };
 
+const prowlarrShown = (prowlarr: BackfillSettings['prowlarr']) => ({
+  ...prowlarr,
+  apiKey: '',
+  hasApiKey: !!prowlarr.apiKey,
+});
+
 const withKey = (data: z.infer<typeof body>): BackfillSettings => ({
   ...data,
-  prowlarr: { ...data.prowlarr, apiKey: keyFor(data.prowlarr) },
-  // Changed only through /blocked-groups.
+  prowlarr: data.prowlarr
+    ? { ...data.prowlarr, apiKey: keyFor(data.prowlarr) }
+    : getSettings().backfill.prowlarr,
+  // Changed only through /blocked-groups and /download-check.
   blockedGroups: getSettings().backfill.blockedGroups,
+  downloadCheck: getSettings().backfill.downloadCheck,
+  stepDown: data.stepDown ?? getSettings().backfill.stepDown,
 });
 
 const prowlarrFailed = (e: unknown) => {
@@ -122,12 +150,31 @@ const prowlarrFailed = (e: unknown) => {
   };
 };
 
+/**
+ * The Sonarr, Radarr or Lidarr whose download clients already use this
+ * category, if any. One that doesn't answer is passed over.
+ */
+const categoryUser = async (category: string): Promise<string | undefined> => {
+  const apps = arrApps();
+  const wanted = category.toLowerCase();
+  const users = await Promise.all(
+    apps.map(async ({ name, api }) =>
+      (await api.getDownloadCategories().catch(() => [])).some(
+        (used) => used.trim().toLowerCase() === wanted
+      )
+        ? name
+        : undefined
+    )
+  );
+  return users.find(Boolean);
+};
+
 backfillSettingsRoutes.get('/', (_req, res) => {
   res.status(200).json(shown(getSettings().backfill));
 });
 
 backfillSettingsRoutes.post('/test', async (req, res, next) => {
-  const parsed = body.shape.prowlarr.safeParse(req.body);
+  const parsed = prowlarrBody.safeParse(req.body);
   if (!parsed.success || !parsed.data.hostname) {
     return next({ status: 400, message: 'Check the Prowlarr details.' });
   }
@@ -169,11 +216,20 @@ backfillSettingsRoutes.put('/', async (req, res, next) => {
   ) {
     return next({ status: 400, message: 'Choose a Usenet client.' });
   }
+  // Backfill clears leftovers in its category: it must be Backfill's alone.
+  const user = await categoryUser(next_.category);
+  if (user) {
+    return next({
+      status: 400,
+      message: `${user} already uses the category "${next_.category}". Choose another for Backfill.`,
+    });
+  }
   if (next_.enabled) {
     if (!next_.prowlarr.hostname || !next_.prowlarr.apiKey) {
       return next({
         status: 400,
-        message: 'Backfill needs Prowlarr’s address and API key.',
+        message:
+          'Backfill needs Prowlarr. Set it up in Settings → Services first.',
       });
     }
     try {
@@ -188,9 +244,75 @@ backfillSettingsRoutes.put('/', async (req, res, next) => {
   return res.status(200).json(shown(next_));
 });
 
+/** Prowlarr's connection for Settings → Services, without its API key. */
+backfillSettingsRoutes.get('/prowlarr', (_req, res) => {
+  res.status(200).json(prowlarrShown(getSettings().backfill.prowlarr));
+});
+
 /**
- * Blocks a release group, or unblocks one: saved, and Radarr and Sonarr
- * brought in line. Answers the list, and what could not be updated.
+ * Saves Prowlarr's connection once Prowlarr answers. A blank address removes
+ * it, unless Backfill is on, which needs it.
+ */
+backfillSettingsRoutes.put('/prowlarr', async (req, res, next) => {
+  const parsed = prowlarrBody.safeParse(req.body);
+  if (!parsed.success) {
+    return next({ status: 400, message: 'Check the Prowlarr details.' });
+  }
+  const settings = getSettings();
+  if (!parsed.data.hostname) {
+    if (settings.backfill.enabled) {
+      return next({
+        status: 400,
+        message: 'Backfill is on and needs Prowlarr. Turn Backfill off first.',
+      });
+    }
+    settings.backfill = {
+      ...settings.backfill,
+      prowlarr: { ...parsed.data, apiKey: '' },
+    };
+    await settings.save();
+    return res.status(200).json(prowlarrShown(settings.backfill.prowlarr));
+  }
+  const prowlarr = { ...parsed.data, apiKey: keyFor(parsed.data) };
+  if (!prowlarr.apiKey) {
+    return next({ status: 400, message: 'Enter Prowlarr’s API key.' });
+  }
+  try {
+    await new ProwlarrAPI(prowlarr).getVersion();
+  } catch (e) {
+    return next(prowlarrFailed(e));
+  }
+  settings.backfill = { ...settings.backfill, prowlarr };
+  await settings.save();
+  return res.status(200).json(prowlarrShown(prowlarr));
+});
+
+/**
+ * Sets Download Check to off, Report only, or on. Separate from the form: it
+ * needs no other Backfill setup.
+ */
+backfillSettingsRoutes.put('/download-check', async (req, res, next) => {
+  const parsed = z
+    .object({ mode: z.enum(['off', 'report', 'on']) })
+    .safeParse(req.body);
+  if (!parsed.success) {
+    return next({ status: 400, message: 'Choose Off, Report only or On.' });
+  }
+  const settings = getSettings();
+  settings.backfill = {
+    ...settings.backfill,
+    downloadCheck: { mode: parsed.data.mode },
+  };
+  await settings.save();
+  logger.info(`Download Check is now ${parsed.data.mode}`, {
+    label: 'Download Check',
+  });
+  return res.status(200).json(settings.backfill.downloadCheck);
+});
+
+/**
+ * Blocks or unblocks a release group and syncs Radarr and Sonarr. Returns
+ * the list and what could not be updated.
  */
 backfillSettingsRoutes.post('/blocked-groups', async (req, res, next) => {
   const parsed = z

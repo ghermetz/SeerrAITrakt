@@ -1,8 +1,10 @@
 import Modal from '@app/components/Common/Modal';
 import PosterBackground from '@app/components/Common/PosterBackground';
 import { RESOLVE_BATCH_SIZE, SEARCH_BATCH_SIZE } from '@app/constants/lists';
+import useFeature from '@app/hooks/useFeature';
 import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
+import { Permission, useUser } from '@app/hooks/useUser';
 import defineMessages from '@app/utils/defineMessages';
 import { Transition } from '@headlessui/react';
 import { MagnifyingGlassIcon } from '@heroicons/react/24/outline';
@@ -10,48 +12,55 @@ import axios from 'axios';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 
-const messages = defineMessages('components.MediaLists.ImportListModal', {
-  title: 'Import a written list',
-  instructions:
-    'Paste your list below — one title per line. Bullets, numbering and years are fine.',
-  placeholder: 'The Matrix (1999)\nPractical Magic\nPerson of Interest',
-  find: 'Find matches',
-  review: 'Check these matches before adding them.',
-  nomatch: 'No match found',
-  skip: 'Skip',
-  add: 'Add {count}',
-  back: 'Back',
-  nothingfound: 'Nothing recognisable in that text.',
-  truncated: 'Only the first 100 lines were read.',
-  searchagain: 'Search again',
-  searchplaceholder: 'Search for the right title',
-  alsorequest: 'Also request anything not already in the library',
-  notrequested:
-    'Added to the list. {count, plural, one {# title was} other {# titles were}} not requested, as one import requests up to 20; request them from the list.',
-  matching: 'Matching titles…',
-  collection:
-    ' — Collection, {count} {count, plural, one {film} other {films}}',
-  series: ' — Series',
-  movie: ' — Movie',
-  instructionsTrakt:
-    'Paste your list below, one title per line (bullets, numbering and years are fine), or a link to a public Trakt list or watchlist.',
-  readingTrakt: 'Reading the Trakt list…',
-  truncatedTrakt: 'Only the first 500 titles were read.',
-  traktNotSetUp:
-    'Trakt is not set up here yet. An admin can add it in Settings → Services.',
-  traktPrivate:
-    'That Trakt list or watchlist is private. Make it public on Trakt, then try again.',
-  traktNotFound: 'Trakt has no such user or list. Check the link.',
-  traktBadKey:
-    'Trakt did not accept this server’s Client ID. An admin can check it in Settings → Services.',
-  traktLimited:
-    'Trakt is limiting requests just now. Try again in a few minutes.',
-  traktUnreachable: 'Could not reach Trakt. Try again in a while.',
-  notTrakt:
-    'That is not a link to a Trakt list or watchlist. Use the link to a public list, or to someone’s watchlist.',
-});
+export const messages = defineMessages(
+  'components.MediaLists.ImportListModal',
+  {
+    title: 'Import a written list',
+    titleTrakt: 'Import titles or a Trakt list',
+    instructions:
+      'Paste your list below — one title per line. Bullets, numbering and years are fine.',
+    placeholder: 'The Matrix (1999)\nPractical Magic\nPerson of Interest',
+    placeholderTrakt:
+      'The Matrix (1999)\nPractical Magic\nPerson of Interest\n\nor a Trakt link, like\nhttps://trakt.tv/users/name/lists/favorites',
+    traktAdminHint:
+      'Trakt links work here once Trakt has a Client ID in Settings → Services.',
+    find: 'Find matches',
+    review: 'Check these matches before adding them.',
+    nomatch: 'No match found',
+    skip: 'Skip',
+    add: 'Add {count}',
+    back: 'Back',
+    nothingfound: 'Nothing recognisable in that text.',
+    truncated: 'Only the first 100 lines were read.',
+    searchagain: 'Search again',
+    searchplaceholder: 'Search for the right title',
+    alsorequest: 'Also request anything not already in the library',
+    notrequested:
+      'Added to the list. {count, plural, one {# title wasn’t} other {# titles weren’t}} requested (20 at most per import); request them from the list.',
+    matching: 'Matching titles…',
+    collection:
+      ' — Collection, {count} {count, plural, one {film} other {films}}',
+    series: ' — Series',
+    movie: ' — Movie',
+    instructionsTrakt:
+      'Paste titles, one per line, or a link to a public Trakt list or watchlist.',
+    readingTrakt: 'Reading the Trakt list…',
+    truncatedTrakt: 'Only the first 500 titles were read.',
+    traktNotSetUp:
+      'Trakt is not set up here yet. An admin can add it in Settings → Services.',
+    traktPrivate:
+      'That Trakt list or watchlist is private. Make it public on Trakt, then try again.',
+    traktNotFound: 'Trakt has no such user or list. Check the link.',
+    traktBadKey:
+      'Trakt did not accept this server’s Client ID. An admin can check it in Settings → Services.',
+    traktLimited:
+      'Trakt is limiting requests just now. Try again in a few minutes.',
+    traktUnreachable: 'Could not reach Trakt. Try again in a while.',
+    notTrakt: 'That isn’t a link to a Trakt list or watchlist.',
+  }
+);
 
-/** Whether the pasted text is a link to Trakt, rather than a written list. */
+/** A Trakt link, rather than a written list. */
 const TRAKT_LINK = /^(https?:\/\/)?(www\.|app\.)?trakt\.tv\/\S*$/i;
 
 interface Candidate {
@@ -85,6 +94,8 @@ const ImportListModal = ({
   const intl = useIntl();
   const { addToast } = useToasts();
   const { currentSettings } = useSettings();
+  const { hasPermission } = useUser();
+  const trakt = !!currentSettings.traktReady;
   const [text, setText] = useState('');
   const [fromTrakt, setFromTrakt] = useState(false);
   const [results, setResults] = useState<LineResult[] | null>(null);
@@ -93,7 +104,9 @@ const ImportListModal = ({
   const [manual, setManual] = useState<Record<number, string>>({});
   const [isBusy, setBusy] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
-  const [alsoRequest, setAlsoRequest] = useState(true);
+  // Starts as the person's own choice for what they add to lists.
+  const listRequests = useFeature('listRequests');
+  const [alsoRequest, setAlsoRequest] = useState(listRequests);
   const [error, setError] = useState<string | null>(null);
 
   const describe = (e: unknown) =>
@@ -119,10 +132,7 @@ const ImportListModal = ({
       : describe(e);
   };
 
-  /**
-   * A Trakt link: the list's titles come with TMDB's ids, so each is looked
-   * up rather than searched for, in batches as a written list is.
-   */
+  /** Trakt titles carry TMDB ids, so each is looked up in batches, not searched. */
   const importTrakt = async (url: string) => {
     let titles: {
       tmdbId?: number;
@@ -177,9 +187,8 @@ const ImportListModal = ({
   };
 
   /**
-   * Searches in batches so progress can be reported honestly. Sending the
-   * whole list in one request gives no way to say how far along it is, and a
-   * long list can take a while — each title is a TMDB lookup.
+   * Searches in batches so progress can be shown: each title is a TMDB
+   * lookup, and one request for a long list gives no progress.
    */
   const search = async () => {
     setBusy(true);
@@ -233,11 +242,7 @@ const ImportListModal = ({
     }
   };
 
-  /**
-   * Re-runs a single line against a title the user typed. Automatic matching
-   * always misses some, and an unmatched line with no way to correct it is a
-   * dead end — the point of this feature is migrating a list that exists.
-   */
+  /** Re-runs one line against a title the user typed, to fix missed matches. */
   const searchOne = async (index: number) => {
     const query = (manual[index] ?? '').trim();
 
@@ -344,7 +349,7 @@ const ImportListModal = ({
         onSecondary={results ? () => setResults(null) : undefined}
         secondaryButtonType="default"
         secondaryText={results ? intl.formatMessage(messages.back) : undefined}
-        title={intl.formatMessage(messages.title)}
+        title={intl.formatMessage(trakt ? messages.titleTrakt : messages.title)}
       >
         {error && (
           <p className="mb-3 rounded bg-red-900/40 px-3 py-2 text-sm text-red-200">
@@ -356,15 +361,20 @@ const ImportListModal = ({
           <>
             <p className="mb-2 text-sm text-gray-300">
               {intl.formatMessage(
-                currentSettings.traktReady
-                  ? messages.instructionsTrakt
-                  : messages.instructions
+                trakt ? messages.instructionsTrakt : messages.instructions
               )}
             </p>
+            {!trakt && hasPermission(Permission.ADMIN) && (
+              <p className="mb-2 text-xs text-gray-400">
+                {intl.formatMessage(messages.traktAdminHint)}
+              </p>
+            )}
             <textarea
               className="h-48 w-full rounded border-gray-600 bg-gray-700 p-3 font-mono text-sm text-white"
               onChange={(e) => setText(e.target.value)}
-              placeholder={intl.formatMessage(messages.placeholder)}
+              placeholder={intl.formatMessage(
+                trakt ? messages.placeholderTrakt : messages.placeholder
+              )}
               value={text}
             />
 
@@ -430,7 +440,7 @@ const ImportListModal = ({
                       className="rounded border border-gray-700 bg-gray-900/40 p-2"
                       key={`line-${index}`}
                     >
-                      <p className="mb-1 truncate text-xs text-gray-400">
+                      <p className="mb-1 text-xs text-gray-400 [overflow-wrap:anywhere]">
                         {line.raw}
                       </p>
 

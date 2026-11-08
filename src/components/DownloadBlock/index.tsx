@@ -8,6 +8,7 @@ import type {
   DownloadStep,
   DownloadingItem,
 } from '@server/lib/downloadtracker';
+import type { IntlShape } from 'react-intl';
 import { FormattedRelativeTime, useIntl } from 'react-intl';
 
 const messages = defineMessages('components.DownloadBlock', {
@@ -16,7 +17,7 @@ const messages = defineMessages('components.DownloadBlock', {
   waitingDetail:
     'Held by {arr}’s delay profile, in case a better release turns up',
   waitingFor:
-    'Held by {arr}’s delay profile, in case a better release turns up; sent for download in {time}',
+    'Held by {arr}’s delay profile for a better release; downloads in {time}',
   hoursMinutes: '{hours} h {minutes} min',
   minutes: '{minutes} min',
   queued: 'Queued',
@@ -34,6 +35,7 @@ const messages = defineMessages('components.DownloadBlock', {
   failedDetail: 'Download failed; looking for another',
   imported: 'Imported',
   importedDetail: 'In the library folder; showing up in a moment',
+  importedMatching: 'Waiting for {mediaServer} to match it',
   stepVerifying: 'Downloaded; being verified',
   stepRepairing: 'Downloaded; being repaired',
   stepUnpacking: 'Downloaded; being unpacked',
@@ -45,9 +47,10 @@ const messages = defineMessages('components.DownloadBlock', {
   stepNoPeers: 'No one to download from right now',
   formattedTitle: '{title}: Season {seasonNumber} Episode {episodeNumber}',
   formattedSeason: '{title}: Season {seasonNumber}',
+  formattedAlbum: '{album} — {title}',
 });
 
-/** How much has arrived, 0 to 100, whatever the server reported. */
+/** Progress 0–100, clamped whatever the server reports. */
 const downloadedPercent = ({ size, sizeLeft }: DownloadingItem) => {
   if (!size || !Number.isFinite(size) || !Number.isFinite(sizeLeft)) {
     return 0;
@@ -58,7 +61,7 @@ const downloadedPercent = ({ size, sizeLeft }: DownloadingItem) => {
   );
 };
 
-/** What the badge says, and a line under it after the download itself. */
+/** Badge text, and the line under the download. */
 const STAGES: Record<
   DownloadStage,
   {
@@ -91,10 +94,16 @@ const STAGES: Record<
   imported: { label: 'imported', detail: 'importedDetail', badge: 'success' },
 };
 
-/**
- * What the download client says it is doing, when Seerr reads it directly:
- * more exact than the stage's own line.
- */
+/** A stage's badge label and colour. */
+export const stageBadge = (
+  intl: IntlShape,
+  stage: DownloadStage
+): { label: string; badgeType: (typeof STAGES)[DownloadStage]['badge'] } => ({
+  label: intl.formatMessage(messages[STAGES[stage].label]),
+  badgeType: STAGES[stage].badge,
+});
+
+/** The client's own step, when Seerr reads it directly; more precise than the stage line. */
 const stepDetail = (
   stage: DownloadStage,
   step?: DownloadStep
@@ -125,7 +134,7 @@ interface DownloadBlockProps {
   downloadItem: DownloadingItem;
   is4k?: boolean;
   title?: string;
-  /** It brings several episodes of its season, as a pack does. */
+  /** Several episodes of one season, like a pack. */
   pack?: boolean;
 }
 
@@ -138,13 +147,19 @@ const DownloadBlock = ({
   const intl = useIntl();
   const { hasPermission } = useUser();
   const percent = downloadedPercent(downloadItem);
-  // A copy saved before stages were sent counts as downloading.
+  // A missing stage (older cached data) counts as downloading.
   const stage = STAGES[downloadItem.stage] ?? STAGES.downloading;
-  const detail =
-    stepDetail(downloadItem.stage, downloadItem.step) ?? stage.detail;
-  const arr = downloadItem.mediaType === MediaType.MOVIE ? 'Radarr' : 'Sonarr';
-  // Radarr and Sonarr hold a release for the delay its profile sets; what
-  // they call time left is how long until they send it.
+  // Imported, but the media server matched another title; admins are notified.
+  const detail = downloadItem.matching
+    ? 'importedMatching'
+    : (stepDetail(downloadItem.stage, downloadItem.step) ?? stage.detail);
+  const arr =
+    downloadItem.mediaType === MediaType.MOVIE
+      ? 'Radarr'
+      : downloadItem.mediaType === MediaType.MUSIC
+        ? 'Lidarr'
+        : 'Sonarr';
+  // During a profile delay, Radarr/Sonarr's time left is until they send it.
   const held =
     downloadItem.stage === 'waiting'
       ? secondsLeft(downloadItem.timeLeft)
@@ -166,7 +181,7 @@ const DownloadBlock = ({
 
   return (
     <div className="p-4">
-      <div className="mb-2 w-56 truncate text-sm sm:w-80 md:w-full">
+      <div className="mb-2 text-sm [overflow-wrap:anywhere]">
         {hasPermission(Permission.ADMIN)
           ? downloadItem.title
           : downloadItem.episode && pack
@@ -180,11 +195,16 @@ const DownloadBlock = ({
                   seasonNumber: downloadItem?.episode?.seasonNumber,
                   episodeNumber: downloadItem?.episode?.episodeNumber,
                 })
-              : title}
+              : downloadItem.album?.title && title
+                ? intl.formatMessage(messages.formattedAlbum, {
+                    title,
+                    album: downloadItem.album.title,
+                  })
+                : (downloadItem.album?.title ?? title)}
       </div>
       <div className="relative mb-2 h-6 min-w-0 overflow-hidden rounded-full bg-gray-700">
         <div
-          className="h-8 bg-indigo-600 transition-all duration-200 ease-in-out"
+          className="h-8 bg-accent transition-all duration-200 ease-in-out"
           style={{ width: `${percent}%` }}
         />
         <div className="absolute inset-0 flex h-6 w-full items-center justify-center text-xs">
@@ -206,7 +226,10 @@ const DownloadBlock = ({
           {heldFor
             ? intl.formatMessage(messages.waitingFor, { arr, time: heldFor })
             : detail
-              ? intl.formatMessage(messages[detail], { arr })
+              ? intl.formatMessage(messages[detail], {
+                  arr,
+                  mediaServer: downloadItem.matching,
+                })
               : estimate && estimate.getTime() > Date.now()
                 ? intl.formatMessage(messages.estimatedtime, {
                     time: (

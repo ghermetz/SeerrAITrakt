@@ -9,13 +9,13 @@ describe('speech input', () => {
   it('joins what has been heard, and is final only once all of it is', () => {
     assert.deepEqual(
       transcriptOf(
-        Object.assign([result('star ', true), result('wars', false)])
+        Object.assign([result('nova ', true), result('rift', false)])
       ),
-      { text: 'star wars', final: false }
+      { text: 'nova rift', final: false }
     );
     assert.deepEqual(
-      transcriptOf(Object.assign([result(' the matrix ', true)])),
-      { text: 'the matrix', final: true }
+      transcriptOf(Object.assign([result(' the mazewright ', true)])),
+      { text: 'the mazewright', final: true }
     );
   });
 
@@ -49,7 +49,7 @@ describe('speech input', () => {
     assert.equal(isHandheld({ userAgent: firefox }), false);
     assert.equal(isHandheld({ userAgent: iphone, maxTouchPoints: 5 }), true);
     assert.equal(isHandheld({ userAgent: android, maxTouchPoints: 5 }), true);
-    // An iPad asks for the desktop site, so it says Macintosh, with touch.
+    // An iPad reports Macintosh, but with touch.
     assert.equal(isHandheld({ userAgent: mac, maxTouchPoints: 5 }), true);
     assert.equal(
       isHandheld({ userAgent: windows, userAgentData: { mobile: true } }),

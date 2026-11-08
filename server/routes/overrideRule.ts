@@ -12,18 +12,24 @@ import OverrideRule from '@server/entity/OverrideRule';
 import { User } from '@server/entity/User';
 import type { OverrideRuleResultsResponse } from '@server/interfaces/api/overrideRuleInterfaces';
 import overrideRules, {
+  formatRuleCountries,
   type OverrideRulesResult,
 } from '@server/lib/overrideRules';
 import { Permission } from '@server/lib/permissions';
+import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
+import {
+  formatRuleCertifications,
+  parseRuleCertifications,
+} from '@server/utils/ruleCertification';
 import { Router } from 'express';
 
 const overrideRuleRoutes = Router();
 
 /**
- * A rule's series type: any for a Sonarr rule, anime or standard for a
- * Radarr one; anything else is none.
+ * A rule's series type: any for a Sonarr rule, anime or standard for a Radarr
+ * one; otherwise none.
  */
 const seriesTypeFor = (body: {
   seriesType?: string | null;
@@ -35,6 +41,13 @@ const seriesTypeFor = (body: {
     : body.radarrServiceId !== undefined && body.radarrServiceId !== null
       ? toSeriesTypeFor(MediaType.MOVIE, body.seriesType)
       : null;
+
+/**
+ * Normalize a rule's age ratings: keep each "country:rating" as given and drop
+ * anything missing either part. Empty means no condition.
+ */
+const certificationFor = (value?: string | null) =>
+  formatRuleCertifications(parseRuleCertifications(value));
 
 overrideRuleRoutes.get(
   '/',
@@ -60,6 +73,8 @@ overrideRuleRoutes.post<
     genre?: string;
     language?: string;
     keywords?: string;
+    certification?: string | null;
+    country?: string | null;
     profileId?: number;
     rootFolder?: string;
     tags?: string;
@@ -76,6 +91,8 @@ overrideRuleRoutes.post<
       genre: req.body.genre,
       language: req.body.language,
       keywords: req.body.keywords,
+      certification: certificationFor(req.body.certification),
+      country: formatRuleCountries(req.body.country),
       profileId: req.body.profileId,
       rootFolder: req.body.rootFolder,
       tags: req.body.tags,
@@ -103,6 +120,8 @@ overrideRuleRoutes.post<
     requestId: number | null;
     tags?: number[] | null;
     serviceId?: number;
+    /** The request's Anime tick, as it will be sent. */
+    seriesType?: string | null;
   }
 >(
   '/advancedRequest',
@@ -196,14 +215,29 @@ overrideRuleRoutes.post<
         where: { tmdbId: req.body.tmdbId, mediaType: req.body.mediaType },
       });
 
+      // Matched as the request itself will be (MediaRequest.request): on the
+      // chosen server, or the default when it isn't one of them, and anime or
+      // not per the dialog's tick.
+      const settings = getSettings();
+      const serviceId = (
+        req.body.mediaType === MediaType.MOVIE
+          ? settings.radarr
+          : settings.sonarr
+      ).find((server) => server.id === req.body.serviceId)?.id;
+      const chosenSeriesType =
+        req.body.seriesType == null
+          ? null
+          : toSeriesTypeFor(req.body.mediaType, req.body.seriesType);
       const overrideRulesResult: OverrideRulesResult = await overrideRules({
         mediaType: req.body.mediaType,
         is4k: req.body.is4k,
         tmdbMedia,
         requestUser: ruleUser,
         tags: req.body.tags,
-        serviceId: req.body.serviceId,
-        animeSetting: media?.animeSetting,
+        serviceId,
+        animeSetting: chosenSeriesType
+          ? chosenSeriesType === 'anime'
+          : media?.animeSetting,
       });
 
       res.status(200).json(overrideRulesResult);
@@ -226,6 +260,8 @@ overrideRuleRoutes.put<
     genre?: string;
     language?: string;
     keywords?: string;
+    certification?: string | null;
+    country?: string | null;
     profileId?: number;
     rootFolder?: string;
     tags?: string;
@@ -251,6 +287,8 @@ overrideRuleRoutes.put<
     rule.genre = req.body.genre;
     rule.language = req.body.language;
     rule.keywords = req.body.keywords;
+    rule.certification = certificationFor(req.body.certification);
+    rule.country = formatRuleCountries(req.body.country);
     rule.profileId = req.body.profileId;
     rule.rootFolder = req.body.rootFolder;
     rule.tags = req.body.tags;

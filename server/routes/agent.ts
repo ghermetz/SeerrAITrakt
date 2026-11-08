@@ -6,7 +6,7 @@ import type {
   AgentRunDetail,
   AgentRunSummary,
 } from '@server/interfaces/api/agentInterfaces';
-import agent, { proposalOf } from '@server/lib/agent';
+import agent, { NoSuchRun, proposalOf } from '@server/lib/agent';
 import backfill from '@server/lib/backfill/engine';
 import { getSettings } from '@server/lib/settings';
 import type { NextFunction, Request, Response } from 'express';
@@ -15,8 +15,8 @@ import { In } from 'typeorm';
 import { z } from 'zod';
 
 /*
- * The admin agent, for admins: what it has done (each run with its steps)
- * and asking it to do something.
+ * Admin agent routes, admin only: its runs (each with its steps) and asking it
+ * to do something.
  */
 const agentRoutes = Router();
 
@@ -43,7 +43,7 @@ const summaryOf = (run: AgentRun): AgentRunSummary => ({
 });
 
 const titleSchema = z.object({
-  kind: z.enum(['series', 'movie']),
+  kind: z.enum(['series', 'movie', 'album']),
   serverId: z.coerce.number().int().min(0),
   arrId: z.coerce.number().int().min(1),
 });
@@ -64,7 +64,7 @@ agentRoutes.get('/', async (req, res) => {
     busy: agent.isBusy(),
     runs: runs.map(summaryOf),
     total,
-    // Across every page, so Clear finished is offered whichever page is open.
+    // Across all pages, so Clear finished is offered on any page.
     finished: await getRepository(AgentRun).count({
       where: { status: In(['done', 'failed']) },
     }),
@@ -101,17 +101,33 @@ agentRoutes.get<{ id: string }>('/:id', async (req, res, next) => {
         : null;
     })(),
     backfillId: row?.id ?? null,
+    titlePage: !row
+      ? null
+      : row.kind === 'album'
+        ? row.foreignId
+          ? `/music/album/${row.foreignId}`
+          : null
+        : row.tmdbId
+          ? `/${row.kind === 'movie' ? 'movie' : 'tv'}/${row.tmdbId}`
+          : null,
     inputTokens: run.inputTokens,
     outputTokens: run.outputTokens,
   };
   return res.status(200).json(body);
 });
 
-/** A title in Sonarr or Radarr, by its name there, or null if it is not. */
+/** A title's name in Sonarr, Radarr or Lidarr, or null if absent. */
 const nameOf = async (
   title: z.infer<typeof titleSchema>
 ): Promise<string | null> => {
   try {
+    if (title.kind === 'album') {
+      if (!backfill.readiness().music) return null;
+      const lidarr = backfill.lidarrFor(title.serverId);
+      const album = await lidarr.getAlbumDetail(title.arrId);
+      const artist = await lidarr.getArtistDetail(album.artistId);
+      return `${album.title} by ${artist.artistName}`;
+    }
     if (title.kind === 'series') {
       return (
         await backfill.sonarrFor(title.serverId).getSeriesDetail(title.arrId)
@@ -145,7 +161,7 @@ agentRoutes.post('/ask', async (req, res, next) => {
     if (!name) {
       return next({
         status: 400,
-        message: 'That title is not in Sonarr or Radarr.',
+        message: 'That title is not in Sonarr, Radarr or Lidarr.',
       });
     }
     about = { title: body.data.title, name };
@@ -178,13 +194,27 @@ agentRoutes.post<{ id: string }>('/:id/reply', async (req, res, next) => {
     return res.status(202).json(summaryOf(run));
   } catch (e) {
     return next({
-      status: 409,
+      status: e instanceof NoSuchRun ? 404 : 409,
       message: e instanceof Error ? e.message : 'It cannot answer now.',
     });
   }
 });
 
-/** Approving or declining what a run proposed, by the proposal's id. */
+/** Stop a run before its next step; what it started carries on. */
+agentRoutes.post<{ id: string }>('/:id/stop', async (req, res, next) => {
+  if (!req.user) return next({ status: 403, message: 'Sign in first.' });
+  try {
+    const run = await agent.stop(Number(req.params.id) || 0, req.user);
+    return res.status(202).json(summaryOf(run));
+  } catch (e) {
+    return next({
+      status: e instanceof NoSuchRun ? 404 : 409,
+      message: e instanceof Error ? e.message : 'It cannot be stopped now.',
+    });
+  }
+});
+
+/** Approve or decline a run's proposal, by proposal id. */
 const decision =
   (approve: boolean) =>
   async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {

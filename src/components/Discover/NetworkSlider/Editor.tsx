@@ -137,8 +137,7 @@ const NetworkSliderEditor = ({
       const response = await axios.get<TvNetwork>(`/api/v1/network/${id}`);
       const network = response.data;
 
-      // The editor may have closed, or the list may have changed, while the
-      // lookup was running, so check again against the latest list.
+      // The editor may have closed or the list changed during the lookup.
       if (!isMounted.current) {
         return;
       }
@@ -165,8 +164,8 @@ const NetworkSliderEditor = ({
         return;
       }
 
-      // Use the same rules as the server so a network that is added here can
-      // always be saved. A very long name is shortened instead of rejected.
+      // Server rules, so an added network can always be saved; long names are
+      // truncated, not rejected.
       const validated = readDiscoverNetwork({
         id: network.id,
         name: network.name?.trim().slice(0, MAX_DISCOVER_NETWORK_NAME_LENGTH),
@@ -209,7 +208,7 @@ const NetworkSliderEditor = ({
   return (
     <div className="mb-6 mt-6" data-testid="discover-network-editor">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <span className="text-sm font-semibold text-gray-300">
+        <span className="text-sm font-semibold text-default">
           {intl.formatMessage(messages.editNetworks)}
         </span>
         <Button
@@ -226,12 +225,12 @@ const NetworkSliderEditor = ({
         {networks.map((network, index) => (
           <li
             key={network.id}
-            className="flex items-center gap-2 rounded-md bg-gray-900 px-3 py-2 text-sm text-gray-200"
+            className="flex items-center gap-2 rounded-md bg-page px-3 py-2 text-sm text-gray-200"
           >
-            <span className="min-w-0 flex-1 truncate">{network.name}</span>
+            <span className="min-w-0 flex-1 break-words">{network.name}</span>
             <button
               type="button"
-              className="text-gray-400 hover:text-white disabled:text-gray-700"
+              className="text-muted hover:text-strong disabled:text-gray-700"
               aria-label={intl.formatMessage(messages.moveUp, {
                 networkName: network.name,
               })}
@@ -242,7 +241,7 @@ const NetworkSliderEditor = ({
             </button>
             <button
               type="button"
-              className="text-gray-400 hover:text-white disabled:text-gray-700"
+              className="text-muted hover:text-strong disabled:text-gray-700"
               aria-label={intl.formatMessage(messages.moveDown, {
                 networkName: network.name,
               })}
@@ -253,7 +252,7 @@ const NetworkSliderEditor = ({
             </button>
             <button
               type="button"
-              className="text-gray-400 hover:text-white"
+              className="text-muted hover:text-strong"
               aria-label={intl.formatMessage(messages.removeNetwork, {
                 networkName: network.name,
               })}

@@ -1,12 +1,16 @@
 import Badge from '@app/components/Common/Badge';
 import { menuMessages } from '@app/components/Layout/Sidebar';
+import { loadNavEditor, useNavLayout } from '@app/context/NavLayoutContext';
 import useClickOutside from '@app/hooks/useClickOutside';
 import { useFeatureCheck } from '@app/hooks/useFeature';
+import useLazyModule from '@app/hooks/useLazyModule';
+import useStayAtBottom from '@app/hooks/useStayAtBottom';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import { Transition } from '@headlessui/react';
 import {
+  AdjustmentsHorizontalIcon,
   BookmarkIcon,
   CalendarDaysIcon,
   ClockIcon,
@@ -17,6 +21,7 @@ import {
   EyeSlashIcon,
   BookmarkIcon as FilledBookmarkIcon,
   FilmIcon,
+  MusicalNoteIcon,
   SparklesIcon,
   TvIcon,
   UsersIcon,
@@ -29,12 +34,19 @@ import {
   ExclamationTriangleIcon as FilledExclamationTriangleIcon,
   EyeSlashIcon as FilledEyeSlashIcon,
   FilmIcon as FilledFilmIcon,
+  MusicalNoteIcon as FilledMusicalNoteIcon,
   SparklesIcon as FilledSparklesIcon,
   TvIcon as FilledTvIcon,
   UsersIcon as FilledUsersIcon,
   XMarkIcon,
 } from '@heroicons/react/24/solid';
 import type { Feature } from '@server/constants/features';
+import type { NavItem } from '@server/constants/navigation';
+import {
+  sortByNavOrder,
+  splitAtNavBar,
+  withoutHiddenNav,
+} from '@server/constants/navigation';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { cloneElement, useEffect, useRef, useState, type JSX } from 'react';
@@ -42,6 +54,7 @@ import { useIntl } from 'react-intl';
 
 const messages = defineMessages('components.Layout.MobileMenu', {
   more: 'More',
+  arrangeMenu: 'Arrange menu',
 });
 
 interface MobileMenuProps {
@@ -52,6 +65,8 @@ interface MobileMenuProps {
 }
 
 interface MenuLink {
+  /** Its id in each person's saved order (server/constants/navigation). */
+  id: NavItem;
   href: string;
   svgIcon: JSX.Element;
   svgIconSelected: JSX.Element;
@@ -72,11 +87,17 @@ const MobileMenu = ({
   revalidateRequestsCount,
 }: MobileMenuProps) => {
   const ref = useRef<HTMLDivElement>(null);
+  const barRef = useRef<HTMLDivElement>(null);
+  useStayAtBottom(barRef);
   const intl = useIntl();
   const [isOpen, setIsOpen] = useState(false);
   const { hasPermission } = useUser();
   const featureIsOn = useFeatureCheck();
   const router = useRouter();
+  const { draft, setDraft, order, hidden } = useNavLayout();
+  // Discover loads it when customizing starts and reports a failure.
+  const NavEditor = useLazyModule(loadNavEditor, !!draft, () => undefined);
+  const editing = !!draft;
   useClickOutside(ref, () => {
     setTimeout(() => {
       if (isOpen) {
@@ -89,6 +110,7 @@ const MobileMenu = ({
 
   const menuLinks: MenuLink[] = [
     {
+      id: 'discover',
       href: '/',
       content: intl.formatMessage(menuMessages.dashboard),
       svgIcon: <SparklesIcon className="h-6 w-6" />,
@@ -96,6 +118,7 @@ const MobileMenu = ({
       activeRegExp: /^\/(discover\/?)?$/,
     },
     {
+      id: 'movies',
       href: '/discover/movies',
       content: intl.formatMessage(menuMessages.browsemovies),
       svgIcon: <FilmIcon className="h-6 w-6" />,
@@ -103,6 +126,7 @@ const MobileMenu = ({
       activeRegExp: /^\/discover\/movies$/,
     },
     {
+      id: 'series',
       href: '/discover/tv',
       content: intl.formatMessage(menuMessages.browsetv),
       svgIcon: <TvIcon className="h-6 w-6" />,
@@ -110,6 +134,7 @@ const MobileMenu = ({
       activeRegExp: /^\/discover\/tv$/,
     },
     {
+      id: 'lists',
       href: '/lists',
       content: intl.formatMessage(menuMessages.watchlists),
       svgIcon: <BookmarkIcon className="h-6 w-6" />,
@@ -117,6 +142,7 @@ const MobileMenu = ({
       activeRegExp: /^\/lists/,
     },
     {
+      id: 'requests',
       href: '/requests',
       content: intl.formatMessage(menuMessages.requests),
       svgIcon: <ClockIcon className="h-6 w-6" />,
@@ -124,6 +150,17 @@ const MobileMenu = ({
       activeRegExp: /^\/requests/,
     },
     {
+      id: 'music',
+      href: '/discover/music',
+      content: intl.formatMessage(menuMessages.music),
+      // Only once Lidarr is set up, for people with music on.
+      feature: 'music',
+      svgIcon: <MusicalNoteIcon className="h-6 w-6" />,
+      svgIconSelected: <FilledMusicalNoteIcon className="h-6 w-6" />,
+      activeRegExp: /^\/(discover\/music|music\/)/,
+    },
+    {
+      id: 'calendar',
       href: '/calendar',
       content: intl.formatMessage(menuMessages.calendar),
       feature: 'releaseCalendar',
@@ -132,6 +169,7 @@ const MobileMenu = ({
       activeRegExp: /^\/calendar/,
     },
     {
+      id: 'blocklist',
       href: '/blocklist',
       content: intl.formatMessage(menuMessages.blocklist),
       svgIcon: <EyeSlashIcon className="h-6 w-6" />,
@@ -144,6 +182,7 @@ const MobileMenu = ({
       permissionType: 'or',
     },
     {
+      id: 'issues',
       href: '/issues',
       content: intl.formatMessage(menuMessages.issues),
       svgIcon: <ExclamationTriangleIcon className="h-6 w-6" />,
@@ -157,6 +196,7 @@ const MobileMenu = ({
       permissionType: 'or',
     },
     {
+      id: 'users',
       href: '/users',
       content: intl.formatMessage(menuMessages.users),
       svgIcon: <UsersIcon className="mr-3 h-6 w-6" />,
@@ -166,6 +206,7 @@ const MobileMenu = ({
       dataTestId: 'sidebar-menu-users',
     },
     {
+      id: 'backfill',
       href: '/backfill',
       content: intl.formatMessage(menuMessages.backfill),
       svgIcon: <DocumentMagnifyingGlassIcon className="mr-3 h-6 w-6" />,
@@ -177,6 +218,7 @@ const MobileMenu = ({
       dataTestId: 'sidebar-menu-backfill',
     },
     {
+      id: 'settings',
       href: '/settings',
       content: intl.formatMessage(menuMessages.settings),
       svgIcon: <CogIcon className="mr-3 h-6 w-6" />,
@@ -187,7 +229,9 @@ const MobileMenu = ({
     },
   ];
 
-  const filteredLinks = menuLinks.filter(
+  // Same order as the sidebar and menu editor: the person's own, or the
+  // default. Items they cannot use are left out regardless.
+  const usableLinks = sortByNavOrder(menuLinks, order).filter(
     (link) =>
       (!link.feature || featureIsOn(link.feature)) &&
       (!link.requiredPermission ||
@@ -195,6 +239,16 @@ const MobileMenu = ({
           type: link.permissionType ?? 'and',
         }))
   );
+  const filteredLinks = withoutHiddenNav(usableLinks, hidden);
+  // The first shown go on the bar; the menu button appears for the rest.
+  const [barPart, menuPart] = splitAtNavBar(usableLinks, hidden);
+  const barLinks = withoutHiddenNav(barPart, hidden);
+  const hasMenu = menuPart.length > 0;
+
+  // Close the menu when customizing starts or ends.
+  useEffect(() => {
+    setIsOpen(false);
+  }, [editing]);
 
   useEffect(() => {
     if (openIssuesCount) {
@@ -212,7 +266,13 @@ const MobileMenu = ({
   ]);
 
   return (
-    <div className="fixed bottom-0 left-0 right-0 z-50">
+    // Above Discover's Save bar while arranging the menu.
+    <div
+      ref={barRef}
+      className={`fixed bottom-0 left-0 right-0 ${
+        editing && isOpen ? 'z-[60]' : 'z-50'
+      }`}
+    >
       <Transition
         show={isOpen}
         as="div"
@@ -223,68 +283,87 @@ const MobileMenu = ({
         leave="transition duration-500"
         leaveFrom="opacity-100 -translate-y-full"
         leaveTo="opacity-0 translate-y-0"
-        className="absolute left-0 right-0 top-0 flex w-full -translate-y-full flex-col space-y-6 border-t border-gray-600 bg-gray-900/90 px-6 py-6 font-semibold text-gray-100 backdrop-blur"
+        className={`absolute left-0 right-0 top-0 flex w-full -translate-y-full flex-col space-y-6 border-t border-strong bg-page/bar px-6 py-6 font-semibold text-gray-100 backdrop-blur ${
+          editing ? 'max-h-[75vh] overflow-y-auto' : ''
+        }`}
+        data-seerr="more-menu"
       >
-        {filteredLinks.map((link) => {
-          const isActive = router.pathname.match(link.activeRegExp);
-          return (
-            <Link
-              key={`mobile-menu-link-${link.href}`}
-              href={link.href}
-              className={`flex items-center ${
-                isActive ? 'text-indigo-500' : ''
-              }`}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  setIsOpen(false);
-                }
-              }}
-              onClick={() => setIsOpen(false)}
-              role="button"
-              tabIndex={0}
-            >
-              {cloneElement(isActive ? link.svgIconSelected : link.svgIcon, {
-                className: 'h-5 w-5',
-              })}
-              <span className="ml-2">{link.content}</span>
-              {link.href === '/requests' &&
-                pendingRequestsCount > 0 &&
-                hasPermission(Permission.MANAGE_REQUESTS) && (
-                  <div className="ml-auto flex">
-                    <Badge className="rounded-md border-indigo-500 bg-gradient-to-br from-indigo-600 to-purple-600">
-                      {pendingRequestsCount}
-                    </Badge>
-                  </div>
-                )}
-              {link.href === '/issues' &&
-                openIssuesCount > 0 &&
-                hasPermission(Permission.MANAGE_ISSUES) && (
-                  <div className="ml-auto flex">
-                    <Badge className="rounded-md border-indigo-500 bg-gradient-to-br from-indigo-600 to-purple-600">
-                      {openIssuesCount}
-                    </Badge>
-                  </div>
-                )}
-            </Link>
-          );
-        })}
+        {draft && NavEditor ? (
+          <NavEditor
+            phone
+            items={usableLinks.map((link) => ({
+              id: link.id,
+              name: typeof link.content === 'string' ? link.content : link.id,
+              icon: link.svgIcon,
+            }))}
+            draft={draft}
+            onChange={setDraft}
+          />
+        ) : (
+          filteredLinks.map((link) => {
+            const isActive = router.pathname.match(link.activeRegExp);
+            return (
+              <Link
+                key={`mobile-menu-link-${link.href}`}
+                href={link.href}
+                className={`flex items-center ${
+                  isActive ? 'text-accent-text' : ''
+                }`}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    setIsOpen(false);
+                  }
+                }}
+                onClick={() => setIsOpen(false)}
+                role="button"
+                tabIndex={0}
+              >
+                {cloneElement(isActive ? link.svgIconSelected : link.svgIcon, {
+                  className: 'h-5 w-5',
+                })}
+                <span className="ml-2">{link.content}</span>
+                {link.href === '/requests' &&
+                  pendingRequestsCount > 0 &&
+                  hasPermission(Permission.MANAGE_REQUESTS) && (
+                    <div className="ml-auto flex">
+                      <Badge className="rounded-md !border-accent-hover bg-gradient-to-br from-accent to-accent-alt">
+                        {pendingRequestsCount}
+                      </Badge>
+                    </div>
+                  )}
+                {link.href === '/issues' &&
+                  openIssuesCount > 0 &&
+                  hasPermission(Permission.MANAGE_ISSUES) && (
+                    <div className="ml-auto flex">
+                      <Badge className="rounded-md !border-accent-hover bg-gradient-to-br from-accent to-accent-alt">
+                        {openIssuesCount}
+                      </Badge>
+                    </div>
+                  )}
+              </Link>
+            );
+          })
+        )}
       </Transition>
-      <div className="padding-bottom-safe border-t border-gray-600 bg-gray-800/90 backdrop-blur">
+      <div
+        className="tab-bar-blur padding-bottom-safe border-t border-strong bg-surface/bar"
+        data-seerr="bottom-bar"
+      >
         <div className="flex h-full items-center justify-between px-3 py-4 text-gray-100 sm:px-6">
-          {filteredLinks.slice(0, 5).map((link) => {
+          {barLinks.map((link) => {
             const isActive =
               router.pathname.match(link.activeRegExp) && !isOpen;
             return (
               <Link
                 key={`mobile-menu-link-${link.href}`}
                 href={link.href}
-                // Icons only on the bar, so the name is given here.
+                // The bar shows icons only.
                 aria-label={
                   typeof link.content === 'string' ? link.content : undefined
                 }
                 aria-current={isActive ? 'page' : undefined}
                 className={`relative flex flex-col items-center space-y-1 ${
-                  isActive ? 'text-indigo-500' : ''
+                  isActive ? 'text-accent-text' : ''
                 }`}
               >
                 {cloneElement(isActive ? link.svgIconSelected : link.svgIcon, {
@@ -295,10 +374,15 @@ const MobileMenu = ({
                   hasPermission(Permission.MANAGE_REQUESTS) && (
                     <div className="absolute bottom-3 left-3">
                       <Badge
-                        className={`bg-gradient-to-br ${
+                        badgeType={
                           router.pathname.match(link.activeRegExp)
-                            ? 'border-indigo-600 from-indigo-700 to-purple-700'
-                            : 'border-indigo-500 from-indigo-600 to-purple-600'
+                            ? 'deep'
+                            : 'default'
+                        }
+                        className={`${
+                          router.pathname.match(link.activeRegExp)
+                            ? ''
+                            : '!border-accent-hover bg-gradient-to-br from-accent to-accent-alt'
                         } flex ${
                           pendingRequestsCount > 99 ? 'w-6' : 'w-4'
                         } h-4 items-center justify-center !px-[5px] !py-[7px] text-[8px]`}
@@ -312,23 +396,45 @@ const MobileMenu = ({
               </Link>
             );
           })}
-          {filteredLinks.length > 4 && filteredLinks.length !== 5 && (
+          {editing ? (
             <button
               className={`flex flex-col items-center space-y-1 ${
-                isOpen ? 'text-indigo-500' : ''
+                isOpen
+                  ? 'text-accent-text'
+                  : 'text-indigo-300 light:text-accent-text'
               }`}
               onClick={() => toggle()}
               aria-label={intl.formatMessage(
-                isOpen ? globalMessages.close : messages.more
+                isOpen ? globalMessages.close : messages.arrangeMenu
               )}
               aria-expanded={isOpen}
+              data-testid="mobile-menu-arrange"
             >
               {isOpen ? (
                 <XMarkIcon className="h-6 w-6" />
               ) : (
-                <EllipsisHorizontalIcon className="h-6 w-6" />
+                <AdjustmentsHorizontalIcon className="h-6 w-6" />
               )}
             </button>
+          ) : (
+            hasMenu && (
+              <button
+                className={`flex flex-col items-center space-y-1 ${
+                  isOpen ? 'text-accent-text' : ''
+                }`}
+                onClick={() => toggle()}
+                aria-label={intl.formatMessage(
+                  isOpen ? globalMessages.close : messages.more
+                )}
+                aria-expanded={isOpen}
+              >
+                {isOpen ? (
+                  <XMarkIcon className="h-6 w-6" />
+                ) : (
+                  <EllipsisHorizontalIcon className="h-6 w-6" />
+                )}
+              </button>
+            )
           )}
         </div>
       </div>

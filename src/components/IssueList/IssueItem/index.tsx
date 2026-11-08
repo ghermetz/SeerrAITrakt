@@ -3,9 +3,11 @@ import Button from '@app/components/Common/Button';
 import CachedImage from '@app/components/Common/CachedImage';
 import Tooltip from '@app/components/Common/Tooltip';
 import { issueOptions } from '@app/components/IssueModal/constants';
+import useNearScreen, { useLoadWhenNear } from '@app/hooks/useNearScreen';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
+import { pictureLoading } from '@app/utils/nearScreen';
 import { EyeIcon } from '@heroicons/react/24/solid';
 import { IssueStatus } from '@server/constants/issue';
 import { MediaType } from '@server/constants/media';
@@ -13,7 +15,6 @@ import type Issue from '@server/entity/Issue';
 import type { MovieDetails } from '@server/models/Movie';
 import type { TvDetails } from '@server/models/Tv';
 import Link from 'next/link';
-import { useInView } from 'react-intersection-observer';
 import { FormattedRelativeTime, useIntl } from 'react-intl';
 import useSWR from 'swr';
 
@@ -41,16 +42,14 @@ interface IssueItemProps {
 const IssueItem = ({ issue }: IssueItemProps) => {
   const intl = useIntl();
   const { hasPermission } = useUser();
-  const { ref, inView } = useInView({
-    triggerOnce: true,
-  });
+  // Load the title and images once the row is near the screen.
+  const { ref, near, nearness } = useNearScreen();
   const url =
     issue.media.mediaType === 'movie'
       ? `/api/v1/movie/${issue.media.tmdbId}`
       : `/api/v1/tv/${issue.media.tmdbId}`;
-  const { data: title, error } = useSWR<MovieDetails | TvDetails>(
-    inView ? url : null
-  );
+  const titleKey = useLoadWhenNear(url, near);
+  const { data: title, error } = useSWR<MovieDetails | TvDetails>(titleKey);
 
   if (!title && !error) {
     return (
@@ -127,14 +126,9 @@ const IssueItem = ({ issue }: IssueItemProps) => {
             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
             fill
             sizes="(min-width: 1280px) 66vw, 100vw"
+            {...pictureLoading(nearness)}
           />
-          <div
-            className="absolute inset-0"
-            style={{
-              backgroundImage:
-                'linear-gradient(90deg, rgba(31, 41, 55, 0.47) 0%, rgba(31, 41, 55, 1) 100%)',
-            }}
-          />
+          <div className="row-backdrop-fade absolute inset-y-0 -right-px left-0" />
         </div>
       )}
       <div className="relative flex w-full flex-col justify-between overflow-hidden sm:flex-row">
@@ -151,18 +145,19 @@ const IssueItem = ({ issue }: IssueItemProps) => {
               type="tmdb"
               src={
                 title.posterPath
-                  ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${title.posterPath}`
+                  ? `https://image.tmdb.org/t/p/w300_and_h450_face${title.posterPath}`
                   : '/images/seerr_poster_not_found.png'
               }
               alt=""
               sizes="100vw"
               style={{ width: '100%', height: 'auto', objectFit: 'cover' }}
-              width={600}
-              height={900}
+              width={300}
+              height={450}
+              {...pictureLoading(nearness)}
             />
           </Link>
           <div className="flex flex-col justify-center overflow-hidden pl-2 xl:pl-4">
-            <div className="pt-0.5 text-xs text-white sm:pt-1">
+            <div className="pt-0.5 text-xs text-strong sm:pt-1">
               {(isMovie(title) ? title.releaseDate : title.firstAirDate)?.slice(
                 0,
                 4
@@ -174,7 +169,7 @@ const IssueItem = ({ issue }: IssueItemProps) => {
                   ? `/movie/${issue.media.tmdbId}`
                   : `/tv/${issue.media.tmdbId}`
               }
-              className="mr-2 min-w-0 truncate text-lg font-bold text-white hover:underline xl:text-xl"
+              className="mr-2 min-w-0 break-words text-lg font-bold text-strong hover:underline xl:truncate xl:text-xl"
             >
               {isMovie(title) ? title.title : title.name}
             </Link>
@@ -186,7 +181,7 @@ const IssueItem = ({ issue }: IssueItemProps) => {
                       content={
                         <div className="max-w-sm p-3">
                           <div className="mb-1 text-sm font-medium text-gray-200">
-                            Issue Description
+                            {intl.formatMessage(messages.descriptionpreview)}
                           </div>
                           <div className="whitespace-pre-wrap text-sm leading-relaxed text-gray-300">
                             {description}
@@ -198,7 +193,7 @@ const IssueItem = ({ issue }: IssueItemProps) => {
                         offset: [0, 8],
                       }}
                     >
-                      <span className="block cursor-help truncate transition-colors hover:text-gray-200">
+                      <span className="block cursor-help break-words transition-colors hover:text-gray-200 sm:truncate">
                         {truncatedDescription}
                       </span>
                     </Tooltip>
@@ -236,7 +231,7 @@ const IssueItem = ({ issue }: IssueItemProps) => {
             <span className="card-field-name">
               {intl.formatMessage(messages.issuetype)}
             </span>
-            <span className="flex truncate text-sm text-gray-300">
+            <span className="flex min-w-0 text-sm text-gray-300 xl:truncate">
               {intl.formatMessage(
                 issueOption?.name ?? messages.unknownissuetype
               )}
@@ -250,7 +245,7 @@ const IssueItem = ({ issue }: IssueItemProps) => {
                 <span className="card-field-name">
                   {intl.formatMessage(messages.opened)}
                 </span>
-                <span className="flex truncate text-sm text-gray-300">
+                <span className="flex min-w-0 flex-wrap text-sm text-gray-300 xl:flex-nowrap xl:truncate">
                   {intl.formatMessage(messages.openeduserdate, {
                     date: (
                       <FormattedRelativeTime
@@ -265,7 +260,7 @@ const IssueItem = ({ issue }: IssueItemProps) => {
                     user: (
                       <Link
                         href={`/users/${issue.createdBy.id}`}
-                        className="group flex items-center truncate"
+                        className="group flex min-w-0 items-center xl:truncate"
                       >
                         <CachedImage
                           type="avatar"
@@ -275,7 +270,7 @@ const IssueItem = ({ issue }: IssueItemProps) => {
                           width={20}
                           height={20}
                         />
-                        <span className="truncate text-sm font-semibold group-hover:text-white group-hover:underline">
+                        <span className="min-w-0 break-words text-sm font-semibold group-hover:text-strong group-hover:underline xl:truncate">
                           {issue.createdBy.displayName}
                         </span>
                       </Link>
@@ -288,7 +283,7 @@ const IssueItem = ({ issue }: IssueItemProps) => {
                 <span className="card-field-name">
                   {intl.formatMessage(messages.opened)}
                 </span>
-                <span className="flex truncate text-sm text-gray-300">
+                <span className="flex min-w-0 text-sm text-gray-300 xl:truncate">
                   <FormattedRelativeTime
                     value={Math.floor(
                       (new Date(issue.createdAt).getTime() - Date.now()) / 1000

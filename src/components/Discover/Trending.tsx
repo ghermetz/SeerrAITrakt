@@ -30,13 +30,8 @@ const Trending = () => {
   const router = useRouter();
   const updateQueryParams = useUpdateQueryParams({});
 
-  /*
-   * Kept in the page address rather than component state, as the Discover
-   * pages do. Component state was rebuilt from the defaults whenever you came
-   * back from a title, so the filters reset; the address survives the round
-   * trip, and the browser restores it on back. Anything unrecognised in the
-   * address falls back to the default.
-   */
+  // Kept in the URL so filters survive going to a title and back; invalid
+  // values fall back to the default.
   const currentMediaType: MediaType = (['movie', 'tv'] as const).includes(
     router.query.mediaType as 'movie' | 'tv'
   )
@@ -68,7 +63,7 @@ const Trending = () => {
         <Header>{intl.formatMessage(messages.trending)}</Header>
         <div className="mt-2 flex flex-grow flex-col sm:flex-row lg:flex-grow-0">
           <div className="mb-2 flex flex-grow sm:mb-0 sm:mr-2 lg:flex-grow-0">
-            <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-sm text-gray-100">
+            <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-surface px-3 text-sm text-gray-100">
               <CircleStackIcon className="h-6 w-6" />
             </span>
             <select
@@ -95,7 +90,7 @@ const Trending = () => {
             </select>
           </div>
           <div className="mb-2 flex flex-grow sm:mb-0 sm:mr-2 lg:flex-grow-0">
-            <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-sm text-gray-100">
+            <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-surface px-3 text-sm text-gray-100">
               <FunnelIcon className="h-6 w-6" />
             </span>
             <select

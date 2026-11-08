@@ -1,5 +1,6 @@
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
+import SaveBar from '@app/components/Common/SaveBar';
 import NotificationTypeSelector from '@app/components/NotificationTypeSelector';
 import { availableLanguages } from '@app/context/LanguageContext';
 import useToasts from '@app/hooks/useToasts';
@@ -149,7 +150,7 @@ const NotificationsSlack = () => {
         return (
           <Form className="section">
             <div className="form-row">
-              <label htmlFor="isDefault" className="checkbox-label">
+              <label htmlFor="enabled" className="checkbox-label">
                 {intl.formatMessage(messages.agentenabled)}
                 <span className="label-required">*</span>
               </label>
@@ -166,7 +167,7 @@ const NotificationsSlack = () => {
               </div>
             </div>
             <div className="form-row">
-              <label htmlFor="name" className="text-label">
+              <label htmlFor="webhookUrl" className="text-label">
                 {intl.formatMessage(messages.webhookUrl)}
                 <span className="label-required">*</span>
                 <span className="label-tip">
@@ -174,7 +175,7 @@ const NotificationsSlack = () => {
                     WebhookLink: (msg: React.ReactNode) => (
                       <a
                         href="https://my.slack.com/services/new/incoming-webhook/"
-                        className="text-white transition duration-300 hover:underline"
+                        className="text-strong transition duration-300 hover:underline"
                         target="_blank"
                         rel="noreferrer"
                       >
@@ -240,7 +241,7 @@ const NotificationsSlack = () => {
                   : undefined
               }
             />
-            <div className="actions">
+            <SaveBar>
               <div className="flex justify-end">
                 <span className="ml-3 inline-flex rounded-md shadow-sm">
                   <Button
@@ -279,7 +280,7 @@ const NotificationsSlack = () => {
                   </Button>
                 </span>
               </div>
-            </div>
+            </SaveBar>
           </Form>
         );
       }}

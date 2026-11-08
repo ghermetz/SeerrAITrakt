@@ -1,0 +1,293 @@
+import { musicBrainz } from '@server/api/musicbrainz';
+import type LidarrAPI from '@server/api/servarr/lidarr';
+import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
+import { getRepository } from '@server/datasource';
+import AlbumRequest from '@server/entity/AlbumRequest';
+import MusicAlbum from '@server/entity/MusicAlbum';
+import SongRequest from '@server/entity/SongRequest';
+import { lidarrApi } from '@server/lib/music/access';
+import { trackOf } from '@server/lib/music/songFetch';
+import { albumFor, toVersion } from '@server/lib/music/songs';
+import type { LidarrSettings } from '@server/lib/settings';
+import { getSettings } from '@server/lib/settings';
+import logger from '@server/logger';
+import { In, IsNull, Not } from 'typeorm';
+
+/*
+ * Songs with a single are fetched by Lidarr like any album. Older singles
+ * are rarely posted alone, so Lidarr often finds nothing. Lidarr searches
+ * once; if nothing is grabbed, the song goes to Seerr's song fetch
+ * (lib/music/songFetch), from an album with the recording or else the
+ * single, retrying on its own schedule.
+ */
+
+const LABEL = 'Song Fetch';
+
+/** Max searches started per minute, so singles don't flood indexers. */
+export const SEARCHES_AT_ONCE = 3;
+
+/** Lidarr's terminal command states. */
+const OVER = ['completed', 'failed', 'aborted', 'cancelled', 'orphaned'];
+
+interface Single {
+  server: LidarrSettings;
+  lidarrAlbumId: number;
+  songs: SongRequest[];
+}
+
+/**
+ * Wait after Lidarr's search ends for a grab to show in its queue, so Seerr
+ * and Lidarr don't both download the song.
+ */
+const QUEUE_SETTLE_MS = 2 * 60_000;
+/** Retry delay for a search Lidarr couldn't run or lost. */
+const SEARCH_RETRY_MS = 60 * 60_000;
+
+/** State of Lidarr's search for a single. */
+interface Search {
+  commandId?: number;
+  /** When the search ended with nothing grabbed. */
+  endedAt?: number;
+  /** No new search before this. */
+  retryAt?: number;
+}
+
+class SingleFallback {
+  /** Search state keyed by server and Lidarr album id. */
+  private searches = new Map<string, Search>();
+
+  /** Hands songs whose single Lidarr couldn't find to Seerr's song fetch. */
+  public async run(now = Date.now()): Promise<void> {
+    const singles = await this.waiting();
+    if (!singles.length) {
+      this.searches.clear();
+      return;
+    }
+    const queues = new Map<number, Set<number>>();
+    const inQueue = async (single: Single, fresh = false) => {
+      if (fresh || !queues.has(single.server.id)) {
+        const queue = await lidarrApi(single.server).getMusicQueue();
+        queues.set(single.server.id, new Set(queue.map((i) => i.albumId)));
+      }
+      return queues.get(single.server.id)!.has(single.lidarrAlbumId);
+    };
+    let started = 0;
+    const live = new Set<string>();
+    for (const single of singles) {
+      const key = `${single.server.id}:${single.lidarrAlbumId}`;
+      live.add(key);
+      const api = lidarrApi(single.server);
+      try {
+        // Downloading, or downloaded and waiting for library scans.
+        if (await inQueue(single)) {
+          this.searches.delete(key);
+          continue;
+        }
+        const album = await api.getAlbum(single.lidarrAlbumId);
+        // Lidarr has part of the single and won't fetch the rest, so Seerr
+        // takes the missing songs.
+        if ((album.statistics?.trackFileCount ?? 0) > 0) {
+          const tracks = await api.getTracks(album.id);
+          const missing = single.songs.filter(
+            (song) => !trackOf(tracks, song)?.hasFile
+          );
+          if (missing.length) {
+            await this.handOn(api, { ...single, songs: missing }, 'partly');
+          }
+          this.searches.delete(key);
+          continue;
+        }
+
+        const search = this.searches.get(key) ?? {};
+        this.searches.set(key, search);
+        if (search.endedAt !== undefined) {
+          if (now - search.endedAt < QUEUE_SETTLE_MS) continue;
+          if (await inQueue(single, true)) {
+            this.searches.delete(key);
+            continue;
+          }
+          if (await this.handOn(api, single)) this.searches.delete(key);
+          continue;
+        }
+        if (search.commandId === undefined) {
+          if (search.retryAt !== undefined && now < search.retryAt) continue;
+          if (started >= SEARCHES_AT_ONCE) continue;
+          started++;
+          search.commandId = await api.startAlbumSearch([album.id]);
+          search.retryAt = undefined;
+          logger.info('Asked Lidarr to search for a single', {
+            label: LABEL,
+            single: single.songs[0].singleTitle,
+            songs: single.songs.length,
+          });
+          continue;
+        }
+        const command = await api
+          .getCommand(search.commandId)
+          .catch(() => null);
+        if (command && !OVER.includes(command.status)) continue;
+        search.commandId = undefined;
+        // A failed or forgotten search (Lidarr restarted) proves nothing;
+        // retry later, not now.
+        if (command?.status !== 'completed') {
+          search.retryAt = now + SEARCH_RETRY_MS;
+          continue;
+        }
+        search.endedAt = now;
+      } catch (e) {
+        logger.debug('Could not check a single Lidarr is looking for', {
+          label: LABEL,
+          lidarrAlbumId: single.lidarrAlbumId,
+          errorMessage: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    for (const key of this.searches.keys()) {
+      if (!live.has(key)) this.searches.delete(key);
+    }
+  }
+
+  /**
+   * Approved songs grouped by single, using Lidarr's album list so library
+   * scans needn't have caught up. Includes failed requests, whose other
+   * songs are still in progress.
+   */
+  private async waiting(): Promise<Single[]> {
+    const songs = await getRepository(SongRequest).find({
+      where: {
+        status: MediaRequestStatus.APPROVED,
+        singleMbid: Not(IsNull()),
+        request: {
+          status: In([MediaRequestStatus.APPROVED, MediaRequestStatus.FAILED]),
+        },
+      },
+      relations: { request: { media: true } },
+    });
+    if (!songs.length) return [];
+    const servers = getSettings().lidarr;
+    const albumsOf = new Map<string, Map<string, number>>();
+    const singles = new Map<string, Single>();
+    for (const song of songs) {
+      const server =
+        servers.find((s) => s.id === song.request.serverId) ??
+        servers.find((s) => s.isDefault);
+      const artistMbid = song.request.media?.foreignId;
+      // Respect a server's preventSearch.
+      if (!server || server.preventSearch || !artistMbid) continue;
+      const artistKey = `${server.id}:${artistMbid}`;
+      let albums = albumsOf.get(artistKey);
+      if (!albums) {
+        const api = lidarrApi(server);
+        const artist = await api.getArtistByMbid(artistMbid).catch(() => null);
+        albums = new Map(
+          artist
+            ? (await api.getAlbums({ artistId: artist.id })).map((album) => [
+                album.foreignAlbumId,
+                album.id,
+              ])
+            : []
+        );
+        albumsOf.set(artistKey, albums);
+      }
+      const lidarrAlbumId = albums.get(song.singleMbid!);
+      // Not in Lidarr yet: the request is still being sent.
+      if (lidarrAlbumId === undefined) continue;
+      const key = `${server.id}:${lidarrAlbumId}`;
+      const single = singles.get(key) ?? { server, lidarrAlbumId, songs: [] };
+      single.songs.push(song);
+      singles.set(key, single);
+    }
+    return [...singles.values()];
+  }
+
+  /**
+   * Hands the single's songs to Seerr's song fetch, sourced from an album
+   * with the recording or else the single. Unmonitors the single and frees
+   * it if nothing else waits on it, so its other songs stay requestable.
+   * False if a recording lookup failed, so it's retried.
+   */
+  private async handOn(
+    api: LidarrAPI,
+    single: Single,
+    why: 'none' | 'partly' = 'none'
+  ): Promise<boolean> {
+    const singleMbid = single.songs[0]?.singleMbid;
+    let left = 0;
+    for (const song of single.songs) {
+      let recording;
+      try {
+        recording = await musicBrainz().getRecording(
+          song.recordingMbid,
+          'background'
+        );
+      } catch (e) {
+        left++;
+        logger.debug('Could not look up a song Lidarr found no single for', {
+          label: LABEL,
+          song: song.title,
+          errorMessage: e instanceof Error ? e.message : String(e),
+        });
+        continue;
+      }
+      const version = recording ? toVersion(recording) : null;
+      const album = version ? albumFor(version) : null;
+      await getRepository(SongRequest).update(song.id, {
+        singleMbid: null,
+        singleTitle: null,
+        sourceAlbumMbid: album?.mbId ?? song.singleMbid,
+        sourceAlbumTitle: album?.title ?? song.singleTitle,
+      });
+      logger.info(
+        why === 'partly'
+          ? 'Lidarr has only part of the single; Seerr is taking the song'
+          : album
+            ? 'Lidarr found no release of the single; taking the song from an album'
+            : 'Lidarr found no release of the single; Seerr is looking for it instead',
+        {
+          label: LABEL,
+          song: song.title,
+          single: song.singleTitle,
+          ...(album ? { album: album.title } : {}),
+        }
+      );
+    }
+    if (left) return false;
+    await api.monitorAlbums([single.lidarrAlbumId], false);
+    if (singleMbid) await this.release(singleMbid);
+    return true;
+  }
+
+  /**
+   * Resets the single's album row to unknown when no open request needs it
+   * and it has no files.
+   */
+  private async release(singleMbid: string): Promise<void> {
+    const open = [MediaRequestStatus.PENDING, MediaRequestStatus.APPROVED];
+    const [songs, albums] = await Promise.all([
+      getRepository(SongRequest).count({
+        where: { singleMbid, status: In(open) },
+      }),
+      getRepository(AlbumRequest).count({
+        where: { albumMbid: singleMbid, status: In(open) },
+      }),
+    ]);
+    if (songs || albums) return;
+    const rows = await getRepository(MusicAlbum).find({
+      select: { id: true, trackFileCount: true },
+      where: {
+        mbId: singleMbid,
+        status: In([MediaStatus.PENDING, MediaStatus.PROCESSING]),
+      },
+    });
+    const free = rows.filter((row) => !row.trackFileCount);
+    if (free.length) {
+      await getRepository(MusicAlbum).update(
+        { id: In(free.map((row) => row.id)) },
+        { status: MediaStatus.UNKNOWN }
+      );
+    }
+  }
+}
+
+const singleFallback = new SingleFallback();
+export default singleFallback;

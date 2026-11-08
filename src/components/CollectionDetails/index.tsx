@@ -1,3 +1,4 @@
+import AddCollectionToList from '@app/components/AddToList/Collection';
 import BlocklistModal from '@app/components/BlocklistModal';
 import Button from '@app/components/Common/Button';
 import ButtonWithDropdown from '@app/components/Common/ButtonWithDropdown';
@@ -15,6 +16,7 @@ import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import ErrorPage from '@app/pages/_error';
 import defineMessages from '@app/utils/defineMessages';
+import { titleBackdrop, titlePoster } from '@app/utils/imageSources';
 import { refreshIntervalHelper } from '@app/utils/refreshIntervalHelper';
 import {
   ArrowDownTrayIcon,
@@ -238,8 +240,7 @@ const CollectionDetails = ({ collection }: CollectionDetailsProps) => {
         part.mediaInfo.status4k === MediaStatus.UNKNOWN
     ).length > 0;
 
-  // How much of the collection is here, for the line under its name and the
-  // request button: films in the library, films on their way, and the rest.
+  // Library, in-progress and remaining films, for the subtitle and request button.
   const inLibrary = data.parts.filter(
     (part) =>
       part.mediaInfo?.status === MediaStatus.AVAILABLE ||
@@ -310,18 +311,12 @@ const CollectionDetails = ({ collection }: CollectionDetailsProps) => {
           <CachedImage
             type="tmdb"
             alt=""
-            src={`https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${data.backdropPath}`}
+            src={titleBackdrop(data.backdropPath)}
             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
             fill
             priority
           />
-          <div
-            className="absolute inset-0"
-            style={{
-              backgroundImage:
-                'linear-gradient(180deg, rgba(17, 24, 39, 0.47) 0%, rgba(17, 24, 39, 1) 100%)',
-            }}
-          />
+          <div className="media-page-fade" />
         </div>
       )}
       <PageTitle title={data.name} />
@@ -351,7 +346,7 @@ const CollectionDetails = ({ collection }: CollectionDetailsProps) => {
             type="tmdb"
             src={
               data.posterPath
-                ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${data.posterPath}`
+                ? titlePoster(data.posterPath)
                 : '/images/seerr_poster_not_found.png'
             }
             alt=""
@@ -410,7 +405,7 @@ const CollectionDetails = ({ collection }: CollectionDetailsProps) => {
                 ))}
           </span>
           {inLibrary > 0 && inLibrary < data.parts.length && (
-            <span className="mt-1 block text-sm text-gray-300">
+            <span className="mt-1 block text-sm text-default">
               {intl.formatMessage(messages.inlibrary, {
                 have: inLibrary,
                 total: data.parts.length,
@@ -465,6 +460,17 @@ const CollectionDetails = ({ collection }: CollectionDetailsProps) => {
                 </Button>
               </Tooltip>
             ))}
+          {data.parts.length > 0 && (
+            <div className="z-20">
+              <AddCollectionToList
+                movies={data.parts.map((part) => ({
+                  tmdbId: part.id,
+                  posterPath: part.posterPath ?? null,
+                }))}
+                onRequested={() => revalidate()}
+              />
+            </div>
+          )}
           {(hasRequestable || hasRequestable4k) && (
             <ButtonWithDropdown
               buttonType="primary"
@@ -477,8 +483,7 @@ const CollectionDetails = ({ collection }: CollectionDetailsProps) => {
                   <ArrowDownTrayIcon />
                   <span>
                     {hasRequestable && inLibrary + onTheirWay > 0
-                      ? // Some of it is already here: say what the button
-                        // will actually ask for.
+                      ? // Partly available: name what the button requests.
                         intl.formatMessage(messages.requestmissing, {
                           count: missing,
                         })
@@ -539,7 +544,9 @@ const CollectionDetails = ({ collection }: CollectionDetailsProps) => {
               id={title.id}
               isAddedToWatchlist={title.mediaInfo?.watchlists?.length ?? 0}
               image={title.posterPath}
+              backdrop={title.backdropPath}
               status={title.mediaInfo?.status}
+              outsideLibraries={title.mediaInfo?.outsideLibraries}
               summary={title.overview}
               title={title.title}
               userScore={title.voteAverage}

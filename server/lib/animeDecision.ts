@@ -1,20 +1,38 @@
 import type { SeriesType } from '@server/constants/seriesType';
+import { getSettings } from '@server/lib/settings';
 import type { AnimeSignals } from '@server/utils/isAnime';
 import { isAnime } from '@server/utils/isAnime';
+
+/**
+ * Anime detection minus this server's excluded countries (Settings → Services →
+ * Anime).
+ */
+export const detectAnime = (media: AnimeSignals): boolean =>
+  isAnime(media, getSettings().main.animeExcludedCountries ?? []);
 
 /** Who decided whether a title is anime. */
 export type AnimeDecidedBy = 'title' | 'request' | 'detection';
 
+/** Series type of the newest request with this `is4k` that has one. */
+export const requestSeriesType = (
+  requests: readonly {
+    id: number;
+    is4k: boolean;
+    seriesType?: SeriesType | null;
+  }[],
+  is4k: boolean
+): SeriesType | null =>
+  requests
+    .filter((r) => r.is4k === is4k && r.seriesType)
+    .sort((a, b) => b.id - a.id)[0]?.seriesType ?? null;
+
 /**
- * Whether a title is anime, and who said so: the series type on its request
- * (ticked or unticked as Anime by whoever requested it, or set by an
- * override rule), then the title's own setting (set on its page), then anime
- * detection.
+ * Whether a title is anime, and who decided: the request's series type, then
+ * the title's own setting, then detection.
  *
  * A request only carries a rule's type that agrees with the title's setting
- * (MediaRequest.request), and saving the setting clears request types that
- * disagree with it (lib/animePlacement), so the latest decision is the one
- * that stands.
+ * (MediaRequest.request), and saving the setting clears disagreeing request
+ * types (lib/animePlacement), so the latest decision stands.
  */
 export const decideAnime = (
   media: AnimeSignals,
@@ -27,5 +45,5 @@ export const decideAnime = (
   if (animeSetting === true || animeSetting === false) {
     return { anime: animeSetting, decidedBy: 'title' };
   }
-  return { anime: isAnime(media), decidedBy: 'detection' };
+  return { anime: detectAnime(media), decidedBy: 'detection' };
 };

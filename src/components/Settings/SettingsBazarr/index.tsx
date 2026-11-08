@@ -18,7 +18,7 @@ import useSWR, { mutate as globalMutate } from 'swr';
 const messages = defineMessages('components.Settings.SettingsBazarr', {
   title: 'Bazarr',
   description:
-    'Link Bazarr to show each title’s subtitles on its page, and to search, replace, delete or transcribe them from there. Bazarr does the work; Seerr AI asks it.',
+    'Shows each title’s subtitles on its page, and lets you search, replace or transcribe them.',
   addBazarr: 'Add Bazarr',
   subtitles: 'Subtitles',
   onTitlePages: 'On title pages',
@@ -30,7 +30,7 @@ const messages = defineMessages('components.Settings.SettingsBazarr', {
 
 /*
  * Bazarr, laid out like Maintainerr and the download clients: its tile with
- * Edit and Delete once it is set up, a dashed tile to add it before.
+ * Edit and Delete once set up, else a dashed tile to add it.
  */
 const SettingsBazarr = () => {
   const intl = useIntl();
@@ -110,7 +110,9 @@ const SettingsBazarr = () => {
                 hostname={data.hostname}
                 port={data.port}
                 isSSL={data.useSsl}
-                logo={<BazarrLogo className="h-10 w-10 flex-shrink-0" />}
+                logo={
+                  <BazarrLogo className="service-logo h-10 w-10 flex-shrink-0" />
+                }
                 detail={{
                   label: intl.formatMessage(messages.subtitles),
                   value: intl.formatMessage(messages.onTitlePages),

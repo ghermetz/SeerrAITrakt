@@ -1,7 +1,12 @@
+import JellyfinAPI from '@server/api/jellyfin';
 import PlexTvAPI from '@server/api/plextv';
+import { MEDIA_SERVER_KINDS, MediaServerType } from '@server/constants/server';
+import { UserType } from '@server/constants/user';
 import { getRepository } from '@server/datasource';
+import OidcLink from '@server/entity/OidcLink';
 import { User } from '@server/entity/User';
 import UserPasskey from '@server/entity/UserPasskey';
+import { applyMediaServerLogin } from '@server/lib/mediaServerAdmin';
 import { passkeyName, takeChallenge } from '@server/lib/passkeys';
 import { getSettings } from '@server/lib/settings';
 import { checkUser } from '@server/middleware/auth';
@@ -16,11 +21,18 @@ import type { Server } from 'node:http';
 import path from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
+// Settings → Users' media server sign-in switch, which toggles every connected
+// server's own switch.
+const setMediaServerLogin = (on: boolean): void => {
+  getSettings().main.mediaServerLogin = on;
+  applyMediaServerLogin(on);
+};
+
 /*
  * Passkeys end to end against the real verification code: a small software
- * authenticator below makes real P-256 keys and signatures, the way a phone
- * or security key would, and every request goes through the API validator
- * and a real session cookie.
+ * authenticator makes real P-256 keys and signatures like a phone or security
+ * key, and every request goes through the API validator with a real session
+ * cookie.
  */
 
 const RP_ID = 'seerr.test';
@@ -175,7 +187,7 @@ before(async () => {
   ex.set('trust proxy', true);
   ex.use(express.json());
   ex.use(session({ secret: 'test', resave: false, saveUninitialized: false }));
-  // Test-only way in: signs the session in as the user named in the header.
+  // Test-only sign-in: signs the session in as the user named in the header.
   ex.use((req, _res, next) => {
     const as = req.header('x-test-sign-in-as');
     if (as) {
@@ -211,11 +223,28 @@ before(async () => {
 });
 after(() => app?.close());
 
+/** Jellyfin's answer for whether the account is enabled there. */
+let jellyfinEnabled = true;
+Object.defineProperty(JellyfinAPI.prototype, 'getAccount', {
+  configurable: true,
+  set() {},
+  get() {
+    return async () => ({ Policy: { IsDisabled: !jellyfinEnabled } });
+  },
+});
+
 beforeEach(async () => {
   plexAccess = true;
+  jellyfinEnabled = true;
   const settings = getSettings();
   settings.main.applicationUrl = ORIGIN;
-  settings.main.mediaServerLogin = true;
+  setMediaServerLogin(true);
+  // A Plex-set-up server with nothing else connected.
+  settings.main.mediaServerType = MediaServerType.PLEX;
+  for (const kind of MEDIA_SERVER_KINDS) {
+    settings[kind].connected = false;
+    settings[kind].signIn = true;
+  }
   // Both seeded accounts are Plex accounts; the friend is on the share list.
   await getRepository(User).update(
     { email: 'admin@seerr.dev' },
@@ -231,7 +260,7 @@ beforeEach(async () => {
   );
 });
 
-/** A browser: keeps its session cookie between calls. */
+/** A browser that keeps its session cookie between calls. */
 class Browser {
   public cookie = '';
 
@@ -268,7 +297,7 @@ class Browser {
 const userId = async (email: string) =>
   (await getRepository(User).findOneOrFail({ where: { email } })).id;
 
-/** Adds a passkey for whoever this browser is signed in as. */
+/** Add a passkey for whoever the browser is signed in as. */
 const addPasskey = async (browser: Browser, device: Authenticator) => {
   const options = await browser.call('POST', '/passkey/register/options');
   assert.equal(options.status, 200);
@@ -327,8 +356,8 @@ describe('passkeys', () => {
     const device = new Authenticator();
     assert.equal((await addPasskey(owner, device)).status, 201);
 
-    // Starting a passkey sign-in stores a session before anyone is signed
-    // in; someone could note that id, or plant it in another's browser.
+    // Starting passkey sign-in stores a session before anyone signs in; someone
+    // could note that id or plant it in another's browser.
     const other = new Browser();
     await other.call('POST', '/passkey/login/options');
     const earlier = other.cookie;
@@ -445,8 +474,92 @@ describe('passkeys', () => {
     const device = new Authenticator();
     await addPasskey(browser, device);
 
-    getSettings().main.mediaServerLogin = false;
+    setMediaServerLogin(false);
     assert.equal((await signInWith(device)).status, 403);
+  });
+
+  it('lets someone in while any of their connected servers does', async () => {
+    const settings = getSettings();
+    settings.jellyfin.connected = true;
+    settings.jellyfin.ip = 'jellyfin.local';
+    settings.jellyfin.apiKey = 'jellyfin-key';
+    await getRepository(User).update(
+      { email: 'friend@seerr.dev' },
+      { jellyfinUserId: 'jf-friend' }
+    );
+    const browser = new Browser();
+    await browser.signInAs(await userId('friend@seerr.dev'));
+    const device = new Authenticator();
+    await addPasskey(browser, device);
+
+    // No longer shared on Plex, still on Jellyfin.
+    plexAccess = false;
+    assert.equal((await signInWith(device)).status, 200);
+
+    // Jellyfin sign-in off: a passkey doesn't bypass it.
+    settings.jellyfin.signIn = false;
+    assert.equal((await signInWith(device)).status, 403);
+
+    settings.jellyfin.signIn = true;
+    jellyfinEnabled = false;
+    assert.equal((await signInWith(device)).status, 403);
+  });
+
+  it("follows Plex's own sign-in switch", async () => {
+    const browser = new Browser();
+    await browser.signInAs(await userId('friend@seerr.dev'));
+    const device = new Authenticator();
+    await addPasskey(browser, device);
+
+    getSettings().plex.signIn = false;
+    assert.equal((await signInWith(device)).status, 403);
+    getSettings().plex.signIn = true;
+    assert.equal((await signInWith(device)).status, 200);
+  });
+
+  it('lets in an account made by single sign-on while password sign-in is off', async () => {
+    const users = getRepository(User);
+    const sso = await users.save(
+      new User({
+        email: 'sso@seerr.dev',
+        avatar: '',
+        permissions: 0,
+        userType: UserType.LOCAL,
+      })
+    );
+    await getRepository(OidcLink).save(
+      new OidcLink({ user: sso, provider: 'authentik', sub: 'sso-sub' })
+    );
+    const password = await users.save(
+      new User({
+        email: 'password@seerr.dev',
+        avatar: '',
+        permissions: 0,
+        userType: UserType.LOCAL,
+      })
+    );
+    const settings = getSettings();
+    settings.main.localLogin = false;
+    try {
+      const ssoDevice = new Authenticator();
+      const ssoBrowser = new Browser();
+      await ssoBrowser.signInAs(sso.id);
+      assert.equal((await addPasskey(ssoBrowser, ssoDevice)).status, 201);
+      assert.equal((await signInWith(ssoDevice)).status, 200);
+
+      // A password account's passkey stands in for its password, which is
+      // switched off.
+      const passwordDevice = new Authenticator();
+      const passwordBrowser = new Browser();
+      await passwordBrowser.signInAs(password.id);
+      assert.equal(
+        (await addPasskey(passwordBrowser, passwordDevice)).status,
+        201
+      );
+      assert.equal((await signInWith(passwordDevice)).status, 403);
+    } finally {
+      settings.main.localLogin = true;
+    }
   });
 
   it('refuses a response made for another site', async () => {
@@ -472,6 +585,22 @@ describe('passkeys', () => {
       userHandle: b64url(Buffer.from(`seerr-user-${admin}`)),
     });
     assert.equal(res.status, 403);
+  });
+
+  it('asks for a wait after ten failed sign-ins with one passkey, even a good one', async () => {
+    const browser = new Browser();
+    await browser.signInAs(await userId('friend@seerr.dev'));
+    const device = new Authenticator();
+    await addPasskey(browser, device);
+
+    for (let i = 0; i < 10; i++) {
+      assert.equal(
+        (await signInWith(device, { origin: 'https://other.example.invalid' }))
+          .status,
+        403
+      );
+    }
+    assert.equal((await signInWith(device)).status, 429);
   });
 
   it('never accepts the same challenge twice', async () => {

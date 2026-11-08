@@ -1,4 +1,5 @@
 import { AgentPanel } from '@app/components/Backfill/Agent/parts';
+import DownloadCheckPanel from '@app/components/Backfill/DownloadCheck';
 import SearchAllPanel, {
   SearchAllButton,
 } from '@app/components/Backfill/SearchAll';
@@ -15,6 +16,7 @@ import {
   appName,
   formatBytes,
   formatDuration,
+  jobStage,
   useCandidateLine,
 } from '@app/components/Backfill/shared';
 import type { Overview } from '@app/components/Backfill/types';
@@ -24,6 +26,7 @@ import Header from '@app/components/Common/Header';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import PageTitle from '@app/components/Common/PageTitle';
 import useDebouncedState from '@app/hooks/useDebouncedState';
+import useScrollToHash from '@app/hooks/useScrollToHash';
 import ErrorPage from '@app/pages/_error';
 import defineMessages from '@app/utils/defineMessages';
 import {
@@ -45,7 +48,9 @@ import useSWR from 'swr';
 const messages = defineMessages('components.Backfill.Dashboard', {
   backfill: 'Backfill',
   description:
-    'Finds what Sonarr and Radarr can’t, checks every file against your quality profile, and imports only what you approve.',
+    'Finds what Sonarr and Radarr can’t, and imports only what you approve.',
+  descriptionMusic:
+    'Finds what Sonarr, Radarr and Lidarr can’t, and imports only what you approve.',
   scan: 'Scan now',
   scanning: 'Scanning…',
   startSearch: 'Start search…',
@@ -54,6 +59,7 @@ const messages = defineMessages('components.Backfill.Dashboard', {
   stuckHint: 'searched for, never grabbed',
   missing: 'Missing',
   missingHint: 'episodes and movies',
+  missingHintMusic: 'episodes, movies and tracks',
   awaiting: 'Awaiting approval',
   awaitingHint: 'packs found that would help',
   filled: 'Filled this week',
@@ -79,13 +85,12 @@ const messages = defineMessages('components.Backfill.Dashboard', {
   neverSearched: '{app} has not searched',
   searchNow: 'Search now',
   searching: 'Searching…',
-  emptyActive:
-    'Nothing is stuck. The scan runs every few hours; Scan now runs it straight away.',
+  emptyActive: 'Nothing is stuck. Scans run every few hours, or use Scan now.',
   emptyOther: 'Nothing here.',
   searchTitles: 'Search titles',
   clearSearch: 'Clear the search',
   noMatch:
-    'Nothing on this tab matches “{query}”. The counts on the tabs show where it is.',
+    'Nothing on this tab matches “{query}”. Tab counts show where it is.',
   left: '{size} left · {speed}/s',
   eta: '{time} left',
   searchFailed: 'The search could not be started.',
@@ -115,8 +120,8 @@ const Stat = ({
       <div className="text-sm font-medium text-gray-400">{label}</div>
       <div className={`rounded-lg p-2 ${tone}`}>{icon}</div>
     </div>
-    <div className="mt-2 text-3xl font-bold text-white">{value}</div>
-    <div className="mt-auto truncate pt-1 text-sm text-gray-500">{hint}</div>
+    <div className="mt-2 text-3xl font-bold text-strong">{value}</div>
+    <div className="mt-auto break-words pt-1 text-sm text-gray-500">{hint}</div>
   </div>
 );
 
@@ -124,8 +129,7 @@ const BackfillDashboard = () => {
   const intl = useIntl();
   const line = useCandidateLine();
   const router = useRouter();
-  // The tab and the search live in the address too, so coming back from a
-  // title finds the list as it was left.
+  // Tab and search live in the URL so coming back from a title restores them.
   const [filter, setFilter] = useState<Filter>(() =>
     FILTERS.includes(router.query.tab as Filter)
       ? (router.query.tab as Filter)
@@ -144,10 +148,9 @@ const BackfillDashboard = () => {
       search ? `&q=${encodeURIComponent(search)}` : ''
     }`,
     {
-      // Switching tabs keeps the page in place: emptied while the next tab
-      // loads, it would shrink and jump to the top.
+      // Keep old data while switching tabs so the page doesn't shrink and jump.
       keepPreviousData: true,
-      // Live while anything downloads; the server reads the client each time.
+      // Poll fast while downloading; the server reads the client on each call.
       refreshInterval: (latest) =>
         latest?.jobs.some((j) => j.status === 'downloading')
           ? 2000
@@ -159,6 +162,9 @@ const BackfillDashboard = () => {
             : 30000,
     }
   );
+
+  // Notifications link to #awaiting.
+  useScrollToHash(!!data);
 
   useEffect(() => {
     if (!router.isReady) return;
@@ -239,11 +245,16 @@ const BackfillDashboard = () => {
     <>
       <PageTitle title={intl.formatMessage(messages.backfill)} />
       <div className="mb-2 flex flex-col justify-between gap-4 lg:flex-row lg:items-end">
-        <Header subtext={intl.formatMessage(messages.description)}>
+        <Header
+          subtext={intl.formatMessage(
+            data?.readiness.music
+              ? messages.descriptionMusic
+              : messages.description
+          )}
+        >
           {intl.formatMessage(messages.backfill)}
         </Header>
-        {/* One even row at any width: three equal buttons on a phone,
-            their names wrapping inside rather than the row wrapping. */}
+        {/* Three equal buttons on phones; labels wrap, the row doesn't. */}
         <div className="grid grid-cols-3 gap-2 lg:flex lg:flex-none">
           <Button
             buttonType="default"
@@ -289,7 +300,7 @@ const BackfillDashboard = () => {
             <Alert type="warning" title={data.readiness.problem}>
               <Link
                 href="/settings/backfill"
-                className="font-semibold text-yellow-100 underline"
+                className="font-semibold text-yellow-100 underline light:text-warning-text"
               >
                 {intl.formatMessage(messages.setUp)}
               </Link>
@@ -311,21 +322,25 @@ const BackfillDashboard = () => {
               value={intl.formatNumber(data.stats.stuck)}
               hint={intl.formatMessage(messages.stuckHint)}
               icon={<RectangleStackIcon className="h-5 w-5" />}
-              tone="bg-yellow-500/15 text-yellow-400"
+              tone="bg-yellow-500/15 text-yellow-400 light:text-warning-text"
             />
             <Stat
               label={intl.formatMessage(messages.missing)}
               value={intl.formatNumber(data.stats.missing)}
-              hint={intl.formatMessage(messages.missingHint)}
+              hint={intl.formatMessage(
+                data.readiness.music
+                  ? messages.missingHintMusic
+                  : messages.missingHint
+              )}
               icon={<TvIcon className="h-5 w-5" />}
-              tone="bg-red-500/15 text-red-400"
+              tone="bg-red-500/15 text-red-400 light:text-danger-text"
             />
             <Stat
               label={intl.formatMessage(messages.awaiting)}
               value={intl.formatNumber(data.stats.awaiting)}
               hint={intl.formatMessage(messages.awaitingHint)}
               icon={<ClockIcon className="h-5 w-5" />}
-              tone="bg-indigo-500/15 text-indigo-300"
+              tone="bg-indigo-500/15 text-indigo-300 light:text-accent-text"
             />
             <Stat
               label={intl.formatMessage(messages.filled)}
@@ -335,13 +350,13 @@ const BackfillDashboard = () => {
                 intl.formatMessage(messages.filledHint)
               }
               icon={<CheckCircleIcon className="h-5 w-5" />}
-              tone="bg-green-500/15 text-green-400"
+              tone="bg-green-500/15 text-success-text"
             />
           </div>
 
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             <section className="rounded-lg bg-gray-800 ring-1 ring-gray-700">
-              <h3 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-white">
+              <h3 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-strong">
                 {intl.formatMessage(messages.activeJobs)}
               </h3>
               <div className={`space-y-2 p-4 ${SCROLL_LIST}`}>
@@ -362,7 +377,7 @@ const BackfillDashboard = () => {
                     />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-start justify-between gap-2">
-                        <div className="truncate font-semibold text-white">
+                        <div className="min-w-0 break-words font-semibold text-strong">
                           {job.series?.title}
                         </div>
                         <JobStatusBadge
@@ -371,12 +386,12 @@ const BackfillDashboard = () => {
                           kind={job.series?.kind}
                         />
                       </div>
-                      <div className="mt-0.5 truncate text-xs text-gray-400">
+                      <div className="mt-0.5 text-xs text-gray-400 [overflow-wrap:anywhere]">
                         {job.title}
                       </div>
                       {job.stage && (
-                        <div className="truncate text-xs text-gray-500">
-                          {job.stage}
+                        <div className="break-words text-xs text-gray-500">
+                          {jobStage(intl, job)}
                         </div>
                       )}
                       <div className="mt-2 flex justify-between text-xs text-gray-300">
@@ -403,8 +418,11 @@ const BackfillDashboard = () => {
               </div>
             </section>
 
-            <section className="rounded-lg bg-gray-800 ring-1 ring-gray-700">
-              <h3 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-white">
+            <section
+              id="awaiting"
+              className="scroll-mt-[calc(5rem+env(safe-area-inset-top))] rounded-lg bg-gray-800 ring-1 ring-gray-700"
+            >
+              <h3 className="border-b border-gray-700 px-5 py-4 text-lg font-semibold text-strong">
                 {intl.formatMessage(messages.awaitingApproval)}
               </h3>
               <ul className={`space-y-4 p-5 ${SCROLL_LIST}`}>
@@ -420,10 +438,10 @@ const BackfillDashboard = () => {
                       title={c.series?.title ?? c.title}
                     />
                     <div className="min-w-0 flex-1">
-                      <div className="truncate font-semibold text-white">
+                      <div className="break-words font-semibold text-strong">
                         {c.series?.title}
                       </div>
-                      <div className="truncate text-xs text-gray-400">
+                      <div className="break-words text-xs text-gray-400">
                         {[c.summary?.quality, line(c, c.series?.kind)]
                           .filter(Boolean)
                           .join(' · ')}
@@ -449,6 +467,8 @@ const BackfillDashboard = () => {
 
           <AgentPanel />
 
+          <DownloadCheckPanel />
+
           <section className="rounded-lg bg-gray-800 ring-1 ring-gray-700">
             <div className="border-b border-gray-700 p-3">
               <div className="relative">
@@ -464,13 +484,13 @@ const BackfillDashboard = () => {
                   aria-label={intl.formatMessage(messages.searchTitles)}
                   autoComplete="off"
                   maxLength={100}
-                  className="block w-full rounded-md border border-gray-600 bg-gray-900/60 py-2 pl-10 pr-10 text-sm text-white placeholder-gray-400 hover:border-gray-500 focus:border-indigo-500 focus:outline-none focus:ring-0"
+                  className="block w-full rounded-md border border-gray-600 bg-gray-900/60 py-2 pl-10 pr-10 text-sm text-strong placeholder-gray-400 hover:border-gray-500 focus:border-indigo-500 focus:outline-none focus:ring-0"
                 />
                 {query && (
                   <button
                     type="button"
                     onClick={() => setQuery('')}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-gray-400 hover:text-white"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-gray-400 hover:text-strong"
                     aria-label={intl.formatMessage(messages.clearSearch)}
                   >
                     <XMarkIcon className="h-5 w-5" />
@@ -478,8 +498,7 @@ const BackfillDashboard = () => {
                 )}
               </div>
             </div>
-            {/* One even row at any width: the count goes under the name on
-                a phone, beside it on wider screens. */}
+            {/* One row at any width; counts sit under the name on phones. */}
             <div
               className="grid grid-cols-4 border-b border-gray-700"
               role="tablist"
@@ -493,11 +512,13 @@ const BackfillDashboard = () => {
                   onClick={() => setFilter(tab.id)}
                   className={`-mb-px flex min-w-0 flex-col items-center justify-center gap-1 border-b-2 px-1 py-3 text-xs font-medium sm:flex-row sm:gap-2 sm:text-sm ${
                     filter === tab.id
-                      ? 'border-indigo-500 text-white'
+                      ? 'border-indigo-500 text-strong'
                       : 'border-transparent text-gray-400 hover:text-gray-200'
                   }`}
                 >
-                  <span className="whitespace-nowrap">{tab.label}</span>
+                  <span className="whitespace-normal text-center">
+                    {tab.label}
+                  </span>
                   {tab.count !== undefined && (
                     <span className="rounded-full bg-gray-700 px-2 py-0.5 text-xs tabular-nums text-gray-200">
                       {tab.count}
@@ -536,11 +557,11 @@ const BackfillDashboard = () => {
                       <div className="min-w-0">
                         <Link
                           href={`/backfill/series/${row.id}`}
-                          className="block truncate font-semibold text-white hover:underline"
+                          className="block break-words font-semibold text-strong hover:underline"
                         >
                           {row.title}
                         </Link>
-                        <div className="truncate text-xs text-gray-500">
+                        <div className="break-words text-xs text-gray-500">
                           {row.lastArrSearchAt
                             ? intl.formatMessage(messages.lastSearch, {
                                 app: appName(row.kind),
@@ -564,7 +585,7 @@ const BackfillDashboard = () => {
                     </div>
                     <div className="flex flex-wrap items-center gap-2 sm:w-[46%] sm:flex-nowrap">
                       <TypeBadge kind={row.kind} seriesType={row.seriesType} />
-                      <span className="whitespace-nowrap text-sm text-gray-300">
+                      <span className="text-sm text-gray-300">
                         {row.kind === 'movie'
                           ? intl.formatMessage(
                               row.missing

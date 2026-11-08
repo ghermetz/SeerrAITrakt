@@ -15,14 +15,10 @@ const messages = defineMessages('components.RequestModal.EpisodePicker', {
 interface EpisodePickerProps {
   tvId: number;
   seasonNumber: number;
-  /** Whether the season toggle is currently on. */
   seasonSelected: boolean;
-  /**
-   * Partial selection for this season. Undefined while the season is toggled
-   * on means the whole season; undefined while it is off means nothing.
-   */
+  /** Partial selection; undefined means all if the season is on, else none. */
   selected?: number[];
-  /** Reports the full set now wanted, plus the season's episode count. */
+  /** Receives the full wanted set and the season's episode count. */
   onChange: (episodeNumbers: number[], totalEpisodes: number) => void;
 }
 
@@ -56,9 +52,7 @@ const EpisodePicker = ({
 
   const allNumbers = data.episodes.map((episode) => episode.episodeNumber);
 
-  // What the user currently has checked, as an explicit list. A season that
-  // is toggled on with no partial list is every episode; one that is off is
-  // none of them. Nothing is checked by default.
+  // On with no partial list is every episode; off is none.
   const checked: number[] = seasonSelected
     ? selected && selected.length > 0
       ? selected
@@ -77,7 +71,7 @@ const EpisodePicker = ({
     <div className="space-y-1 px-4 py-3">
       <div className="mb-2 flex space-x-3 text-xs">
         <button
-          className="text-indigo-400 hover:text-indigo-300"
+          className="text-indigo-400 hover:text-indigo-300 light:text-accent-text light:hover:text-accent-text"
           onClick={() => onChange(allNumbers, allNumbers.length)}
           type="button"
         >
@@ -102,7 +96,7 @@ const EpisodePicker = ({
             onChange={() => toggle(episode.episodeNumber)}
             type="checkbox"
           />
-          <span className="flex-1 truncate">
+          <span className="min-w-0 flex-1 break-words">
             {episode.episodeNumber}. {episode.name}
           </span>
           {episode.available && (

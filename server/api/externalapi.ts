@@ -6,24 +6,43 @@ import type { AxiosInstance, AxiosRequestConfig } from 'axios';
 import axios from 'axios';
 import rateLimit from 'axios-rate-limit';
 
-// 5 minute default TTL (in seconds)
+// Seconds.
 const DEFAULT_TTL = 300;
 
-// 10 seconds default rolling buffer (in ms)
+// Milliseconds.
 const DEFAULT_ROLLING_BUFFER = 10000;
 
 /**
- * How long a client of a public service, or of the media server, waits for
- * an answer when it is not told otherwise. Without one, a request that never
- * gets an answer holds up whatever asked (a scan, a watchlist sync) for good.
+ * Default request timeout. Without one, a request that never answers stalls
+ * its caller (a scan, a watchlist sync) forever.
  */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
-/*
- * Cached answers being refreshed in the background, by cache key: one
- * refresh at a time each, however many people ask meanwhile.
- */
+/** Cache keys refreshing in the background; one refresh per key at a time. */
 const refreshing = new Set<string>();
+
+type Limiter = ReturnType<typeof rateLimit.getLimiter>;
+
+/**
+ * One rate limit per service, shared by every client of it: routes make a
+ * client per request, and the limit is the service's for this server.
+ */
+const limiters = new Map<string, Limiter>();
+
+const limiterFor = (
+  baseUrl: string,
+  { maxRequests, maxRPS }: { maxRequests: number; maxRPS: number }
+): Limiter => {
+  let limiter = limiters.get(baseUrl);
+  if (!limiter) {
+    limiter = rateLimit.getLimiter({ maxRequests, maxRPS });
+    limiters.set(baseUrl, limiter);
+  }
+  return limiter;
+};
+
+/** Answers being fetched, per cache and key: one request for many callers. */
+const inFlight = new WeakMap<CacheStore, Map<string, Promise<unknown>>>();
 
 export interface ExternalAPIOptions {
   nodeCache?: CacheStore;
@@ -60,8 +79,7 @@ class ExternalAPI {
 
     if (options.rateLimit) {
       this.axios = rateLimit(this.axios, {
-        maxRequests: options.rateLimit.maxRequests,
-        maxRPS: options.rateLimit.maxRPS,
+        rateLimiter: limiterFor(baseUrl, options.rateLimit),
       });
     }
 
@@ -69,12 +87,17 @@ class ExternalAPI {
     this.cache = options.nodeCache;
   }
 
-  // transform runs before the cache write.
+  // transform runs before the cache write; data `keep` rejects is returned
+  // but not cached, so the next call fetches again.
   protected async get<T>(
     endpoint: string,
     config?: AxiosRequestConfig,
     ttl?: number,
-    options?: { cache?: CacheStore; transform?: (data: T) => T }
+    options?: {
+      cache?: CacheStore;
+      transform?: (data: T) => T;
+      keep?: (data: T) => boolean;
+    }
   ): Promise<T> {
     const cache = options?.cache ?? this.cache;
     const cacheKey = this.serializeCacheKey(endpoint, {
@@ -86,22 +109,45 @@ class ExternalAPI {
       return cachedItem;
     }
 
-    const response = await this.axios.get<T>(endpoint, config);
-    const data = options?.transform
-      ? options.transform(response.data)
-      : response.data;
+    const load = async () => {
+      const response = await this.axios.get<T>(endpoint, config);
+      const data = options?.transform
+        ? options.transform(response.data)
+        : response.data;
 
-    if (cache && ttl !== 0) {
-      cache.set(cacheKey, data, ttl ?? DEFAULT_TTL);
+      if (cache && ttl !== 0 && (options?.keep?.(data) ?? true)) {
+        cache.set(cacheKey, data, ttl ?? DEFAULT_TTL);
+      }
+
+      return data;
+    };
+    if (!cache || ttl === 0) {
+      return load();
     }
 
-    return data;
+    // Callers asking while it is fetched share the answer, each with its own
+    // copy, as from the cache.
+    let pending = inFlight.get(cache);
+    if (!pending) {
+      pending = new Map();
+      inFlight.set(cache, pending);
+    }
+    const shared = pending.get(cacheKey) as Promise<T> | undefined;
+    if (shared) {
+      return structuredClone(await shared);
+    }
+    const fetching = load();
+    pending.set(cacheKey, fetching);
+    try {
+      return await fetching;
+    } finally {
+      pending.delete(cacheKey);
+    }
   }
 
   /**
-   * A POST is kept in the cache only when its caller gives how long: most
-   * change something or sign in, and an answer kept from before would hide
-   * that the service is down now.
+   * Cached only when the caller passes a ttl: most POSTs change something or
+   * sign in, and a stale answer would hide that the service is down.
    */
   protected async post<T>(
     endpoint: string,
@@ -143,7 +189,7 @@ class ExternalAPI {
     if (cachedItem) {
       const keyTtl = this.cache?.getTtl(cacheKey) ?? 0;
 
-      // If the item has passed our rolling check, fetch again in background
+      // Past the rolling buffer: refresh in the background.
       if (
         keyTtl - (ttl ?? DEFAULT_TTL) * 1000 <
           Date.now() - DEFAULT_ROLLING_BUFFER &&
@@ -156,8 +202,8 @@ class ExternalAPI {
             this.cache?.set(cacheKey, response.data, ttl ?? DEFAULT_TTL);
           })
           .catch((e) => {
-            // The kept answer stays until the next try. Only the message is
-            // logged: the request itself carries API keys and tokens.
+            // Keep the cached answer. Log only the message: the request
+            // carries API keys and tokens.
             logger.warn('Could not refresh a cached answer', {
               label: 'External API',
               endpoint,

@@ -4,7 +4,9 @@ import CachedImage from '@app/components/Common/CachedImage';
 import Modal from '@app/components/Common/Modal';
 import type { RequestOverrides } from '@app/components/RequestModal/AdvancedRequester';
 import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
-import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
+import QuotaDisplay, {
+  OverQuotaAlert,
+} from '@app/components/RequestModal/QuotaDisplay';
 import useToasts from '@app/hooks/useToasts';
 import { useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
@@ -67,6 +69,10 @@ const CollectionRequestModal = ({
 
   const currentlyRemaining =
     (quota?.movie.remaining ?? 0) - selectedParts.length;
+  // The limit stops picking, unless requests past it wait for an admin.
+  const limitBlocks = !!quota?.movie.limit && !quota?.overQuotaWaits;
+  const pastLimit =
+    !!quota?.movie.limit && !!quota.overQuotaWaits && currentlyRemaining < 0;
 
   const getAllParts = (): number[] => {
     return (data?.parts ?? [])
@@ -111,17 +117,13 @@ const CollectionRequestModal = ({
     selectedParts.includes(tmdbId);
 
   const togglePart = (tmdbId: number): void => {
-    // If this part already has a pending request, don't allow it to be toggled
+    // Already requested or available.
     if (getAllRequestedParts().includes(tmdbId)) {
       return;
     }
 
-    // If there are no more remaining requests available, block toggle
-    if (
-      quota?.movie.limit &&
-      currentlyRemaining <= 0 &&
-      !isSelectedPart(tmdbId)
-    ) {
+    // Quota used up.
+    if (limitBlocks && currentlyRemaining <= 0 && !isSelectedPart(tmdbId)) {
       return;
     }
 
@@ -137,19 +139,15 @@ const CollectionRequestModal = ({
   );
 
   const toggleAllParts = (): void => {
-    // If the user has a quota and not enough requests for all parts, block toggleAllParts
+    // Quota too small for every part.
     if (
-      quota?.movie.limit &&
+      limitBlocks &&
       (quota?.movie.remaining ?? 0) < unrequestedParts.length
     ) {
       return;
     }
 
-    if (
-      data &&
-      selectedParts.length >= 0 &&
-      selectedParts.length < unrequestedParts.length
-    ) {
+    if (data && selectedParts.length < unrequestedParts.length) {
       setSelectedParts(unrequestedParts);
     } else {
       setSelectedParts([]);
@@ -294,7 +292,7 @@ const CollectionRequestModal = ({
       okButtonType={'primary'}
       backdrop={`https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${data?.backdropPath}`}
     >
-      {hasAutoApprove && !quota?.movie.restricted && (
+      {hasAutoApprove && !quota?.movie.restricted && !pastLimit && (
         <div className="mt-6">
           <Alert
             title={intl.formatMessage(messages.requestadmin)}
@@ -302,11 +300,12 @@ const CollectionRequestModal = ({
           />
         </div>
       )}
+      {pastLimit && <OverQuotaAlert />}
       {(quota?.movie.limit ?? 0) > 0 && (
         <QuotaDisplay
           mediaType="movie"
           quota={quota?.movie}
-          remaining={currentlyRemaining}
+          remaining={Math.max(0, currentlyRemaining)}
           userOverride={
             requestOverrides?.user && requestOverrides.user.id !== user?.id
               ? requestOverrides?.user?.id
@@ -335,8 +334,9 @@ const CollectionRequestModal = ({
                           }
                         }}
                         className={`relative inline-flex h-5 w-10 flex-shrink-0 cursor-pointer items-center justify-center rounded-full pt-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
-                          quota?.movie.limit &&
-                          (quota.movie.remaining ?? 0) < unrequestedParts.length
+                          limitBlocks &&
+                          (quota?.movie.remaining ?? 0) <
+                            unrequestedParts.length
                             ? 'opacity-50'
                             : ''
                         }`}
@@ -413,7 +413,7 @@ const CollectionRequestModal = ({
                                   partMedia.status !==
                                     MediaStatus.BLOCKLISTED) ||
                                 partRequest ||
-                                (quota?.movie.limit &&
+                                (limitBlocks &&
                                   currentlyRemaining <= 0 &&
                                   !isSelectedPart(part.id))
                                   ? 'opacity-50'
@@ -457,7 +457,7 @@ const CollectionRequestModal = ({
                                 type="tmdb"
                                 src={
                                   part.posterPath
-                                    ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${part.posterPath}`
+                                    ? `https://image.tmdb.org/t/p/w300_and_h450_face${part.posterPath}`
                                     : '/images/seerr_poster_not_found.png'
                                 }
                                 alt=""
@@ -467,8 +467,8 @@ const CollectionRequestModal = ({
                                   height: 'auto',
                                   objectFit: 'cover',
                                 }}
-                                width={600}
-                                height={900}
+                                width={300}
+                                height={450}
                               />
                             </div>
                             <div className="flex flex-col justify-center pl-2">

@@ -1,8 +1,33 @@
+import type { PersonalApiKeyAccess } from '@server/constants/apiKeys';
 import type { AiFeature } from '@server/constants/features';
 import { DEFAULT_IMAGE_CACHE_MAX_MB } from '@server/constants/images';
-import { MediaServerType } from '@server/constants/server';
+import type { OidcClaimRule } from '@server/constants/oidc';
+import { oidcApplicationUrl, requiredClaimsFrom } from '@server/constants/oidc';
+import type { ProfileFolder } from '@server/constants/requestDefaults';
+import type { MediaServerKind } from '@server/constants/server';
+import {
+  MEDIA_SERVER_KINDS,
+  MediaServerType,
+  kindOfType,
+} from '@server/constants/server';
+import type { ThemeDefaults } from '@server/constants/theme';
+import {
+  SERVER_THEME_DEFAULTS,
+  cleanThemeDefaults,
+} from '@server/constants/theme';
+import { cssVersion } from '@server/lib/customCss';
 import { Permission } from '@server/lib/permissions';
-import { runMigrations } from '@server/lib/settings/migrator';
+import type { QualitySettings } from '@server/lib/quality/types';
+import {
+  ADJUSTMENT_DEFAULTS,
+  QUALITY_DEFAULTS,
+} from '@server/lib/quality/types';
+import type { SeasonCalendar, SeasonsSettings } from '@server/lib/seasons';
+import { seasonCalendar, seasonSettings } from '@server/lib/seasons';
+import {
+  runMigrations,
+  writeSettingsFile,
+} from '@server/lib/settings/migrator';
 import type { AvailableLocale } from '@server/types/languages';
 import { randomBytes, randomUUID } from 'crypto';
 import fs from 'fs/promises';
@@ -10,7 +35,7 @@ import { mergeWith } from 'lodash';
 import path from 'path';
 import webpush from 'web-push';
 
-// Prevents stale array entries when incoming data has fewer elements
+// Replace arrays wholesale so shorter incoming arrays leave no stale entries.
 const mergeSettings = <T>(current: T, incoming: Partial<T>): T =>
   mergeWith({}, current, incoming, (_objValue, srcValue) =>
     Array.isArray(srcValue) ? srcValue : undefined
@@ -22,6 +47,14 @@ export interface Library {
   enabled: boolean;
   type: 'show' | 'movie';
   lastScan?: number;
+}
+
+/**
+ * A music library ('artist' on Plex, 'music' on Jellyfin/Emby). A separate
+ * type so film/series code can't be handed one.
+ */
+export interface MusicLibrary extends Omit<Library, 'type'> {
+  type: 'artist' | 'music';
 }
 
 export interface Region {
@@ -43,9 +76,16 @@ export interface PlexSettings {
   port: number;
   useSsl?: boolean;
   libraries: Library[];
+  /** Kept apart from `libraries` so film/series scans and history skip them. */
+  musicLibraries: MusicLibrary[];
   webAppUrl?: string;
+  /** Seerr is connected to this server (see lib/mediaServers). */
+  connected?: boolean;
+  /** People may sign in with their account on this server. */
+  signIn?: boolean;
 }
 
+/** A Jellyfin or an Emby server: both are set up the same way. */
 export interface JellyfinSettings {
   name: string;
   ip: string;
@@ -55,20 +95,67 @@ export interface JellyfinSettings {
   externalHostname?: string;
   jellyfinForgotPasswordUrl?: string;
   libraries: Library[];
+  /** Kept apart from `libraries`, as on Plex. */
+  musicLibraries: MusicLibrary[];
   serverId: string;
   apiKey: string;
+  /** Seerr is connected to this server (see lib/mediaServers). */
+  connected?: boolean;
+  /** People may sign in with their account on this server. */
+  signIn?: boolean;
+  /** Account Seerr reads libraries as; defaults to user 1's linked account. */
+  adminUserId?: string;
 }
+
+/** Default music settings. */
+export const musicDefaults = (): MusicSettings => ({
+  musicbrainzUrl: MUSICBRAINZ_URL,
+  contactEmail: '',
+  listenBrainz: true,
+  deezer: true,
+  theAudioDbApiKey: '',
+  maxAlbumsPerRequest: 100,
+  songRequests: true,
+  songsFromAlbums: true,
+  songQuota: { quotaLimit: 0, quotaDays: 7 },
+  playlists: { overLimit: 'wait', approveOver: 25 },
+  soulseek: { url: '', apiKey: '', downloadsPath: '' },
+  search: {},
+});
+
+/** An unconfigured Jellyfin or Emby server. */
+export const jellyfinDefaults = (): JellyfinSettings => ({
+  name: '',
+  ip: '',
+  port: 8096,
+  useSsl: false,
+  urlBase: '',
+  externalHostname: '',
+  jellyfinForgotPasswordUrl: '',
+  libraries: [],
+  musicLibraries: [],
+  serverId: '',
+  apiKey: '',
+  connected: false,
+  signIn: true,
+});
+
 /**
- * One Maintainerr server. Seerr reads what it will delete, to warn people,
- * and lets them keep a title by postponing it. Each server carries its own
- * feature switches, so they can differ between servers.
+ * Connected media servers, primary (main.mediaServerType) first; the primary
+ * always counts as connected. Helpers live in lib/mediaServers.
  */
-/**
- * A download client Seerr reads directly, for progress by the second rather
- * than at Radarr's and Sonarr's once-a-minute pace. Radarr and Sonarr still
- * send the downloads; Seerr only reads them, matched by the download id
- * Radarr and Sonarr record.
- */
+export const connectedKindsOf = (
+  settings: Pick<AllSettings, 'main' | 'plex' | 'jellyfin' | 'emby'>
+): MediaServerKind[] => {
+  const primary = kindOfType(settings.main.mediaServerType);
+  return [
+    ...(primary ? [primary] : []),
+    ...MEDIA_SERVER_KINDS.filter(
+      (kind) => kind !== primary && !!settings[kind]?.connected
+    ),
+  ];
+};
+
 /** Usenet clients, then torrent clients. */
 export const DOWNLOAD_CLIENT_TYPES = [
   'sabnzbd',
@@ -80,6 +167,10 @@ export const DOWNLOAD_CLIENT_TYPES = [
 ] as const;
 export type DownloadClientType = (typeof DOWNLOAD_CLIENT_TYPES)[number];
 
+/**
+ * A download client read directly for per-second progress (Radarr/Sonarr
+ * poll once a minute). Read-only; matched by the download id the *arr records.
+ */
 export interface DownloadClientSettings {
   id: number;
   name: string;
@@ -91,21 +182,20 @@ export interface DownloadClientSettings {
   /** SABnzbd's API key. */
   apiKey: string;
   /**
-   * The client's sign-in, empty when it lets this address in: qBittorrent's
-   * Web UI, Transmission's RPC, NZBGet's and rTorrent's basic auth. Deluge
-   * signs in with its Web UI password alone.
+   * Login (qBittorrent Web UI, Transmission RPC, NZBGet/rTorrent basic auth);
+   * empty when the client allows this address. Deluge uses only a password.
    */
   username: string;
   password: string;
 }
 
 /**
- * Backfill: finds packs for series Sonarr, and movies Radarr, have searched
- * for and not found, by searching Prowlarr directly and judging each pack by
- * the files inside, and imports them through Sonarr or Radarr once an admin
- * approves. Downloads go to the download clients set up above, under their
- * own category.
+ * Backfill: searches Prowlarr for titles the *arrs couldn't find, judges
+ * packs by their files, and imports through Sonarr/Radarr once an admin
+ * approves. Downloads use the clients above, under their own category.
  */
+export type DownloadCheckMode = 'off' | 'report' | 'on';
+
 export interface BackfillSettings {
   enabled: boolean;
   prowlarr: {
@@ -119,73 +209,103 @@ export interface BackfillSettings {
   torrentClientId: number | null;
   usenetClientId: number | null;
   category: string;
-  /** Movies Radarr cannot find are followed too, not only series. */
+  /** Also handle movies Radarr can't find. */
   includeMovies: boolean;
-  /** Hours since Sonarr's or Radarr's last search before a title is stuck. */
+  /** Also handle albums Lidarr can't find. */
+  includeMusic: boolean;
+  /** Hours after the *arr's last search before a title counts as stuck. */
   stuckAfterHours: number;
-  /** Treat episodes below the profile's cutoff as gaps too. */
+  /**
+   * Hours a new episode is left to Sonarr after it airs before Backfill may
+   * fetch it, even for a show just requested. 0 doesn't wait.
+   */
+  newReleaseWaitHours: number;
+  /**
+   * Search new requests as soon as the *arr finds nothing, not after Stuck
+   * After.
+   */
+  searchAfterArr: boolean;
+  /** Treat episodes below the profile cutoff as gaps. */
   includeCutoffUnmet: boolean;
   includeSpecials: boolean;
-  /** Titles searched per scan, so indexers aren't hit all at once. */
+  /** Titles searched per scan, to spare indexers. */
   searchesPerScan: number;
-  /** Days before a title with nothing found is searched again. */
+  /** Days before re-searching a title with no results. */
   researchAfterDays: number;
   autoApprove: {
     enabled: boolean;
     minScore: number;
     maxSizeGb: number;
   };
+  /** Concurrent series downloads per client. */
   maxActiveJobs: number;
+  /** Concurrent movie downloads per client. */
+  maxMovieJobs: number;
+  /** Concurrent music downloads per client. */
+  maxMusicJobs: number;
   /** New downloads wait while the title's disk has less free than this. */
   minFreeSpaceGb: number;
-  /**
-   * A torrent that gains nothing for this long is given up on and the next
-   * pack offered. 0 waits forever.
-   */
+  /** Give up on a torrent stalled this long; offer the next pack. 0 never. */
   stallHours: number;
   /**
-   * A download that fails or stalls is replaced on its own by the next
-   * good pack for the same episodes (auto-approve's score and size), until
-   * none is left.
+   * Abandon a torrent whose pace (two consecutive 2-hour windows) projects a
+   * finish beyond this, and offer the next pack. 0 never.
+   */
+  slowHours: number;
+  /**
+   * Replace a failed or stalled download with the next good pack for the same
+   * episodes (auto-approve's score and size) until none remain.
    */
   replaceFailed: boolean;
   /**
-   * Days finished downloads, and the packs they and searches left, are
-   * kept before the nightly database maintenance removes them. 0 keeps
-   * them for good.
+   * Days nightly maintenance keeps finished downloads and leftover packs. 0
+   * forever.
    */
   historyDays: number;
   /**
-   * Release groups an admin blocked: Backfill and the agent pass over them,
-   * and Radarr and Sonarr are given a custom format that rejects them (see
-   * lib/blockedGroups.ts). Changed only through their own route, never by
-   * saving the rest of these settings.
+   * Blocked release groups: skipped by Backfill and the agent, rejected in
+   * Radarr/Sonarr via a custom format (lib/blockedGroups.ts). Changed only
+   * through their own route, never by saving these settings.
    */
   blockedGroups: string[];
   /**
-   * The admin agent: an AI that looks further when Backfill finds nothing
-   * for a requested title, and that admins can ask to find something.
+   * Download Check (lib/downloadCheck): inspects Radarr/Sonarr grabs before
+   * download and on stuck imports. Independent of Backfill; own route only.
    */
+  downloadCheck: {
+    /** report: log what it would do; on: do it. */
+    mode: DownloadCheckMode;
+  };
+  /** Admin agent: AI that digs further when Backfill finds nothing, or on ask. */
   agent: {
-    /** Started on its own for requested titles Backfill found nothing for. */
+    /** Auto-start for requested titles Backfill found nothing for. */
     autoRun: boolean;
-    /** Runs it starts on its own in a day. */
+    /** Max auto-started runs per day. */
     maxAutoRunsPerDay: number;
-    /** Downloads it may start in a day, asked or not. */
+    /** Max downloads per day, auto or asked. */
     maxGrabsPerDay: number;
-    /** Tool calls in one run before it has to stop. */
+    /** Max tool calls per run. */
     maxSteps: number;
     /**
-     * Times it carries on by itself after a go's steps run out, while it
-     * is still getting somewhere; then it stops and waits for a reply.
+     * Auto-continuations after a turn's step budget, while progressing, before
+     * waiting for a reply.
      */
     autoContinue: number;
-    /** The largest download it may start, in GB. */
+    /** Max download size, GB. */
     maxSizeGb: number;
-    /** What an admin wants it always to do, in their words. */
+    /** Standing admin instructions. */
     instructions: string;
-    /** Days a finished conversation is kept; 0 keeps them for good. */
+    /** Days to keep finished conversations; 0 forever. */
     keepDays: number;
+  };
+  /**
+   * A title on a quality preset with no grab in `days` moves to the next
+   * looser preset, and back once something is grabbed (lib/quality/stepDown).
+   * Off by default.
+   */
+  stepDown: {
+    enabled: boolean;
+    days: number;
   };
 }
 
@@ -202,18 +322,25 @@ export const BACKFILL_DEFAULTS: BackfillSettings = {
   usenetClientId: null,
   category: 'backfill',
   includeMovies: true,
+  includeMusic: true,
   stuckAfterHours: 24,
+  newReleaseWaitHours: 12,
+  searchAfterArr: false,
   includeCutoffUnmet: false,
   includeSpecials: false,
   searchesPerScan: 5,
   researchAfterDays: 7,
   autoApprove: { enabled: false, minScore: 700, maxSizeGb: 25 },
   maxActiveJobs: 2,
+  maxMovieJobs: 2,
+  maxMusicJobs: 2,
   minFreeSpaceGb: 200,
   stallHours: 12,
+  slowHours: 72,
   replaceFailed: true,
   historyDays: 90,
   blockedGroups: [],
+  downloadCheck: { mode: 'off' },
   agent: {
     autoRun: true,
     maxAutoRunsPerDay: 12,
@@ -224,15 +351,14 @@ export const BACKFILL_DEFAULTS: BackfillSettings = {
     instructions: '',
     keepDays: 30,
   },
+  stepDown: { enabled: false, days: 30 },
 };
 
 /**
- * Bazarr, which Seerr reads for the subtitles on disk and asks to search,
- * download, delete or transcribe them. One instance: Bazarr itself follows
- * one Radarr and one Sonarr.
+ * Bazarr, for on-disk subtitles and subtitle search/download/delete/transcribe.
+ * One instance: Bazarr itself follows one Radarr and one Sonarr.
  */
 export interface BazarrSettings {
-  /** Blank until Bazarr is set up. */
   hostname: string;
   port: number;
   useSsl: boolean;
@@ -240,6 +366,40 @@ export interface BazarrSettings {
   apiKey: string;
 }
 
+/**
+ * An OpenID Connect sign-in provider (Authentik, Authelia, Keycloak, Pocket ID,
+ * Google…).
+ */
+export interface OidcProviderSettings {
+  /** Derived from the name on creation and never changed: links refer to it. */
+  id: string;
+  /** Button text: "Sign in with {name}". */
+  name: string;
+  issuerUrl: string;
+  clientId: string;
+  /** Never sent back to a browser. */
+  clientSecret: string;
+  /** Button image; blank for none. */
+  logoUrl: string;
+  scopes: string;
+  enabled: boolean;
+  /** Create an account on first sign-in. Off by default. */
+  newUserSignUp: boolean;
+  /**
+   * All rules must match the provider's claims. Empty allows anyone with an
+   * account there.
+   */
+  requiredClaims: OidcClaimRule[];
+}
+
+export interface OidcSettings {
+  providers: OidcProviderSettings[];
+}
+
+/**
+ * A Maintainerr server: Seerr reads pending deletions to warn users and can
+ * postpone one. Feature switches are per server.
+ */
 export interface MaintainerrSettings {
   id: number;
   name: string;
@@ -247,17 +407,17 @@ export interface MaintainerrSettings {
   port: number;
   useSsl: boolean;
   urlBase: string;
-  /** Maintainerr itself does not ask for one; for a proxy in front that does. */
+  /** For a proxy in front; Maintainerr itself needs none. */
   apiKey: string;
-  /** A "Deleting soon" badge on posters and title pages. */
+  /** "Deleting soon" badge on posters and title pages. */
   showBadges: boolean;
-  /** Include its titles in the home page's "Deleting Soon" row. */
+  /** Include its titles in the home "Deleting Soon" row. */
   showDeletingSoon: boolean;
-  /** A Keep button, for anyone signed in, that postpones the deletion. */
+  /** Keep button for any signed-in user, postponing deletion. */
   allowKeep: boolean;
   /** Days a Keep adds. 0 restarts the rule's whole grace period. */
   keepDays: number;
-  /** How close a deletion has to be to count as "soon". */
+  /** Days ahead a deletion counts as "soon". */
   soonDays: number;
 }
 
@@ -271,8 +431,8 @@ export interface TautulliSettings {
 }
 
 /**
- * Trakt, for public lists and watchlists. Only the Client ID of the admin's
- * own Trakt app: Seerr AI reads public data and nobody signs in to Trakt.
+ * Trakt public lists and watchlists, via the admin's app Client ID only; no
+ * Trakt sign-in.
  */
 export interface TraktSettings {
   clientId?: string;
@@ -301,15 +461,145 @@ export interface DVRSettings {
 
 export interface RadarrSettings extends DVRSettings {
   minimumAvailability: string;
-  /** Where anime movies go, when set: see lib/radarrRouting. */
+  /** Root folders some quality profiles always go to, unless a request manager picks another. */
+  profileFolders?: ProfileFolder[];
+  /** Anime movie destination, when set (lib/radarrRouting). */
   activeAnimeProfileId?: number;
   activeAnimeProfileName?: string;
   activeAnimeDirectory?: string;
   animeTags?: number[];
 }
 
+/**
+ * A Lidarr server. is4k is always false. The metadata profile picks which
+ * release kinds (albums, EPs, live) Lidarr lists for an added artist.
+ */
+export interface LidarrSettings extends DVRSettings {
+  activeMetadataProfileId: number;
+  activeMetadataProfileName: string;
+}
+
+/**
+ * Settings → Appearance. The default applies to the sign-in page and users
+ * without their own look.
+ */
+export interface AppearanceSettings {
+  default: ThemeDefaults;
+  /**
+   * Seasonal themes and dates. Unset until saved; Halloween, Holidays and New
+   * Year run by default.
+   */
+  seasons?: SeasonsSettings;
+  /**
+   * Server CSS for all pages, sign-in included; may @import
+   * (server/constants/customCss.ts). '' for none.
+   */
+  serverCss?: string;
+  /** Whether users may add personal CSS. */
+  personalCss?: boolean;
+}
+
+/** Music metadata sources and request limits. */
+export interface MusicSettings {
+  /**
+   * MusicBrainz or a mirror. The public one allows 1 request/s; mirrors are
+   * unlimited.
+   */
+  musicbrainzUrl: string;
+  /**
+   * Appended to the MusicBrainz user agent so MusicBrainz can contact this
+   * server's admin rather than throttle every Seerr AI.
+   */
+  contactEmail: string;
+  /** ListenBrainz new and popular releases for Discover. */
+  listenBrainz: boolean;
+  /**
+   * Deezer, for playlist ISRCs (MusicBrainz matching) and albums MusicBrainz
+   * lacks. On unless disabled.
+   */
+  deezer?: boolean;
+  /** TheAudioDB key, for artist images Lidarr lacks. Never sent to clients. */
+  theAudioDbApiKey: string;
+  /** Max albums per request. */
+  maxAlbumsPerRequest: number;
+  /** Allow single-song requests. */
+  songRequests: boolean;
+  /**
+   * Take a non-single song from its album: Backfill fetches the album, Lidarr
+   * imports only the song.
+   */
+  songsFromAlbums: boolean;
+  /**
+   * Per-user song limit per period. 0 counts each song against the music limit
+   * instead.
+   */
+  songQuota: { quotaLimit: number; quotaDays: number };
+  /** Song intake for linked playlists (Lists). */
+  playlists: PlaylistImportSettings;
+  /**
+   * Soulseek via slskd, for album-sourced songs missing from indexers
+   * (Settings → Services).
+   */
+  soulseek?: SoulseekSettings;
+  /** Settings → Music search options. */
+  search: MusicSearchSettings;
+}
+
+/** slskd connection; unused until all three are set. */
+export interface SoulseekSettings {
+  /** e.g. "http://192.168.1.5:5030"; blank for none. */
+  url: string;
+  /** API key with the ReadWrite role. Never sent to clients. */
+  apiKey: string;
+  /** slskd's finished-downloads folder, as Lidarr sees it. */
+  downloadsPath: string;
+}
+
+export const soulseekOf = (
+  music: Pick<MusicSettings, 'soulseek'>
+): SoulseekSettings | undefined =>
+  music.soulseek?.url && music.soulseek.apiKey && music.soulseek.downloadsPath
+    ? music.soulseek
+    : undefined;
+
+/**
+ * Playlist songs over the user's limit: `wait` for the limit to free up, or
+ * past `approveOver` at once, `approve` (admin approval, not counted
+ * against the limit).
+ */
+export interface PlaylistImportSettings {
+  overLimit: 'wait' | 'approve';
+  approveOver: number;
+}
+
+/**
+ * Music search options. The search page's Music tab and the Music page search
+ * always show while music is on for the user; music off (global or theirs)
+ * wins.
+ */
+export interface MusicSearchSettings {
+  /**
+   * Show artists/albums in All search. Unset follows musicInAllSearch; an
+   * explicit choice wins.
+   */
+  inAll?: boolean;
+}
+
+/**
+ * Whether All search includes music: the admin's choice, else whether a default
+ * Lidarr exists.
+ */
+export const musicInAllSearch = (
+  search: MusicSearchSettings,
+  lidarrReady: boolean
+): boolean => search.inAll ?? lidarrReady;
+
+export const MUSICBRAINZ_URL = 'https://musicbrainz.org';
+
 export interface SonarrSettings extends DVRSettings {
   seriesType: 'standard' | 'daily' | 'anime';
+  /** Root folders some quality profiles always go to, unless a request manager picks another. */
+  profileFolders?: ProfileFolder[];
   animeSeriesType: 'standard' | 'daily' | 'anime';
   activeAnimeProfileId?: number;
   activeAnimeProfileName?: string;
@@ -337,53 +627,46 @@ export interface MetadataSettings {
 }
 
 /**
- * The model behind the AI features. `anthropic` is Claude's own API;
- * `openai` is anything that speaks OpenAI's chat format: OpenAI itself, or
- * another service or a local server (Ollama, LM Studio) at `baseUrl`.
+ * `anthropic` is Claude's API; `openai` is any OpenAI-compatible chat API
+ * (OpenAI, or a service/local server such as Ollama or LM Studio at `baseUrl`).
  */
 export type AiProvider = 'anthropic' | 'openai';
 
-/** Whether the AI features have a model they can use. */
+/** Whether AI features have a usable model. */
 export const aiReady = (ai?: AiSettings): boolean =>
   !!ai?.enabled &&
   !!ai.model.trim() &&
-  // OpenAI itself needs a key; a local server may not.
+  // OpenAI needs a key; a local server may not.
   (ai.provider === 'anthropic' || !ai.baseUrl.trim() ? !!ai.apiKey : true);
 
 export interface AiSettings {
   enabled: boolean;
   provider: AiProvider;
-  /** Never sent back to the browser once saved. */
+  /** Never sent to the browser once saved. */
   apiKey: string;
-  /** OpenAI-compatible only; empty means OpenAI itself. */
+  /** OpenAI-compatible only; empty means OpenAI. */
   baseUrl: string;
-  /** Used by every feature without a model of its own below. */
+  /** Default for features without an override below. */
   model: string;
-  /** A cheaper or stronger model for one feature, by feature name. */
+  /** Per-feature model overrides. */
   featureModels: Partial<Record<AiFeature, string>>;
-  /** AI uses per person per day; 0 is no limit. Admins are not limited. */
+  /** Daily AI uses per user; 0 unlimited. Admins are exempt. */
   dailyLimit: number;
 }
 
-/**
- * What the AI account has left, as far as Seerr can tell: neither provider
- * lets a program read the balance itself.
- */
+/** Estimated AI account balance; neither provider exposes it via API. */
 export interface AiCreditSettings {
   /**
-   * An admin key for the provider's own spending report. Never sent back to
-   * a browser; only used with the provider it was saved for.
+   * Admin key for the provider's usage report. Never sent to the browser; only
+   * used with its provider.
    */
   adminKey: string;
-  /** The balance in US dollars when an admin last entered it, and when. */
+  /** USD balance as last entered by an admin, and when. */
   balance: number | null;
   balanceAt: string | null;
-  /**
-   * US dollars per million tokens, by model, for estimating spending without
-   * an admin key.
-   */
+  /** USD per million tokens by model, for estimates without an admin key. */
   prices: Record<string, { input: number; output: number }>;
-  /** When the provider last said the account is out of credit. */
+  /** When the provider last reported no credit. */
   outOfCreditAt: string | null;
 }
 
@@ -404,32 +687,55 @@ export interface MainSettings {
   applicationUrl: string;
   cacheImages: boolean;
   /**
-   * How big the image cache may grow, in MB, before the least recently used
-   * images are removed (lib/imageproxy). Unset means the default.
+   * Image cache size limit in MB before LRU eviction (lib/imageproxy). Unset
+   * uses the default.
    */
   imageCacheMaxMb?: number;
   defaultPermissions: number;
   /**
-   * Whether people get watchlist sync (requesting what is on their Plex or
-   * Trakt watchlist) turned on for movies and for series when their account
-   * is made. Existing accounts keep their own choice.
+   * Default watchlist auto-request for new accounts; existing accounts keep
+   * theirs.
    */
   defaultWatchlistSyncMovies: boolean;
   defaultWatchlistSyncTv: boolean;
   defaultQuotas: {
     movie: Quota;
     tv: Quota;
+    /** Albums. */
+    music: Quota;
   };
-  /** Optional features (see constants/features) turned off for everyone. */
+  /**
+   * Requests over someone's quota wait for an admin (never auto-approved)
+   * instead of being refused. Off unless turned on.
+   */
+  overQuotaRequests: boolean;
+  /** Globally disabled features (constants/features). */
   disabledFeatures: string[];
-  /** Give everyone the owner shares the Plex server with an account. */
+  /**
+   * ISO 3166-1 countries whose anime counts only if Japanese (utils/isAnime).
+   * Empty on new servers; migration 0011 sets US on older ones.
+   */
+  animeExcludedCountries: string[];
+  /** Create accounts for everyone the owner shares the Plex server with. */
   autoImportPlexUsers: boolean;
   hideAvailable: boolean;
   hideBlocklisted: boolean;
   hideRequested: boolean;
+  /**
+   * Show people only what their media server libraries hold: Recently Added,
+   * availability and play links (lib/libraryVisibility). Off by default.
+   */
+  limitToLibraries: boolean;
   localLogin: boolean;
   mediaServerLogin: boolean;
   newPlexLogin: boolean;
+  /** Who may create personal API keys (lib/personalApiKeys). Off by default. */
+  personalApiKeys: PersonalApiKeyAccess;
+  /**
+   * iCloud link to the admin's "Fix this show" shortcut, shown on the Siri
+   * page.
+   */
+  siriShortcutUrl: string;
   discoverRegion: string;
   streamingRegion: string;
   originalLanguage: string;
@@ -443,6 +749,15 @@ export interface MainSettings {
   locale: string;
   youtubeUrl: string;
   versionCheck: boolean;
+  /**
+   * Check for wrong matches minutes after a requested import (lib/matchWatch),
+   * plus nightly.
+   */
+  matchCheckOnImport: boolean;
+  /** Fix button on fixable wrong Plex matches. */
+  matchFix?: boolean;
+  /** Auto-fix them as found and nightly. */
+  matchFixAuto?: boolean;
 }
 
 export interface ProxySettings {
@@ -466,6 +781,13 @@ export interface NetworkSettings {
   csrfProtection: boolean;
   forceIpv4First: boolean;
   trustProxy: boolean;
+  /** With trustProxy, also trust Cloudflare's proxy. */
+  trustCloudflare: boolean;
+  /**
+   * With trustProxy, also trust these addresses or ranges
+   * (utils/trustedProxies).
+   */
+  trustedProxies: string[];
   proxy: ProxySettings;
   dnsCache: DnsCacheSettings;
   apiRequestTimeout: number;
@@ -475,15 +797,37 @@ interface PublicSettings {
   initialized: boolean;
 }
 
+/** A connected media server, as exposed publicly. */
+export interface PublicMediaServer {
+  kind: MediaServerKind;
+  name: string;
+  primary: boolean;
+  signIn: boolean;
+}
+
+/** An OIDC provider as the sign-in page sees it. */
+export interface PublicOidcProvider {
+  id: string;
+  name: string;
+  logoUrl: string;
+}
+
 interface FullPublicSettings extends PublicSettings {
   applicationTitle: string;
   applicationUrl: string;
   disabledFeatures: string[];
+  animeExcludedCountries: string[];
   hideAvailable: boolean;
   hideBlocklisted: boolean;
   hideRequested: boolean;
   localLogin: boolean;
   mediaServerLogin: boolean;
+  /** Who may create personal API keys (profile API Keys tab). */
+  personalApiKeys: PersonalApiKeyAccess;
+  /** Connected media servers, primary first. */
+  mediaServers: PublicMediaServer[];
+  /** Enabled OIDC providers; empty until the Application URL is set. */
+  oidcProviders: PublicOidcProvider[];
   movie4kEnabled: boolean;
   series4kEnabled: boolean;
   discoverRegion: string;
@@ -493,6 +837,8 @@ interface FullPublicSettings extends PublicSettings {
   jellyfinExternalHost?: string;
   jellyfinForgotPasswordUrl?: string;
   jellyfinServerName?: string;
+  embyExternalHost?: string;
+  embyForgotPasswordUrl?: string;
   partialRequestsEnabled: boolean;
   enableSpecialEpisodes: boolean;
   cacheImages: boolean;
@@ -506,10 +852,25 @@ interface FullPublicSettings extends PublicSettings {
   versionCheck: boolean;
   plexClientIdentifier: string;
   aiReady: boolean;
-  /** Bazarr is set up, so title pages can show their subtitles. */
+  /** Bazarr is configured, so title pages can show subtitles. */
   subtitlesReady: boolean;
-  /** A Trakt Client ID is set: Trakt links and watchlists can be read. */
+  /** A Trakt Client ID is set. */
   traktReady: boolean;
+  /** A default Lidarr exists and music isn't globally off. */
+  musicReady: boolean;
+  /** Whether All search includes music. */
+  musicSearch: MusicSearchSettings;
+  /** Single-song requests allowed (Settings → Music). */
+  musicSongs: boolean;
+  /** Default look for users who haven't chosen one. */
+  themeDefault: ThemeDefaults;
+  /** Active seasonal themes and their dates. */
+  seasons: SeasonCalendar;
+  /**
+   * Server CSS version for cache-busting (null for none), and whether personal
+   * CSS is allowed.
+   */
+  customCss: { server: string | null; personal: boolean };
 }
 
 export interface NotificationAgentConfig {
@@ -592,6 +953,11 @@ export interface NotificationAgentWebhook extends NotificationAgentConfig {
   };
 }
 
+/**
+ * Default Gotify priority: 5 plays a sound in the Android app; 0 shows nothing.
+ */
+export const GOTIFY_DEFAULT_PRIORITY = 5;
+
 export interface NotificationAgentGotify extends NotificationAgentConfig {
   options: {
     url: string;
@@ -665,14 +1031,21 @@ export type JobId =
   | 'plex-user-import'
   | 'jellyfin-recently-added-scan'
   | 'jellyfin-full-scan'
+  | 'emby-recently-added-scan'
+  | 'emby-full-scan'
   | 'image-cache-cleanup'
   | 'availability-sync'
   | 'process-blocklisted-tags'
   | 'anime-check'
   | 'backfill-scan'
   | 'backfill-monitor'
+  | 'download-check'
   | 'health-watch'
   | 'plex-match-check'
+  | 'music-sync'
+  | 'music-full-scan'
+  | 'playlist-sync'
+  | 'quality-check'
   | 'database-maintenance';
 
 export interface AllSettings {
@@ -683,14 +1056,21 @@ export interface AllSettings {
   main: MainSettings;
   plex: PlexSettings;
   jellyfin: JellyfinSettings;
+  emby: JellyfinSettings;
   tautulli: TautulliSettings;
   trakt: TraktSettings;
   maintainerr: MaintainerrSettings[];
   downloadClients: DownloadClientSettings[];
   bazarr: BazarrSettings;
   backfill: BackfillSettings;
+  /** Seerr AI-managed quality profiles (lib/quality). */
+  quality?: QualitySettings;
+  oidc: OidcSettings;
   radarr: RadarrSettings[];
   sonarr: SonarrSettings[];
+  lidarr: LidarrSettings[];
+  music: MusicSettings;
+  appearance: AppearanceSettings;
   public: PublicSettings;
   notifications: NotificationSettings;
   jobs: Record<JobId, JobSettings>;
@@ -698,19 +1078,26 @@ export interface AllSettings {
   metadataSettings: MetadataSettings;
   ai: AiSettings;
   aiCredit: AiCreditSettings;
-  /** The next id for each list of servers; see `newId`. */
+  /** Next id per server list; see `newId`. */
   nextIds?: Partial<Record<ServerList, number>>;
+  /**
+   * Emby ids are still in the Jellyfin columns; moved once at startup
+   * (lib/embySplit).
+   */
+  pendingEmbySplit?: boolean;
   migrations: string[];
 }
 
-/** The lists of servers and clients whose ids are kept elsewhere. */
+/** Server/client lists whose ids are referenced elsewhere. */
 export type ServerList =
   | 'radarr'
   | 'sonarr'
+  | 'lidarr'
   | 'maintainerr'
   | 'downloadClients';
 
-const SETTINGS_PATH = process.env.CONFIG_DIRECTORY
+/** Where settings.json is: in CONFIG_DIRECTORY when set, else ./config. */
+export const SETTINGS_PATH = process.env.CONFIG_DIRECTORY
   ? `${process.env.CONFIG_DIRECTORY}/settings.json`
   : path.join(__dirname, '../../../config/settings.json');
 
@@ -736,15 +1123,21 @@ class Settings {
         defaultQuotas: {
           movie: {},
           tv: {},
+          music: {},
         },
+        overQuotaRequests: false,
         disabledFeatures: [],
+        animeExcludedCountries: [],
         autoImportPlexUsers: false,
         hideAvailable: false,
         hideBlocklisted: false,
         hideRequested: false,
+        limitToLibraries: false,
         localLogin: true,
         mediaServerLogin: true,
         newPlexLogin: true,
+        personalApiKeys: 'off',
+        siriShortcutUrl: '',
         discoverRegion: '',
         streamingRegion: '',
         originalLanguage: '',
@@ -758,6 +1151,9 @@ class Settings {
         locale: 'en',
         youtubeUrl: '',
         versionCheck: true,
+        matchCheckOnImport: true,
+        matchFix: true,
+        matchFixAuto: false,
       },
       plex: {
         name: '',
@@ -765,23 +1161,17 @@ class Settings {
         port: 32400,
         useSsl: false,
         libraries: [],
+        musicLibraries: [],
+        connected: false,
+        signIn: true,
       },
-      jellyfin: {
-        name: '',
-        ip: '',
-        port: 8096,
-        useSsl: false,
-        urlBase: '',
-        externalHostname: '',
-        jellyfinForgotPasswordUrl: '',
-        libraries: [],
-        serverId: '',
-        apiKey: '',
-      },
+      jellyfin: jellyfinDefaults(),
+      emby: jellyfinDefaults(),
       tautulli: {},
       trakt: {},
       maintainerr: [],
       downloadClients: [],
+      oidc: { providers: [] },
       bazarr: {
         hostname: '',
         port: 6767,
@@ -812,6 +1202,9 @@ class Settings {
       },
       radarr: [],
       sonarr: [],
+      lidarr: [],
+      music: musicDefaults(),
+      appearance: { default: { ...SERVER_THEME_DEFAULTS } },
       public: {
         initialized: false,
       },
@@ -905,7 +1298,7 @@ class Settings {
             options: {
               url: '',
               token: '',
-              priority: 0,
+              priority: GOTIFY_DEFAULT_PRIORITY,
               locale: 'en',
             },
           },
@@ -952,19 +1345,17 @@ class Settings {
           schedule: '0 0 1 * * *',
         },
         'notification-reconcile': {
-          // Offset from the minute boundary so it does not land alongside
-          // the scans that run on the hour and half-hour.
+          // Offset off the minute to avoid the hourly and half-hourly scans.
           schedule: '20 */2 * * * *',
         },
         'episode-sync': {
           schedule: '40 */5 * * * *',
         },
-        // Seasons premiere on a date, not a minute: a few checks a day is
-        // plenty, and off the hour to stay clear of the scans.
+        // Premieres are by date: a few checks a day, off the hour.
         'future-seasons': {
           schedule: '0 50 */6 * * *',
         },
-        // Only does anything with Auto-Import Plex Users turned on.
+        // No-op unless Auto-Import Plex Users is on.
         'plex-user-import': {
           schedule: '0 25 */1 * * *',
         },
@@ -974,44 +1365,73 @@ class Settings {
         'jellyfin-full-scan': {
           schedule: '0 0 3 * * *',
         },
+        // Offset from Jellyfin's so the scans don't start together.
+        'emby-recently-added-scan': {
+          schedule: '0 2-59/5 * * * *',
+        },
+        'emby-full-scan': {
+          schedule: '0 10 3 * * *',
+        },
         'image-cache-cleanup': {
           schedule: '0 0 5 * * *',
         },
         'process-blocklisted-tags': {
           schedule: '0 30 1 */7 * *',
         },
-        // Report only: which series and movies disagree with Seerr about anime.
+        // Report only: titles whose anime status disagrees with Seerr.
         'anime-check': {
           schedule: '0 15 4 * * *',
         },
-        // Finds stuck series and searches a few of them each time.
+        // Searches a few stuck titles per run.
         'backfill-scan': {
           schedule: '0 40 */6 * * *',
         },
-        // Moves approved Backfill downloads along: picks files, imports
-        // once they are in, cleans up after.
+        // Advances approved Backfill downloads: pick files, import, clean up.
         'backfill-monitor': {
           schedule: '30 * * * * *',
         },
-        // Checks the connected services and tells admins what newly went
-        // wrong (Settings → Health).
+        // Avoids the minute mark, where Download Sync reads the same queues.
+        'download-check': {
+          schedule: '15,45 * * * * *',
+        },
+        // Alerts admins to new service problems (Settings → Health).
         'health-watch': {
           schedule: '15 */10 * * * *',
         },
-        // Report only: folders Plex matched to another title than Sonarr
-        // or Radarr has in them. After the night's full scan.
+        // Report only: Plex matches that disagree with Sonarr/Radarr. After the
+        // nightly full scan.
         'plex-match-check': {
           schedule: '0 20 4 * * *',
         },
-        // Clears out rows nothing reads any more, then vacuums.
+        // Lidarr request progress and newly added music; off the video scans'
+        // 5-minute marks.
+        'music-sync': {
+          schedule: '0 3-59/5 * * * *',
+        },
+        // All music libraries and Lidarr, including removals.
+        'music-full-scan': {
+          schedule: '0 40 3 * * *',
+        },
+        // Re-reads linked playlists daily; requests waiting songs hourly as
+        // limits free.
+        'playlist-sync': {
+          schedule: '0 25 * * * *',
+        },
+        // Settings → Quality: daily TRaSH Guides, profile drift, step-down.
+        'quality-check': {
+          schedule: '0 20 * * * *',
+        },
+        // Deletes unused rows, then vacuums.
         'database-maintenance': {
           schedule: '0 45 3 * * *',
         },
       },
       network: {
-        csrfProtection: false,
+        csrfProtection: true,
         forceIpv4First: false,
         trustProxy: false,
+        trustCloudflare: false,
+        trustedProxies: [],
         proxy: {
           enabled: false,
           hostname: '',
@@ -1029,7 +1449,9 @@ class Settings {
         },
         apiRequestTimeout: 10000,
       },
-      migrations: [],
+      // New installs already match 0010's result (running it later would
+      // disconnect servers connected at setup) and know Wrong Match (0014).
+      migrations: ['0010_media_servers', '0014_wrong_match_notifications'],
     };
     if (initialSettings) {
       this.data = mergeSettings(this.data, initialSettings);
@@ -1060,6 +1482,26 @@ class Settings {
     this.data.jellyfin = mergeSettings(this.data.jellyfin, data);
   }
 
+  get emby(): JellyfinSettings {
+    return this.data.emby;
+  }
+
+  set emby(data: JellyfinSettings) {
+    this.data.emby = mergeSettings(this.data.emby, data);
+  }
+
+  get pendingEmbySplit(): boolean {
+    return !!this.data.pendingEmbySplit;
+  }
+
+  set pendingEmbySplit(pending: boolean) {
+    if (pending) {
+      this.data.pendingEmbySplit = true;
+    } else {
+      delete this.data.pendingEmbySplit;
+    }
+  }
+
   get maintainerr(): MaintainerrSettings[] {
     return this.data.maintainerr;
   }
@@ -1074,6 +1516,20 @@ class Settings {
 
   set downloadClients(data: DownloadClientSettings[]) {
     this.data.downloadClients = data;
+  }
+
+  get oidc(): OidcSettings {
+    // Accept upstream's single-string claim format too.
+    return {
+      providers: (this.data.oidc?.providers ?? []).map((provider) => ({
+        ...provider,
+        requiredClaims: requiredClaimsFrom(provider.requiredClaims),
+      })),
+    };
+  }
+
+  set oidc(data: OidcSettings) {
+    this.data.oidc = data;
   }
 
   get bazarr(): BazarrSettings {
@@ -1101,6 +1557,23 @@ class Settings {
 
   set backfill(data: BackfillSettings) {
     this.data.backfill = data;
+  }
+
+  get quality(): QualitySettings {
+    const quality = mergeSettings(
+      structuredClone(QUALITY_DEFAULTS),
+      this.data.quality ?? {}
+    );
+    // Fill in adjustments newer than the saved server.
+    quality.servers = quality.servers.map((server) => ({
+      ...server,
+      adjustments: { ...ADJUSTMENT_DEFAULTS, ...server.adjustments },
+    }));
+    return quality;
+  }
+
+  set quality(data: QualitySettings) {
+    this.data.quality = data;
   }
 
   get tautulli(): TautulliSettings {
@@ -1146,6 +1619,57 @@ class Settings {
     );
   }
 
+  // Older settings may lack lidarr/music until reloaded; create them here so
+  // changes persist.
+  get lidarr(): LidarrSettings[] {
+    if (!this.data.lidarr) {
+      this.data.lidarr = [];
+    }
+    return this.data.lidarr;
+  }
+
+  set lidarr(data: LidarrSettings[]) {
+    this.data.lidarr = data;
+  }
+
+  get music(): MusicSettings {
+    if (!this.data.music) {
+      this.data.music = musicDefaults();
+    }
+    if (!this.data.music.search) {
+      this.data.music.search = musicDefaults().search;
+    }
+    if (!this.data.music.songQuota) {
+      this.data.music.songQuota = musicDefaults().songQuota;
+    }
+    if (!this.data.music.playlists) {
+      this.data.music.playlists = musicDefaults().playlists;
+    }
+    // Older settings lack these; use defaults.
+    if (this.data.music.songRequests === undefined) {
+      this.data.music.songRequests = musicDefaults().songRequests;
+    }
+    if (this.data.music.songsFromAlbums === undefined) {
+      this.data.music.songsFromAlbums = musicDefaults().songsFromAlbums;
+    }
+    return this.data.music;
+  }
+
+  set music(data: MusicSettings) {
+    this.data.music = data;
+  }
+
+  get appearance(): AppearanceSettings {
+    if (!this.data.appearance) {
+      this.data.appearance = { default: { ...SERVER_THEME_DEFAULTS } };
+    }
+    return this.data.appearance;
+  }
+
+  set appearance(data: AppearanceSettings) {
+    this.data.appearance = data;
+  }
+
   get radarr(): RadarrSettings[] {
     return this.data.radarr;
   }
@@ -1176,13 +1700,30 @@ class Settings {
       applicationTitle: this.data.main.applicationTitle,
       applicationUrl: this.data.main.applicationUrl,
       disabledFeatures: this.data.main.disabledFeatures ?? [],
+      animeExcludedCountries: this.data.main.animeExcludedCountries ?? [],
       hideAvailable: this.data.main.hideAvailable,
       hideBlocklisted: this.data.main.hideBlocklisted,
       hideRequested: this.data.main.hideRequested,
       localLogin: this.data.main.localLogin,
       mediaServerLogin: this.data.main.mediaServerLogin,
-      jellyfinExternalHost: this.data.jellyfin.externalHostname,
-      jellyfinForgotPasswordUrl: this.data.jellyfin.jellyfinForgotPasswordUrl,
+      personalApiKeys: this.data.main.personalApiKeys ?? 'off',
+      mediaServers: connectedKindsOf(this.data).map((kind, index) => ({
+        kind,
+        name: this.data[kind]?.name ?? '',
+        primary: index === 0 && kind === kindOfType(this.main.mediaServerType),
+        signIn: this.data[kind]?.signIn !== false,
+      })),
+      oidcProviders: oidcApplicationUrl(this.data.main.applicationUrl)
+        ? this.oidc.providers
+            .filter((provider) => provider.enabled)
+            .map(({ id, name, logoUrl }) => ({ id, name, logoUrl }))
+        : [],
+      // Single-server pages: Emby's when only Emby is connected.
+      jellyfinExternalHost: this.jellyfinFamilyPublic().externalHostname,
+      jellyfinForgotPasswordUrl:
+        this.jellyfinFamilyPublic().jellyfinForgotPasswordUrl,
+      embyExternalHost: this.data.emby?.externalHostname,
+      embyForgotPasswordUrl: this.data.emby?.jellyfinForgotPasswordUrl,
       movie4kEnabled: this.data.radarr.some(
         (radarr) => radarr.is4k && radarr.isDefault
       ),
@@ -1211,7 +1752,37 @@ class Settings {
         this.data.bazarr?.hostname && this.data.bazarr?.apiKey
       ),
       traktReady: !!this.data.trakt?.clientId,
+      musicReady:
+        (this.data.lidarr ?? []).some((lidarr) => lidarr.isDefault) &&
+        !(this.data.main.disabledFeatures ?? []).includes('music'),
+      musicSearch: {
+        inAll: musicInAllSearch(
+          this.music.search,
+          (this.data.lidarr ?? []).some((lidarr) => lidarr.isDefault)
+        ),
+      },
+      musicSongs: !!this.music.songRequests,
+      // Re-validated: settings.json can be hand-edited.
+      themeDefault:
+        cleanThemeDefaults(this.appearance.default) ?? SERVER_THEME_DEFAULTS,
+      seasons: seasonCalendar(seasonSettings(this.appearance.seasons)),
+      customCss: {
+        server: cssVersion(this.appearance.serverCss),
+        personal: this.appearance.personalCss === true,
+      },
     };
+  }
+
+  /**
+   * The Jellyfin-family server for single-server pages: Jellyfin, unless only
+   * Emby is connected.
+   */
+  private jellyfinFamilyPublic(): JellyfinSettings {
+    const kinds = connectedKindsOf(this.data);
+    const kind = kinds.find((k) => k === 'jellyfin' || k === 'emby');
+    return kind === 'emby' && this.data.emby
+      ? this.data.emby
+      : this.data.jellyfin;
   }
 
   get notifications(): NotificationSettings {
@@ -1239,11 +1810,9 @@ class Settings {
   }
 
   /**
-   * An id for a new server or download client in one of the lists. It is
-   * past the highest id that list has ever had, so a removed one's id is
-   * never given to another: titles, Backfill and its downloads keep the id
-   * they were sent to, and must not end up pointing at a different server.
-   * The caller saves the settings.
+   * A new id for a server list, above any it has ever used, so a removed
+   * server's id is never reused: titles and Backfill downloads keep their
+   * server id. The caller saves the settings.
    */
   public newId(list: ServerList): number {
     const saved: { id: number }[] = this.data[list] ?? [];
@@ -1292,13 +1861,9 @@ class Settings {
   }
 
   /**
-   * Settings Load
-   *
-   * This will load settings from file unless an optional argument of the object structure
-   * is passed in.
-   * @param overrideSettings If passed in, will override all existing settings with these
-   * @param raw If true, will load the settings without running migrations or generating missing
-   * values
+   * Loads settings from file.
+   * @param overrideSettings Replaces all settings instead of reading the file.
+   * @param raw Skip migrations and merging in defaults.
    */
   public async load(
     overrideSettings?: AllSettings,
@@ -1331,7 +1896,6 @@ class Settings {
       this.data = JSON.parse(data);
     }
 
-    // generate keys and ids if it's missing
     if (!this.data.main.apiKey) {
       this.data.main.apiKey = this.generateApiKey();
       change = true;
@@ -1364,12 +1928,12 @@ class Settings {
   public async save(): Promise<void> {
     const savePromise = this.saveLock.then(async () => {
       const tmp = SETTINGS_PATH + '.tmp';
-      await fs.writeFile(tmp, JSON.stringify(this.data, undefined, ' '));
+      await writeSettingsFile(tmp, JSON.stringify(this.data, undefined, ' '));
       await fs.rename(tmp, SETTINGS_PATH);
     });
 
     this.saveLock = savePromise.catch(() => {
-      // Keep the chain alive so future saves aren't blocked by past failures
+      // Keep the chain alive so a failed save doesn't block later ones.
     });
 
     return savePromise;

@@ -9,8 +9,8 @@ import useSWR from 'swr';
 
 const messages = defineMessages('components.RequestModal.SearchByNameModal', {
   notvdbiddescription:
-    'We were unable to automatically match this series. Please select the correct match below.',
-  nomatches: 'We were unable to find a match for this series.',
+    'This series couldn’t be matched automatically. Pick the right one below.',
+  nomatches: 'No match found for this series.',
 });
 
 interface SearchByNameModalProps {
@@ -106,10 +106,6 @@ const SearchByNameModal = ({
                 <div
                   className="text-grey-200 text-xl font-bold leading-tight"
                   style={{
-                    WebkitLineClamp: 1,
-                    display: '-webkit-box',
-                    overflow: 'hidden',
-                    WebkitBoxOrient: 'vertical',
                     wordBreak: 'break-word',
                   }}
                 >

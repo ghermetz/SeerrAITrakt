@@ -15,10 +15,10 @@ export interface MultiSelectOption {
 }
 
 interface MultiSelectFilterProps {
-  /** Leading icon, matching the bordered square on the single selects. */
+  /** Leading icon, as on the single selects. */
   icon: React.ReactNode;
   options: MultiSelectOption[];
-  /** Empty means no filtering — shown as "All". */
+  /** Empty means no filtering, shown as "All". */
   selected: string[];
   onChange: (selected: string[]) => void;
   /** Label used when nothing is ticked. */
@@ -26,11 +26,7 @@ interface MultiSelectFilterProps {
   name: string;
 }
 
-/**
- * A drop-down that ticks several values at once, styled to sit beside the
- * plain selects on the request list: same bordered icon, same control height,
- * same rounded-right body.
- */
+/** A multi-select drop-down styled to match the request list's selects. */
 const MultiSelectFilter = ({
   icon,
   options,
@@ -61,14 +57,14 @@ const MultiSelectFilter = ({
       : intl.formatMessage(messages.selectedcount, { count: selected.length });
 
   return (
-    <div className="relative flex" ref={containerRef}>
+    <div className="relative flex w-full min-w-0" ref={containerRef}>
       <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-sm text-gray-100">
         {icon}
       </span>
       <button
         aria-expanded={isOpen}
         aria-haspopup="listbox"
-        className="flex h-10 w-full min-w-0 items-center justify-between rounded-r-md border border-gray-500 bg-gray-700 px-3 text-left text-sm text-white transition hover:bg-gray-600 focus:border-blue-500 focus:outline-none"
+        className="flex w-full min-w-0 items-center justify-between rounded-r-md border border-field-border bg-field px-3 py-2 text-left text-sm leading-5 text-strong transition hover:bg-gray-600 focus:border-blue-500 focus:outline-none"
         id={name}
         onClick={() => setOpen((open) => !open)}
         type="button"
@@ -93,7 +89,7 @@ const MultiSelectFilter = ({
                 onChange={() => toggle(option.value)}
                 type="checkbox"
               />
-              <span className="truncate">{option.label}</span>
+              <span className="min-w-0 break-words">{option.label}</span>
             </label>
           ))}
         </div>

@@ -51,7 +51,7 @@ const IssueList = () => {
     }&filter=${currentFilter}&sort=${currentSort}`
   );
 
-  // Restore last set filter values on component mount
+  // Restore saved filters on mount.
   useEffect(() => {
     const filterString = window.localStorage.getItem('il-filter-settings');
 
@@ -63,13 +63,13 @@ const IssueList = () => {
       setCurrentPageSize(filterSettings.currentPageSize);
     }
 
-    // If filter value is provided in query, use that instead
+    // A filter in the query takes precedence.
     if (Object.values(Filter).includes(router.query.filter as Filter)) {
       setCurrentFilter(router.query.filter as Filter);
     }
   }, [router.query.filter]);
 
-  // Set filter values to local storage any time they are changed
+  // Persist filters on change.
   useEffect(() => {
     window.localStorage.setItem(
       'il-filter-settings',
@@ -161,13 +161,13 @@ const IssueList = () => {
       </div>
       {data.results.map((issue) => {
         return (
-          <div className="py-2" key={`issue-item-${issue.id}`}>
+          <div className="list-row py-2" key={`issue-item-${issue.id}`}>
             <IssueItem issue={issue} />
           </div>
         );
       })}
       {data.results.length === 0 && (
-        <div className="flex w-full flex-col items-center justify-center py-24 text-white">
+        <div className="flex w-full flex-col items-center justify-center py-24 text-strong">
           <span className="text-2xl text-gray-400">
             {intl.formatMessage(globalMessages.noresults)}
           </span>
@@ -205,7 +205,7 @@ const IssueList = () => {
             </p>
           </div>
           <div className="flex justify-center sm:flex-1 sm:justify-start lg:justify-center">
-            <span className="-mt-3 items-center truncate text-sm sm:mt-0">
+            <span className="-mt-3 items-center text-sm sm:mt-0">
               {intl.formatMessage(globalMessages.resultsperpage, {
                 pageSize: (
                   <select

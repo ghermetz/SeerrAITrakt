@@ -12,11 +12,20 @@ import RecentRequestsSlider from '@app/components/Discover/RecentRequestsSlider'
 import RecentlyAddedSlider from '@app/components/Discover/RecentlyAddedSlider';
 import StudioSlider from '@app/components/Discover/StudioSlider';
 import TvGenreSlider from '@app/components/Discover/TvGenreSlider';
+import { animeQuery } from '@app/components/Discover/animeChoices';
 import { sliderTitles } from '@app/components/Discover/constants';
 import MediaSlider from '@app/components/MediaSlider';
+import MusicSlider from '@app/components/Music/MusicSlider';
+import {
+  musicRowFor,
+  musicRowLink,
+  musicRowUrl,
+} from '@app/components/Music/musicRows';
+import { loadNavEditor, useNavLayout } from '@app/context/NavLayoutContext';
 import { encodeURIExtraParams } from '@app/hooks/useDiscover';
 import { useFeatureCheck } from '@app/hooks/useFeature';
-import useLazyModule from '@app/hooks/useLazyModule';
+import useLazyModule, { loadModule } from '@app/hooks/useLazyModule';
+import usePageReturn from '@app/hooks/usePageReturn';
 import useToasts from '@app/hooks/useToasts';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
@@ -32,19 +41,29 @@ import {
 import { DiscoverSliderType } from '@server/constants/discover';
 import { MAX_DISCOVER_NETWORKS } from '@server/constants/discoverNetworks';
 import { ApiErrorCode } from '@server/constants/error';
+import {
+  editableNavLayout,
+  isDefaultNavOrder,
+  sameNavLayout,
+} from '@server/constants/navigation';
+import {
+  readStreamingRow,
+  streamingServiceQuery,
+} from '@server/constants/streamingServices';
 import type DiscoverSlider from '@server/entity/DiscoverSlider';
 import axios from 'axios';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR from 'swr';
 
-// Only someone customizing the page needs these, and they bring drag-and-drop
-// and select libraries with them: load them when editing starts, not with
-// the page everyone opens first.
+// Heavy editor modules (drag-and-drop, selects) load only when editing
+// starts. The sidebar editor loads with them, so a failed load is reported
+// once, here.
 const loadEditor = () =>
   Promise.all([
     import('@app/components/Discover/CreateSlider'),
     import('@app/components/Discover/DiscoverSliderEdit'),
+    loadModule(loadNavEditor),
   ]).then(([create, edit]) => ({
     CreateSlider: create.default,
     DiscoverSliderEdit: edit.default,
@@ -55,10 +74,9 @@ const messages = defineMessages('components.Discover', {
   couldnotedit:
     'The editor could not be opened. Check your connection and try again.',
   emptywatchlist:
-    'Media added to your <PlexWatchlistSupportLink>Plex Watchlist</PlexWatchlistSupportLink> will appear here.',
+    'Titles on your <PlexWatchlistSupportLink>Plex Watchlist</PlexWatchlistSupportLink> show here.',
   resettodefault: 'Reset to Default',
-  resetwarning:
-    'Reset all sliders to default. This will also delete any custom sliders!',
+  resetwarning: 'Resets all sliders to default and deletes custom ones.',
   updatesuccess: 'Updated discover customization settings.',
   updatefailed:
     'Something went wrong updating the discover customization settings.',
@@ -77,9 +95,8 @@ const messages = defineMessages('components.Discover', {
 });
 
 /**
- * After a slider is created or deleted, the fresh list from the server
- * merged into the one being edited, so changes not saved yet (order, which
- * rows are on, the Networks list) are kept.
+ * Merges the server's list into the edited one, keeping unsaved order,
+ * toggles and Networks list.
  */
 const mergeRefreshedSliders = (
   current: Partial<DiscoverSlider>[],
@@ -87,12 +104,12 @@ const mergeRefreshedSliders = (
 ): Partial<DiscoverSlider>[] => {
   const refreshedById = new Map(refreshed.map((s) => [s.id, s]));
   const currentIds = new Set(current.map((s) => s.id));
-  // A new slider is created at order -1, so the server lists it first.
+  // New sliders are created at order -1, so they go first.
   const added = refreshed.filter((s) => !currentIds.has(s.id));
   const kept = current.flatMap((slider) => {
     const fresh = refreshedById.get(slider.id as number);
     if (!fresh) return [];
-    // A built-in slider is only changed here, so the local copy is newer.
+    // Built-in sliders only change here, so the local copy is newer.
     return [
       fresh.isBuiltIn
         ? slider
@@ -107,11 +124,10 @@ const Discover = () => {
   const featureIsOn = useFeatureCheck();
   const { user, hasPermission, revalidate: revalidateUser } = useUser();
   const isAdmin = hasPermission(Permission.ADMIN);
-  // Rows this person hid for themselves, saved, and as being edited.
+  // The user's own hidden rows: saved and draft.
   const savedHidden = user?.settings?.hiddenSliders ?? [];
   const [myHidden, setMyHidden] = useState<number[]>(savedHidden);
-  // Their own list for the Networks row (null: the usual one), saved and as
-  // being edited.
+  // The user's own Networks list (null: the default): saved and draft.
   const savedNetworks = user?.settings?.discoverNetworks ?? null;
   const [myNetworks, setMyNetworks] = useState<string | null>(savedNetworks);
   const { addToast } = useToasts();
@@ -120,8 +136,15 @@ const Discover = () => {
     error: discoverError,
     mutate,
   } = useSWR<DiscoverSlider[]>('/api/v1/settings/discover');
-  const [sliders, setSliders] = useState<Partial<DiscoverSlider>[]>([]);
+  // Rows from the cache on the first render, so a step back has the page's
+  // height before the browser puts its scroll back.
+  const [sliders, setSliders] = useState<Partial<DiscoverSlider>[]>(
+    () => discoverData ?? []
+  );
   const [isEditing, setIsEditing] = useState(false);
+  // Menu layout is edited in the menus themselves and saved with the page.
+  const nav = useNavLayout();
+  const { setDraft: setNavDraft } = nav;
   const editor = useLazyModule(loadEditor, isEditing, () => {
     addToast(intl.formatMessage(messages.couldnotedit), {
       appearance: 'error',
@@ -132,8 +155,7 @@ const Discover = () => {
   const CreateSlider = editor?.CreateSlider;
   const DiscoverSliderEdit = editor?.DiscoverSliderEdit;
 
-  // We need to sync the state here so that we can modify the changes locally without commiting
-  // anything to the server until the user decides to save the changes
+  // Local copy so edits stay unsaved until the user saves.
   useEffect(() => {
     if (discoverData && !isEditing) {
       setSliders(discoverData);
@@ -150,12 +172,25 @@ const Discover = () => {
       setMyNetworks(savedNetworks);
     }
   }, [savedNetworks, isEditing]);
+  // Menu editors show while customizing, until it ends or the page unmounts.
+  const savedNav = nav.saved;
+  useEffect(() => {
+    setNavDraft(isEditing ? editableNavLayout(savedNav) : undefined);
+    // Only on start/end: anything saved meanwhile is the draft itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isEditing, setNavDraft]);
+  useEffect(() => () => setNavDraft(undefined), [setNavDraft]);
+  // Coming back after a reload or resume: the scroll, once the rows are laid
+  // out (each row keeps its sideways scroll itself).
+  usePageReturn('home', { isReady: () => !!discoverData || !!discoverError });
 
   const layoutChanged = () => isAdmin && !Object.is(discoverData, sliders);
   const hiddenChanged = () =>
     [...myHidden].sort().join(',') !== [...savedHidden].sort().join(',');
   const networksChanged = () => myNetworks !== savedNetworks;
-  const mineChanged = () => hiddenChanged() || networksChanged();
+  const navChanged = () => !!nav.draft && !sameNavLayout(nav.draft, nav.saved);
+  const mineChanged = () =>
+    hiddenChanged() || networksChanged() || navChanged();
   const hasChanged = () => layoutChanged() || mineChanged();
   const hiddenForMe = (id?: number) =>
     id !== undefined && myHidden.includes(id);
@@ -172,11 +207,21 @@ const Discover = () => {
       if (layoutChanged()) {
         await axios.post('/api/v1/settings/discover', sliders);
       }
-      if (mineChanged() && user) {
+      if ((hiddenChanged() || networksChanged()) && user) {
         await axios.post(`/api/v1/user/${user.id}/settings/discover`, {
           hidden: myHidden,
           networks: myNetworks,
         });
+      }
+      if (navChanged() && nav.draft && user) {
+        await axios.post(`/api/v1/user/${user.id}/settings/sidebar`, {
+          // Store the default order as [] so later-added items take their
+          // default place.
+          order: isDefaultNavOrder(nav.draft.order) ? [] : nav.draft.order,
+          hidden: nav.draft.hidden,
+        });
+      }
+      if (mineChanged()) {
         await revalidateUser();
       }
 
@@ -192,7 +237,7 @@ const Discover = () => {
       setIsEditing(false);
       mutate();
     } catch (e) {
-      // A refused Networks list comes back as a 400 with its reason.
+      // A rejected Networks list returns 400 with a reason code.
       const code =
         axios.isAxiosError(e) && e.response?.status === 400
           ? e.response.data?.message
@@ -217,7 +262,7 @@ const Discover = () => {
 
   const resetSliders = async () => {
     try {
-      await axios.get('/api/v1/settings/discover/reset');
+      await axios.post('/api/v1/settings/discover/reset');
 
       addToast(intl.formatMessage(messages.resetsuccess), {
         appearance: 'success',
@@ -238,6 +283,7 @@ const Discover = () => {
   const upcomingDate = new Date(now.getTime() - offset * 60 * 1000)
     .toISOString()
     .split('T')[0];
+  const animeThisSeason = animeQuery('this');
 
   if (!discoverData && !discoverError) {
     return <SliderRowsSkeleton />;
@@ -249,8 +295,8 @@ const Discover = () => {
       {user && (
         <>
           {isAdmin && isEditing && CreateSlider && (
-            <div className="my-6 rounded-lg bg-gray-800">
-              <div className="flex items-center space-x-2 rounded-t-lg border-l border-r border-t border-gray-800 bg-gray-900 p-4 text-lg font-semibold text-gray-400">
+            <div className="my-6 rounded-lg bg-surface">
+              <div className="flex items-center space-x-2 rounded-t-lg border-l border-r border-t border-gray-800 bg-page p-4 text-lg font-semibold text-muted">
                 <PlusIcon className="w-6" />
                 <span data-testid="create-slider-header">
                   {intl.formatMessage(messages.createnewslider)}
@@ -281,7 +327,7 @@ const Discover = () => {
               title={intl.formatMessage(
                 isAdmin ? messages.customizediscover : messages.customizemine
               )}
-              className="h-12 w-12 rounded-full border-2 border-gray-600 bg-gray-700/90 p-3 text-gray-400 shadow transition-all hover:bg-gray-700"
+              className="h-12 w-12 rounded-full border-2 border-strong bg-gray-700/90 p-3 text-muted shadow transition-all hover:bg-gray-700"
             >
               <PencilIcon className="h-full w-full" />
             </button>
@@ -295,7 +341,7 @@ const Discover = () => {
             leave="transition duration-300"
             leaveFrom="opacity-100 translate-y-0"
             leaveTo="opacity-0 translate-y-6"
-            className="safe-shift-edit-menu fixed left-0 right-0 z-50 flex flex-col items-center justify-end space-x-0 space-y-2 border-t border-gray-700 bg-gray-800/80 p-4 backdrop-blur sm:bottom-0 sm:flex-row sm:space-x-3 sm:space-y-0"
+            className="safe-shift-edit-menu fixed left-0 right-0 z-50 flex flex-col items-center justify-end space-x-0 space-y-2 border-t border-subtle bg-surface/80 p-4 backdrop-blur sm:bottom-0 sm:flex-row sm:space-x-3 sm:space-y-0"
           >
             <Button
               buttonType="default"
@@ -342,8 +388,7 @@ const Discover = () => {
         </>
       )}
       {(isEditing
-        ? // Someone who is not an admin only chooses among the rows an
-          // admin left on.
+        ? // Non-admins only choose among rows an admin enabled.
           isAdmin
           ? sliders
           : sliders.filter((slider) => slider.enabled)
@@ -351,10 +396,25 @@ const Discover = () => {
       )?.map((slider, index) => {
         let sliderComponent: React.ReactNode;
 
+        // Music rows are absent, even when editing, without the music feature.
+        const musicRow = musicRowFor(slider.type);
+        if (musicRow && !featureIsOn('music')) {
+          return null;
+        }
+        if (musicRow) {
+          sliderComponent = (
+            <MusicSlider
+              sliderKey={`music-${musicRow.show}`}
+              title={intl.formatMessage(musicRow.title)}
+              url={musicRowUrl(musicRow)}
+              linkUrl={musicRowLink(musicRow)}
+            />
+          );
+        }
+
         switch (slider.type) {
           case DiscoverSliderType.DELETING_SOON:
-            // Shown only while Maintainerr has something due, and only with
-            // Deleting Soon on (Settings → Features, or one's own).
+            // Renders only while Maintainerr has items due and it is on.
             sliderComponent = <DeletingSoonSlider />;
             break;
           case DiscoverSliderType.RECENTLY_ADDED:
@@ -363,13 +423,18 @@ const Discover = () => {
           case DiscoverSliderType.RECENT_REQUESTS:
             sliderComponent = <RecentRequestsSlider />;
             break;
+          case DiscoverSliderType.MUSIC_RECENT_REQUESTS:
+            if (!featureIsOn('music')) {
+              return null;
+            }
+            sliderComponent = <RecentRequestsSlider music />;
+            break;
           case DiscoverSliderType.PLEX_WATCHLIST:
             sliderComponent = <PlexWatchlistSlider />;
             break;
           case DiscoverSliderType.SUGGESTED:
-            // Built from each person's own watching, so it is theirs alone;
-            // hidden for anyone with nothing to go on, or who turned it off.
-            // Still listed while rearranging rows, so it can be moved.
+            // Per-user; hidden when off or empty, but kept while editing so
+            // it can be moved.
             if (!isEditing && !featureIsOn('suggestedForYou')) {
               break;
             }
@@ -444,10 +509,21 @@ const Discover = () => {
               />
             );
             break;
+          case DiscoverSliderType.ANIME:
+            sliderComponent = (
+              <MediaSlider
+                sliderKey="anime"
+                title={intl.formatMessage(sliderTitles.anime)}
+                url="/api/v1/discover/anime"
+                extraParams={`show=${animeThisSeason.show}&season=${animeThisSeason.season}`}
+                linkUrl="/discover/anime"
+              />
+            );
+            break;
           case DiscoverSliderType.NETWORKS:
             sliderComponent = (
               <NetworkSlider
-                // Each person's own list, or the usual one.
+                // The user's own list, or the default.
                 data={isEditing ? myNetworks : savedNetworks}
                 isEditing={isEditing}
                 onChange={setMyNetworks}
@@ -543,12 +619,12 @@ const Discover = () => {
                 sliderKey={`custom-slider-${slider.id}`}
                 title={slider.title ?? ''}
                 url="/api/v1/discover/movies"
-                extraParams={`watchRegion=${
-                  slider.data?.split(',')[0]
-                }&watchProviders=${slider.data?.split(',')[1]}`}
-                linkUrl={`/discover/movies?watchRegion=${
-                  slider.data?.split(',')[0]
-                }&watchProviders=${slider.data?.split(',')[1]}`}
+                extraParams={streamingServiceQuery(
+                  readStreamingRow(slider.data)
+                )}
+                linkUrl={`/discover/movies?${streamingServiceQuery(
+                  readStreamingRow(slider.data)
+                )}`}
               />
             );
             break;
@@ -558,12 +634,12 @@ const Discover = () => {
                 sliderKey={`custom-slider-${slider.id}`}
                 title={slider.title ?? ''}
                 url="/api/v1/discover/tv"
-                extraParams={`watchRegion=${
-                  slider.data?.split(',')[0]
-                }&watchProviders=${slider.data?.split(',')[1]}`}
-                linkUrl={`/discover/tv?watchRegion=${
-                  slider.data?.split(',')[0]
-                }&watchProviders=${slider.data?.split(',')[1]}`}
+                extraParams={streamingServiceQuery(
+                  readStreamingRow(slider.data)
+                )}
+                linkUrl={`/discover/tv?${streamingServiceQuery(
+                  readStreamingRow(slider.data)
+                )}`}
               />
             );
             break;
@@ -590,8 +666,7 @@ const Discover = () => {
               }}
               onDelete={refreshSliders}
               onEnable={() => {
-                // A copy: the slider objects are shared with SWR's cache, and
-                // changing one in place would change the saved copy too.
+                // Copy: the objects are shared with SWR's cache.
                 setSliders(
                   sliders.map((s, i) =>
                     i === index ? { ...s, enabled: !s.enabled } : s

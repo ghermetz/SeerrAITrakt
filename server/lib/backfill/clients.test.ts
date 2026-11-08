@@ -31,11 +31,10 @@ setupTestDb();
 
 /*
  * Backfill with every download client, end to end: the engine and each
- * client's own API code, against a stand-in that speaks that client's
- * protocol and keeps its torrents (or NZB jobs) as the client would. A pack
- * is approved, only its chosen file downloads, Sonarr imports it, and the
- * download is removed with its data. Prowlarr and Sonarr are stubbed at
- * their API clients.
+ * client's API code against a stand-in that speaks its protocol and keeps
+ * torrents (or NZB jobs) as the client would. A pack is approved, only its
+ * chosen file downloads, Sonarr imports it, and the download is removed
+ * with its data. Prowlarr and Sonarr are stubbed at their API clients.
  */
 
 const ben = (value: unknown): Buffer => {
@@ -61,11 +60,11 @@ const ben = (value: unknown): Buffer => {
   ]);
 };
 
-const NAME = '[Judas] Naruto';
+const NAME = '[Tengu] Kitsuraga';
 const FILES = [
-  { length: 400, path: ['S3', '[Judas] Naruto - S03E06 (101).mkv'] },
-  { length: 300, path: ['S3', '[Judas] Naruto - S03E07 (102).mkv'] },
-  { length: 200, path: ['S1', '[Judas] Naruto - S01E01 (001).mkv'] },
+  { length: 400, path: ['S3', '[Tengu] Kitsuraga - S03E06 (101).mkv'] },
+  { length: 300, path: ['S3', '[Tengu] Kitsuraga - S03E07 (102).mkv'] },
+  { length: 200, path: ['S1', '[Tengu] Kitsuraga - S01E01 (001).mkv'] },
 ];
 const INFO = {
   name: NAME,
@@ -75,7 +74,7 @@ const INFO = {
 };
 const TORRENT = ben({ announce: 'udp://tracker', info: INFO });
 const HASH = createHash('sha1').update(ben(INFO)).digest('hex');
-const MAGNET = `magnet:?xt=urn:btih:${HASH}&dn=Naruto`;
+const MAGNET = `magnet:?xt=urn:btih:${HASH}&dn=Kitsuraga`;
 const NZB = Buffer.from('<nzb/>');
 
 const quality = {
@@ -91,7 +90,7 @@ const entry = (index: number, episodeId: number): PlanEntry => ({
   absolute: episodeId,
   quality,
   languages: [{ id: 8, name: 'Japanese' }],
-  releaseGroup: 'Judas',
+  releaseGroup: 'Tengu',
   score: 700,
   action: index === 0 ? 'fill' : 'skip',
   replaces: 0,
@@ -291,7 +290,7 @@ const deluge: http.RequestListener = async (req, res) => {
   switch (method) {
     case 'web.connected':
       return answer(true);
-    case 'daemon.info':
+    case 'daemon.get_version':
       return answer('2.1.1');
     case 'core.get_enabled_plugins':
       return answer(['Label']);
@@ -322,7 +321,10 @@ const deluge: http.RequestListener = async (req, res) => {
       return answer(
         Object.fromEntries(
           [...swarm.torrents.values()]
-            .filter((held) => held.label === params[0].label)
+            .filter(
+              (held) =>
+                !('label' in params[0]) || held.label === params[0].label
+            )
             .map((held) => [held.hash, pick(params[1], held)])
         )
       );
@@ -539,7 +541,7 @@ const nzbget: http.RequestListener = async (req, res) => {
                 NZBID: 21,
                 Status: 'SUCCESS/ALL',
                 FileSizeMB: 100,
-                DestDir: '/complete/backfill/Naruto.S03E06',
+                DestDir: '/complete/backfill/Kitsuraga.S03E06',
               },
             ]
           : []
@@ -628,12 +630,12 @@ beforeEach(() => {
   mock.method(notificationManager, 'sendNotification', () => undefined);
   mock.method(BackfillSonarr.prototype, 'getSeriesDetail', async () => ({
     id: 1279,
-    title: 'Naruto',
+    title: 'Kitsuraga',
     year: 2002,
-    tvdbId: 78857,
+    tvdbId: 63914,
     seriesType: 'anime',
     qualityProfileId: 13,
-    path: '/anime/Naruto',
+    path: '/anime/Kitsuraga',
   }));
   mock.method(BackfillSonarr.prototype, 'getRootFoldersNow', async () => [
     { path: '/anime', freeSpace: 10 * 1024 ** 4 },
@@ -653,8 +655,8 @@ beforeEach(() => {
   ]);
   mock.method(BackfillSonarr.prototype, 'getFolderFiles', async () => [
     {
-      path: '/data/usenet/backfill/Naruto.S03E06/[Judas] Naruto - S03E06 (101).mkv',
-      name: '[Judas] Naruto - S03E06 (101).mkv',
+      path: '/data/usenet/backfill/Kitsuraga.S03E06/[Tengu] Kitsuraga - S03E06 (101).mkv',
+      name: '[Tengu] Kitsuraga - S03E06 (101).mkv',
       size: 400,
     },
   ]);
@@ -689,9 +691,9 @@ const seed = async (
     new BackfillSeries({
       serverId: 0,
       arrId: 1279,
-      tmdbId: 46260,
-      tvdbId: 78857,
-      title: 'Naruto',
+      tmdbId: 58371,
+      tvdbId: 63914,
+      title: 'Kitsuraga',
       year: 2002,
       seriesType: 'anime',
       status: 'found',
@@ -707,7 +709,7 @@ const seed = async (
     new BackfillCandidate({
       seriesId: series.id,
       guid: `https://indexer/${protocol}`,
-      title: '[Judas] Naruto (Complete Series) [BD 1080p]',
+      title: '[Tengu] Kitsuraga (Complete Series) [BD 1080p]',
       indexer: 'Uindex',
       indexerId: 45,
       protocol,
@@ -789,7 +791,7 @@ for (const type of ['transmission', 'deluge', 'rtorrent'] as const) {
       );
       assert.deepEqual(imports[0], [
         {
-          path: '/data/torrents/[Judas] Naruto/S3/[Judas] Naruto - S03E06 (101).mkv',
+          path: '/data/torrents/[Tengu] Kitsuraga/S3/[Tengu] Kitsuraga - S03E06 (101).mkv',
           episodeIds: [101],
         },
       ]);
@@ -849,8 +851,8 @@ describe('Backfill with Deluge', () => {
     useClient('deluge');
     const candidate = await seed('torrent', { kind: 'torrent', data: TORRENT });
     await backfill.approve(candidate.id, { mode: 'missing' });
-    // Left to Deluge's own settings, one set to remove torrents at their
-    // ratio would take this one, files and all, the moment it is done.
+    // Otherwise Deluge's remove-at-ratio could delete it and its files once
+    // done.
     assert.equal(swarm.torrents.get(HASH)?.removeAtRatio, false);
   });
 });
@@ -870,7 +872,7 @@ describe('Backfill with NZBGet', () => {
     assert.equal(job.stage, 'Queued in NZBGet');
     assert.deepEqual(nzb.added, [
       {
-        name: '[Judas] Naruto (Complete Series) [BD 1080p].nzb',
+        name: '[Tengu] Kitsuraga (Complete Series) [BD 1080p].nzb',
         category: 'backfill',
         dupeMode: 'FORCE',
       },
@@ -897,7 +899,7 @@ describe('Backfill with NZBGet', () => {
     );
     assert.deepEqual(imports[0], [
       {
-        path: '/data/usenet/backfill/Naruto.S03E06/[Judas] Naruto - S03E06 (101).mkv',
+        path: '/data/usenet/backfill/Kitsuraga.S03E06/[Tengu] Kitsuraga - S03E06 (101).mkv',
         episodeIds: [101],
       },
     ]);

@@ -1,7 +1,11 @@
+import { MediaType } from '@server/constants/media';
 import type Media from '@server/entity/Media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { User } from '@server/entity/User';
-import notificationManager, { Notification } from '@server/lib/notifications';
+import notificationManager, {
+  Notification,
+  digestOf,
+} from '@server/lib/notifications';
 import type {
   NotificationAgent,
   NotificationPayload,
@@ -9,10 +13,7 @@ import type {
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it } from 'node:test';
 
-/*
- * A burst of notifications to one person goes out as one: what was sent,
- * to whom, and when.
- */
+// A burst to one user goes out as one digest.
 
 let sent: { type: Notification; payload: NotificationPayload }[] = [];
 const agent: NotificationAgent = {
@@ -22,7 +23,7 @@ const agent: NotificationAgent = {
     return true;
   },
 };
-// Fails when told to, as an agent does when its service is down.
+// Fails on demand, like an agent whose service is down.
 let failing = false;
 const flaky: NotificationAgent = {
   shouldSend: () => true,
@@ -55,7 +56,7 @@ beforeEach(() => {
 
 describe('notifications sent close together', () => {
   it('tells the person once about a burst, and admins and channels at once', async () => {
-    for (const title of ['Dune (2021)', 'Up (2009)', 'Heat (1995)']) {
+    for (const title of ['Zelvara (2021)', 'Yonder (2009)', 'Scorch (1995)']) {
       notificationManager.sendNotification(
         Notification.MEDIA_AVAILABLE,
         available(title)
@@ -81,11 +82,11 @@ describe('notifications sent close together', () => {
       },
       {
         subject: '3 titles are ready to watch',
-        message: 'Dune (2021), Up (2009), Heat (1995).',
+        message: 'Zelvara (2021), Yonder (2009), Scorch (1995).',
         digest: true,
         system: false,
         admin: false,
-        image: 'https://img/Dune (2021).jpg',
+        image: 'https://img/Zelvara (2021).jpg',
         actionUrl: '/requests',
       }
     );
@@ -94,12 +95,12 @@ describe('notifications sent close together', () => {
   it('sends one on its own as it was, only a moment later', async () => {
     notificationManager.sendNotification(
       Notification.MEDIA_AVAILABLE,
-      available('Dune (2021)')
+      available('Zelvara (2021)')
     );
     await wait(120);
     const [own] = toUser();
     assert.equal(toUser().length, 1);
-    assert.equal(own.payload.subject, 'Dune (2021)');
+    assert.equal(own.payload.subject, 'Zelvara (2021)');
     assert.equal(own.payload.digest, undefined);
     assert.equal(own.payload.notifyAdmin, false, 'admins were told already');
   });
@@ -156,10 +157,10 @@ describe('notifications sent close together', () => {
 
   it('tells about the same title once, however often it came up', async () => {
     for (const title of [
-      'Dune (2021)',
-      'Dune (2021)',
-      'Up (2009)',
-      'Up (2009)',
+      'Zelvara (2021)',
+      'Zelvara (2021)',
+      'Yonder (2009)',
+      'Yonder (2009)',
     ]) {
       notificationManager.sendNotification(
         Notification.MEDIA_AVAILABLE,
@@ -172,15 +173,15 @@ describe('notifications sent close together', () => {
     sent = [];
     notificationManager.sendNotification(
       Notification.MEDIA_AVAILABLE,
-      available('Heat (1995)')
+      available('Scorch (1995)')
     );
     notificationManager.sendNotification(
       Notification.MEDIA_AVAILABLE,
-      available('Heat (1995)')
+      available('Scorch (1995)')
     );
     await wait(120);
     assert.equal(toUser().length, 1);
-    assert.equal(toUser()[0].payload.subject, 'Heat (1995)');
+    assert.equal(toUser()[0].payload.subject, 'Scorch (1995)');
   });
 
   it('names a few and counts the rest', async () => {
@@ -212,7 +213,7 @@ describe('notifications sent close together', () => {
     notificationManager.gathering = { quietMs: 60_000, longestMs: 60_000 };
     notificationManager.sendNotification(
       Notification.MEDIA_AVAILABLE,
-      available('Dune (2021)')
+      available('Zelvara (2021)')
     );
     notificationManager.flush();
     assert.equal(toUser().length, 1);
@@ -235,6 +236,32 @@ describe('notifications sent close together', () => {
     assert.equal(toUser().length, 1);
     assert.equal(toUser()[0].payload.subject, '2 titles are ready to watch');
   });
+
+  it('tells each decline that came with a reason on its own, reason and all', async () => {
+    const decline = (id: number, title: string, declineReason?: string) =>
+      notificationManager.sendNotification(Notification.MEDIA_DECLINED, {
+        ...available(title),
+        request: { id, is4k: false, declineReason } as MediaRequest,
+      });
+
+    decline(1, 'Zelvara (2021)', 'Already on Netflix');
+    decline(2, 'Yonder (2009)', 'We have it on disc');
+    decline(3, 'Scorch (1995)');
+    decline(4, 'Aurelin (1979)');
+
+    const reasons = () =>
+      toUser().map(
+        (s) => s.payload.request?.declineReason ?? s.payload.subject
+      );
+    assert.deepEqual(reasons(), ['Already on Netflix', 'We have it on disc']);
+
+    await wait(120);
+    assert.deepEqual(reasons(), [
+      'Already on Netflix',
+      'We have it on disc',
+      '2 requests were declined',
+    ]);
+  });
 });
 
 describe('an agent that fails', () => {
@@ -255,5 +282,72 @@ describe('an agent that fails', () => {
     }
     assert.deepEqual(unhandled, []);
     assert.equal(sent.length, 1, 'the other agents still sent it');
+  });
+});
+
+describe('what a gathered "ready" says', () => {
+  const ready = (subject: string, mediaType: MediaType) => ({
+    subject,
+    notifySystem: false,
+    notifyAdmin: false,
+    media: { mediaType } as Media,
+  });
+
+  it('is to listen to for music, and to watch or listen to for both', () => {
+    const subject = (...items: ReturnType<typeof ready>[]) =>
+      digestOf(Notification.MEDIA_AVAILABLE, items).subject;
+    assert.equal(
+      subject(
+        ready('Static Garden — Glasswing', MediaType.MUSIC),
+        ready('Lantern Song — Glasswing', MediaType.MUSIC)
+      ),
+      '2 music requests are ready to listen to'
+    );
+    assert.equal(
+      subject(
+        ready('Zelvara (2021)', MediaType.MOVIE),
+        ready('Static Garden — Glasswing', MediaType.MUSIC)
+      ),
+      '2 requests are ready to watch or listen to'
+    );
+    assert.equal(
+      subject(
+        ready('Zelvara (2021)', MediaType.MOVIE),
+        ready('Yonder (2009)', MediaType.TV)
+      ),
+      '2 titles are ready to watch'
+    );
+  });
+});
+
+describe('a failed request', () => {
+  it('is the requester’s Request Failed, apart from the admins’ and channels’ copy', () => {
+    notificationManager.sendNotification(
+      Notification.MEDIA_FAILED,
+      available('Zelvara (2021)')
+    );
+    assert.deepEqual(
+      sent.map((s) => [
+        Notification[s.type],
+        !!s.payload.holdUser,
+        s.payload.notifySystem,
+        s.payload.notifyAdmin,
+      ]),
+      [
+        ['MEDIA_FAILED', true, true, true],
+        ['REQUEST_FAILED', false, false, false],
+      ]
+    );
+  });
+
+  it('with no one to tell but admins goes as it is', () => {
+    notificationManager.sendNotification(Notification.MEDIA_FAILED, {
+      ...available('Zelvara (2021)'),
+      notifyUser: undefined,
+    });
+    assert.deepEqual(
+      sent.map((s) => Notification[s.type]),
+      ['MEDIA_FAILED']
+    );
   });
 });

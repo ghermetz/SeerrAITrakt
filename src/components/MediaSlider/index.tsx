@@ -1,8 +1,8 @@
 import ShowMoreCard from '@app/components/MediaSlider/ShowMoreCard';
 import PersonCard from '@app/components/PersonCard';
 import Slider from '@app/components/Slider';
-import TitleCard, { EagerPosters } from '@app/components/TitleCard';
-import useNearViewport from '@app/hooks/useNearViewport';
+import TitleCard from '@app/components/TitleCard';
+import { useNearObserver } from '@app/hooks/useNearScreen';
 import useSettings from '@app/hooks/useSettings';
 import useTitleChanged, { pageHolds } from '@app/hooks/useTitleChanged';
 import { useUser } from '@app/hooks/useUser';
@@ -15,8 +15,8 @@ import type {
   TvResult,
 } from '@server/models/Search';
 import Link from 'next/link';
-import type { ReactElement } from 'react';
 import { useEffect } from 'react';
+import { useSWRConfig } from 'swr';
 import useSWRInfinite from 'swr/infinite';
 
 interface MixedResult {
@@ -36,9 +36,6 @@ interface MediaSliderProps {
   onNewTitles?: (titleCount: number) => void;
 }
 
-/** A first swipe's worth of cards on a wide screen. */
-const EAGER_CARDS = 8;
-
 const MediaSlider = ({
   title,
   url,
@@ -50,33 +47,37 @@ const MediaSlider = ({
 }: MediaSliderProps) => {
   const settings = useSettings();
   const { hasPermission } = useUser();
-  const { ref, near } = useNearViewport<HTMLDivElement>();
+  const pageUrl = (page: number) =>
+    `${url}?page=${page}${extraParams ? `&${extraParams}` : ''}`;
+  // Fetch once near the screen, so top rows aren't queued behind lower ones.
+  // Cached rows (e.g. going back) show at once.
+  const { ref: rowRef, near } = useNearObserver();
+  const { cache } = useSWRConfig();
+  const wanted = near || cache.get(pageUrl(1))?.data !== undefined;
   const { data, error, setSize, size, mutate } = useSWRInfinite<MixedResult>(
     (pageIndex: number, previousPageData: MixedResult | null) => {
-      if (previousPageData && pageIndex + 1 > previousPageData.totalPages) {
+      if (
+        !wanted ||
+        (previousPageData && pageIndex + 1 > previousPageData.totalPages)
+      ) {
         return null;
       }
 
-      return `${url}?page=${pageIndex + 1}${
-        extraParams ? `&${extraParams}` : ''
-      }`;
+      return pageUrl(pageIndex + 1);
     },
-    {
-      initialSize: 2,
-      revalidateFirstPage: false,
-    }
+    // One page first so its posters show on arrival; the next (for the
+    // "see more" card) is requested after, below.
+    { revalidateFirstPage: false }
   );
 
-  // After a request from one of these cards, reload only the pages that
-  // hold the title, so its badge changes without reloading the whole row.
+  // After a request, reload only the pages holding the title.
   useTitleChanged((title) => {
     if (data?.some((page) => pageHolds(page, title))) {
       mutate(undefined, { revalidate: (page) => pageHolds(page, title) });
     }
   });
 
-  // A page that came back without its list (a damaged copy held on the
-  // device) is passed over rather than taking the row down with it.
+  // Skip pages without results (a damaged cached copy) instead of breaking the row.
   let titles = (data ?? []).reduce(
     (a, v) => (Array.isArray(v?.results) ? [...a, ...v.results] : a),
     [] as (MovieResult | TvResult | PersonResult)[]
@@ -110,22 +111,25 @@ const MediaSlider = ({
   }
 
   useEffect(() => {
+    // One more page at a time, once the last arrived.
     if (
+      !!data &&
+      data.length >= size &&
       titles.length < 24 &&
       size < 5 &&
-      (data?.[0]?.totalResults ?? 0) > size * 20
+      (data[0]?.totalResults ?? 0) > size * 20
     ) {
       setSize(size + 1);
     }
 
     if (onNewTitles) {
-      // We aren't reporting all titles. We just want to know if there are any titles
-      // at all for our purposes.
+      // Only whether there are any titles matters.
       onNewTitles(titles.length);
     }
   }, [titles, setSize, size, data, onNewTitles]);
 
-  if (hideWhenEmpty && (data?.[0].results ?? []).length === 0) {
+  // Hide only once known empty; before that the row must render to be observed.
+  if (hideWhenEmpty && data && (data[0]?.results ?? []).length === 0) {
     return null;
   }
 
@@ -144,26 +148,18 @@ const MediaSlider = ({
         );
       return title;
     })
-    .map((title, index) => {
-      // Once the row is a screen or so away, the cards that fill its first
-      // swipe load at once, so they are drawn when it arrives; the rest of
-      // the row loads as it is swiped to.
-      const card = (element: ReactElement) => (
-        <EagerPosters.Provider
-          key={`${title.mediaType}-${title.id}`}
-          value={near && index < EAGER_CARDS}
-        >
-          {element}
-        </EagerPosters.Provider>
-      );
+    .map((title) => {
       switch (title.mediaType) {
         case 'movie':
-          return card(
+          return (
             <TitleCard
+              key={`${title.mediaType}-${title.id}`}
               id={title.id}
               isAddedToWatchlist={title.mediaInfo?.watchlists?.length ?? 0}
               image={title.posterPath}
+              backdrop={title.backdropPath}
               status={title.mediaInfo?.status}
+              outsideLibraries={title.mediaInfo?.outsideLibraries}
               summary={title.overview}
               title={title.title}
               userScore={title.voteAverage}
@@ -173,12 +169,15 @@ const MediaSlider = ({
             />
           );
         case 'tv':
-          return card(
+          return (
             <TitleCard
+              key={`${title.mediaType}-${title.id}`}
               id={title.id}
               isAddedToWatchlist={title.mediaInfo?.watchlists?.length ?? 0}
               image={title.posterPath}
+              backdrop={title.backdropPath}
               status={title.mediaInfo?.status}
+              outsideLibraries={title.mediaInfo?.outsideLibraries}
               summary={title.overview}
               title={title.name}
               userScore={title.voteAverage}
@@ -212,11 +211,11 @@ const MediaSlider = ({
   }
 
   return (
-    <div ref={ref}>
+    <div ref={rowRef}>
       <div className="slider-header">
         {linkUrl ? (
           <Link href={linkUrl} className="slider-title min-w-0 pr-16">
-            <span className="truncate">{title}</span>
+            <span className="min-w-0 sm:truncate">{title}</span>
             <ArrowRightCircleIcon />
           </Link>
         ) : (

@@ -4,12 +4,17 @@ import { getRepository } from '@server/datasource';
 import { User } from '@server/entity/User';
 import { getIntl } from '@server/i18n';
 import globalMessages from '@server/i18n/globalMessages';
+import {
+  declineReasonOf,
+  escapeHtml,
+} from '@server/lib/notifications/declineReason';
 import { eventText } from '@server/lib/notifications/eventTitles';
+import notificationHttp from '@server/lib/notifications/http';
+import { mediaPagePath } from '@server/lib/notifications/mediaPage';
 import type { NotificationAgentPushover } from '@server/lib/settings';
 import { NotificationAgentKey, getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import type { AvailableLocale } from '@server/types/languages';
-import axios from 'axios';
 import {
   Notification,
   hasNotificationType,
@@ -33,6 +38,9 @@ interface PushoverPayload extends PushoverImagePayload {
   priority: number;
   html: number;
 }
+
+/** Pushover's message length limit. */
+const MESSAGE_LIMIT = 1024;
 
 class PushoverAgent
   extends BaseAgent<NotificationAgentPushover>
@@ -66,7 +74,7 @@ class PushoverAgent
     imageUrl: string
   ): Promise<Partial<PushoverImagePayload>> {
     try {
-      const response = await axios.get(imageUrl, {
+      const response = await notificationHttp.get(imageUrl, {
         responseType: 'arraybuffer',
       });
       const base64 = Buffer.from(response.data, 'binary').toString('base64');
@@ -100,15 +108,16 @@ class PushoverAgent
 
     const event = eventText(payload, intl);
     const title = event ?? payload.subject;
-    let message = event ? `<b>${payload.subject}</b>` : '';
+    let message = event ? `<b>${escapeHtml(payload.subject)}</b>` : '';
     let priority = 0;
 
-    if (payload.message) {
-      message += `<small>${message ? '\n' : ''}${payload.message}</small>`;
-    }
+    const summary = payload.message
+      ? `<small>${message ? '\n' : ''}${escapeHtml(payload.message)}</small>`
+      : '';
+    message += summary;
 
     if (payload.request) {
-      message += `<small>\n\n<b>${intl.formatMessage(globalMessages.requestedBy)}:</b> ${payload.request.requestedBy.displayName}</small>`;
+      message += `<small>\n\n<b>${intl.formatMessage(globalMessages.requestedBy)}:</b> ${escapeHtml(payload.request.requestedBy.displayName)}</small>`;
 
       let status = '';
       switch (type) {
@@ -133,6 +142,7 @@ class PushoverAgent
           priority = 1;
           break;
         case Notification.MEDIA_FAILED:
+        case Notification.REQUEST_FAILED:
           status = intl.formatMessage(globalMessages.failed);
           priority = 1;
           break;
@@ -141,10 +151,15 @@ class PushoverAgent
       if (status) {
         message += `<small>\n<b>${intl.formatMessage(globalMessages.requestStatus)}:</b> ${status}</small>`;
       }
+
+      const declineReason = declineReasonOf(type, payload);
+      if (declineReason) {
+        message += `<small>\n<b>${intl.formatMessage(globalMessages.declineReason)}:</b> ${escapeHtml(declineReason)}</small>`;
+      }
     } else if (payload.comment) {
-      message += `<small>\n\n<b>${intl.formatMessage(globalMessages.commentFrom, { userName: payload.comment.user.displayName })}:</b> ${payload.comment.message}</small>`;
+      message += `<small>\n\n<b>${intl.formatMessage(globalMessages.commentFrom, { userName: escapeHtml(payload.comment.user.displayName) })}:</b> ${escapeHtml(payload.comment.message)}</small>`;
     } else if (payload.issue) {
-      message += `<small>\n\n<b>${intl.formatMessage(globalMessages.reportedBy)}:</b> ${payload.issue.createdBy.displayName}</small>`;
+      message += `<small>\n\n<b>${intl.formatMessage(globalMessages.reportedBy)}:</b> ${escapeHtml(payload.issue.createdBy.displayName)}</small>`;
       message += `<small>\n<b>${intl.formatMessage(globalMessages.issueType)}:</b> ${IssueTypeName[payload.issue.issueType]}</small>`;
       message += `<small>\n<b>${intl.formatMessage(globalMessages.issueStatus)}:</b> ${
         payload.issue.status === IssueStatus.OPEN
@@ -161,13 +176,22 @@ class PushoverAgent
       message += `<small>\n<b>${extra.name}:</b> ${extra.value}</small>`;
     }
 
+    // Over the limit, drop the summary to keep the decline reason.
+    if (
+      declineReasonOf(type, payload) &&
+      message.length > MESSAGE_LIMIT &&
+      summary
+    ) {
+      message = message.replace(summary, '');
+    }
+
     const url = applicationUrl
       ? payload.actionUrl
         ? `${applicationUrl}${payload.actionUrl}`
         : payload.issue
           ? `${applicationUrl}/issues/${payload.issue.id}`
           : payload.media
-            ? `${applicationUrl}/${payload.media.mediaType}/${payload.media.tmdbId}`
+            ? `${applicationUrl}${mediaPagePath(payload.media, payload.request)}`
             : undefined
       : undefined;
     const url_title = url
@@ -228,7 +252,7 @@ class PushoverAgent
           payload
         );
 
-        await axios.post(endpoint, {
+        await notificationHttp.post(endpoint, {
           ...notificationPayload,
           token: settings.options.accessToken,
           user: settings.options.userToken,
@@ -247,8 +271,7 @@ class PushoverAgent
       }
     }
 
-    // Held while a burst to this person is gathered into one (see the
-    // notification manager): only the admin and channel copies go now.
+    // holdUser: the user's copy goes out later in a digest.
     if (payload.notifyUser && !payload.holdUser) {
       if (
         payload.notifyUser.settings?.hasNotificationType(
@@ -276,7 +299,7 @@ class PushoverAgent
             payload.notifyUser.settings?.locale as AvailableLocale
           );
 
-          await axios.post(endpoint, {
+          await notificationHttp.post(endpoint, {
             ...notificationPayload,
             token: payload.notifyUser.settings.pushoverApplicationToken,
             user: payload.notifyUser.settings.pushoverUserKey,
@@ -332,7 +355,7 @@ class PushoverAgent
                   user.settings?.locale as AvailableLocale
                 );
 
-                await axios.post(endpoint, {
+                await notificationHttp.post(endpoint, {
                   ...notificationPayload,
                   token: user.settings.pushoverApplicationToken,
                   user: user.settings.pushoverUserKey,

@@ -1,15 +1,28 @@
 import Spinner from '@app/assets/spinner.svg';
+import { AiSearchingBadge } from '@app/components/Backfill/shared';
 import Badge from '@app/components/Common/Badge';
 import Button from '@app/components/Common/Button';
 import CachedImage from '@app/components/Common/CachedImage';
 import Tooltip from '@app/components/Common/Tooltip';
+import DeclineReason from '@app/components/DeclineReason';
+import DeclineRequestModal from '@app/components/DeclineRequestModal';
+import MusicRequestCard from '@app/components/Music/MusicRequest/MusicRequestCard';
+import OverQuotaBadge from '@app/components/OverQuotaBadge';
 import RequestModal from '@app/components/RequestModal';
+import RequestServerIssue from '@app/components/RequestServerIssue';
 import StatusBadge from '@app/components/StatusBadge';
-import useDeepLinks from '@app/hooks/useDeepLinks';
+import useNearScreen, {
+  bothRefs,
+  useLoadWhenNear,
+} from '@app/hooks/useNearScreen';
+import usePlayLinks from '@app/hooks/usePlayLinks';
+import useRequestAction from '@app/hooks/useRequestAction';
+import useRetryRequest from '@app/hooks/useRetryRequest';
 import useToasts from '@app/hooks/useToasts';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
+import { pictureLoading } from '@app/utils/nearScreen';
 import {
   getRequestDownloadStatus,
   refreshIntervalHelper,
@@ -23,14 +36,20 @@ import {
   TrashIcon,
   XMarkIcon,
 } from '@heroicons/react/24/solid';
-import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
+import type { VideoMediaType } from '@server/constants/media';
+import {
+  MediaRequestStatus,
+  MediaStatus,
+  MediaType,
+} from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
+import type { BackfillStatus } from '@server/interfaces/api/backfillStatus';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
 import type { MovieDetails } from '@server/models/Movie';
 import type { TvDetails } from '@server/models/Tv';
 import axios from 'axios';
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useInView } from 'react-intersection-observer';
 import { useIntl } from 'react-intl';
 import useSWR, { mutate } from 'swr';
@@ -72,12 +91,7 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
   const { hasPermission } = useUser();
   const intl = useIntl();
 
-  const { mediaUrl: plexUrl, mediaUrl4k: plexUrl4k } = useDeepLinks({
-    mediaUrl: requestData?.media?.mediaUrl,
-    mediaUrl4k: requestData?.media?.mediaUrl4k,
-    iOSPlexUrl: requestData?.media?.iOSPlexUrl,
-    iOSPlexUrl4k: requestData?.media?.iOSPlexUrl4k,
-  });
+  const { playLink, playLink4k } = usePlayLinks(requestData?.media);
 
   const requestDownloadStatus = getRequestDownloadStatus(
     requestData?.media?.[
@@ -88,23 +102,25 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
       : []
   );
 
-  const deleteRequest = async () => {
-    await axios.delete(`/api/v1/media/${requestData?.media.id}`);
-    mutate('/api/v1/media?filter=allavailable&take=20&sort=mediaAdded');
-    mutate('/api/v1/request?filter=all&take=10&sort=modified&skip=0');
-    mutate('/api/v1/request/count');
-  };
+  const { run } = useRequestAction();
+  const deleteRequest = () =>
+    run(async () => {
+      await axios.delete(`/api/v1/media/${requestData?.media.id}`);
+      mutate('/api/v1/media?filter=allavailable&take=20&sort=mediaAdded');
+      mutate('/api/v1/request?filter=all&take=10&sort=modified&skip=0');
+      mutate('/api/v1/request/count');
+    }, messages.failedmodify);
 
   return (
     <div
-      className="relative flex w-72 overflow-hidden rounded-xl bg-gray-800 p-4 text-gray-400 shadow ring-1 ring-red-500 sm:w-96"
+      className="relative flex w-72 overflow-hidden rounded-xl bg-surface p-4 text-muted shadow ring-1 ring-red-500 sm:w-96"
       data-testid="request-card"
     >
       <div className="w-20 sm:w-28">
         <div className="w-full" style={{ paddingBottom: '150%' }}>
           <div className="absolute inset-0 z-10 flex min-w-0 flex-1 flex-col p-4">
             <div
-              className="whitespace-normal text-base font-bold text-white sm:text-lg"
+              className="whitespace-normal text-base font-bold text-strong sm:text-lg"
               data-testid="request-card-title"
             >
               {intl.formatMessage(messages.mediaerror, {
@@ -123,7 +139,7 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
                   [Permission.MANAGE_REQUESTS, Permission.REQUEST_VIEW],
                   { type: 'or' }
                 ) && (
-                  <div className="card-field !hidden sm:!block">
+                  <div className="card-field !hidden truncate sm:!block">
                     <Link
                       href={`/users/${requestData.requestedBy.id}`}
                       className="group flex items-center"
@@ -166,8 +182,8 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
                       title={intl.formatMessage(messages.unknowntitle)}
                       inProgress={requestDownloadStatus.length > 0}
                       is4k={requestData.is4k}
-                      mediaType={requestData.type}
-                      plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
+                      mediaType={requestData.type as VideoMediaType}
+                      playLink={requestData.is4k ? playLink4k : playLink}
                       serviceUrl={
                         requestData.is4k
                           ? requestData.media.serviceUrl4k
@@ -176,6 +192,11 @@ const RequestCardError = ({ requestData }: RequestCardErrorProps) => {
                     />
                   )}
                 </div>
+                <RequestServerIssue
+                  request={requestData}
+                  compact
+                  className="mt-1"
+                />
               </>
             )}
             <div className="flex flex-1 items-end space-x-2">
@@ -219,32 +240,23 @@ interface RequestCardProps {
 }
 
 const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
-  // On screen now, for checking on the request; on screen at any point, for
-  // loading the title, which then stays loaded.
-  const [seen, setSeen] = useState(false);
-  const { ref, inView } = useInView({
-    onChange: (visible) => {
-      if (visible) {
-        setSeen(true);
-      }
-    },
-  });
+  // Near: preload the title and images. In view: poll the request.
+  const { ref: nearRef, near, nearness } = useNearScreen();
+  const { ref: viewRef, inView } = useInView();
+  const ref = useMemo(() => bothRefs(nearRef, viewRef), [nearRef, viewRef]);
   const intl = useIntl();
   const { user, hasPermission } = useUser();
   const { addToast } = useToasts();
-  const [isRetrying, setRetrying] = useState(false);
-  const [updatingType, setUpdatingType] = useState<
-    'approve' | 'decline' | null
-  >(null);
+  const [isApproving, setIsApproving] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
+  const [showDeclineModal, setShowDeclineModal] = useState(false);
   const url =
     request.type === 'movie'
       ? `/api/v1/movie/${request.media.tmdbId}`
       : `/api/v1/tv/${request.media.tmdbId}`;
 
-  const { data: title, error } = useSWR<MovieDetails | TvDetails>(
-    seen ? `${url}` : null
-  );
+  const titleKey = useLoadWhenNear(url, near);
+  const { data: title, error } = useSWR<MovieDetails | TvDetails>(titleKey);
   const {
     data: requestData,
     error: requestError,
@@ -253,8 +265,7 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
     `/api/v1/request/${request.id}`,
     {
       fallbackData: request,
-      // Only while it can be seen: a card scrolled out of the row is not
-      // asked about again until it comes back into view.
+      // Only poll while visible.
       refreshInterval: inView
         ? refreshIntervalHelper<NonFunctionProperties<MediaRequest>>(
             watchRequest,
@@ -264,17 +275,32 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
     }
   );
 
-  const { mediaUrl: plexUrl, mediaUrl4k: plexUrl4k } = useDeepLinks({
-    mediaUrl: requestData?.media?.mediaUrl,
-    mediaUrl4k: requestData?.media?.mediaUrl4k,
-    iOSPlexUrl: requestData?.media?.iOSPlexUrl,
-    iOSPlexUrl4k: requestData?.media?.iOSPlexUrl4k,
-  });
+  const { playLink, playLink4k } = usePlayLinks(requestData?.media);
 
-  const modifyRequest = async (type: 'approve' | 'decline') => {
-    setUpdatingType(type);
+  // Whether the AI admin agent is searching: only while visible, approved
+  // and not fully available.
+  const shown = requestData ?? request;
+  const mayBeLooked =
+    inView &&
+    shown.status === MediaRequestStatus.APPROVED &&
+    shown.media[shown.is4k ? 'status4k' : 'status'] !== MediaStatus.AVAILABLE;
+  const { data: backfillStatus } = useSWR<BackfillStatus[]>(
+    mayBeLooked
+      ? `/api/v1/backfill-status?tmdbIds=${shown.media.tmdbId}`
+      : null,
+    {
+      refreshInterval: (latest) =>
+        latest?.some((s) => s.agent || s.state === 'downloading') ? 15000 : 0,
+    }
+  );
+  const aiSearching = !!backfillStatus?.some(
+    (s) => s.agent && s.mediaType === shown.type
+  );
+
+  const approveRequest = async () => {
+    setIsApproving(true);
     try {
-      await axios.post(`/api/v1/request/${request.id}/${type}`);
+      await axios.post(`/api/v1/request/${request.id}/approve`);
       revalidate();
       mutate('/api/v1/request/count');
     } catch {
@@ -283,34 +309,23 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
         appearance: 'error',
       });
     } finally {
-      setUpdatingType(null);
+      setIsApproving(false);
     }
   };
 
-  const deleteRequest = async () => {
-    await axios.delete(`/api/v1/request/${request.id}`);
-    mutate('/api/v1/request?filter=all&take=10&sort=modified&skip=0');
-    mutate('/api/v1/request/count');
-  };
+  const { run } = useRequestAction();
+  const deleteRequest = () =>
+    run(async () => {
+      await axios.delete(`/api/v1/request/${request.id}`);
+      mutate('/api/v1/request?filter=all&take=10&sort=modified&skip=0');
+      mutate('/api/v1/request/count');
+    }, messages.failedmodify);
 
-  const retryRequest = async () => {
-    setRetrying(true);
-
-    try {
-      const response = await axios.post(`/api/v1/request/${request.id}/retry`);
-
-      if (response) {
-        revalidate();
-      }
-    } catch {
-      addToast(intl.formatMessage(messages.failedretry), {
-        autoDismiss: true,
-        appearance: 'error',
-      });
-    } finally {
-      setRetrying(false);
-    }
-  };
+  const { retry: retryRequest, isRetrying } = useRetryRequest(
+    request,
+    revalidate,
+    messages.failedretry
+  );
 
   useEffect(() => {
     if (title && onTitleData) {
@@ -346,18 +361,31 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
       <RequestModal
         show={showEditModal}
         tmdbId={request.media.tmdbId}
-        type={request.type}
+        // Only films and series reach this card.
+        type={request.type as VideoMediaType}
         is4k={request.is4k}
-        editRequest={request}
+        // The current request, which may have failed since the list loaded.
+        editRequest={requestData}
         onCancel={() => setShowEditModal(false)}
         onComplete={() => {
           revalidate();
           setShowEditModal(false);
         }}
       />
+      <DeclineRequestModal
+        show={showDeclineModal}
+        requests={[request]}
+        subTitle={isMovie(title) ? title.title : title.name}
+        onCancel={() => setShowDeclineModal(false)}
+        onComplete={() => {
+          setShowDeclineModal(false);
+          revalidate();
+        }}
+      />
       <div
-        className="relative flex w-72 overflow-hidden rounded-xl bg-gray-800 bg-cover bg-center p-4 text-gray-400 shadow ring-1 ring-gray-700 sm:w-96"
+        className="relative flex w-72 overflow-hidden rounded-xl bg-surface bg-cover bg-center p-4 text-muted shadow ring-1 ring-subtle sm:w-96"
         data-testid="request-card"
+        data-seerr="request-card"
         ref={ref}
       >
         {title.backdropPath && (
@@ -370,12 +398,13 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
               fill
               // The card is 18rem wide, 24rem from sm: a small backdrop does.
               sizes="(min-width: 640px) 384px, 288px"
+              {...pictureLoading(nearness)}
             />
             <div
               className="absolute inset-0"
               style={{
                 backgroundImage:
-                  'linear-gradient(135deg, rgba(17, 24, 39, 0.47) 0%, rgba(17, 24, 39, 1) 75%)',
+                  'linear-gradient(135deg, rgb(var(--page) / var(--title-fade)) 0%, rgb(var(--page)) 75%)',
               }}
             />
           </div>
@@ -384,7 +413,8 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
           className="relative z-10 flex min-w-0 flex-1 flex-col pr-4"
           data-testid="request-card-title"
         >
-          <div className="hidden text-xs font-medium text-white sm:flex">
+          {/* The year shows on phones too, like a music card's artist. */}
+          <div className="flex text-xs font-medium text-strong">
             {(isMovie(title) ? title.releaseDate : title.firstAirDate)?.slice(
               0,
               4
@@ -396,7 +426,9 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                 ? `/movie/${requestData.media.tmdbId}`
                 : `/tv/${requestData.media.tmdbId}`
             }
-            className="overflow-hidden overflow-ellipsis whitespace-nowrap text-base font-bold text-white hover:underline sm:text-lg"
+            title={isMovie(title) ? title.title : title.name}
+            // Long names wrap to a second line.
+            className="line-clamp-2 whitespace-normal break-words text-base font-bold leading-tight text-strong hover:underline sm:text-lg sm:leading-snug"
           >
             {isMovie(title) ? title.title : title.name}
           </Link>
@@ -404,7 +436,7 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
             [Permission.MANAGE_REQUESTS, Permission.REQUEST_VIEW],
             { type: 'or' }
           ) && (
-            <div className="card-field">
+            <div className="card-field truncate">
               <Link
                 href={`/users/${requestData.requestedBy.id}`}
                 className="group flex items-center"
@@ -419,7 +451,7 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                     height={20}
                   />
                 </span>
-                <span className="truncate font-semibold group-hover:text-white group-hover:underline">
+                <span className="truncate font-semibold group-hover:text-strong group-hover:underline">
                   {requestData.requestedBy.displayName}
                 </span>
               </Link>
@@ -445,11 +477,14 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
               </div>
             </div>
           )}
-          <div className="mt-2 flex items-center text-sm sm:mt-1">
-            <span className="mr-2 hidden font-bold sm:block">
+          <div className="mt-2 flex min-w-0 items-center text-sm sm:mt-1">
+            <span className="mr-2 hidden flex-none font-bold sm:block">
               {intl.formatMessage(globalMessages.status)}
             </span>
-            {requestData.status === MediaRequestStatus.DECLINED ? (
+            {/* The AI search replaces the request status while it runs. */}
+            {aiSearching ? (
+              <AiSearchingBadge className="flex-none" />
+            ) : requestData.status === MediaRequestStatus.DECLINED ? (
               <Badge badgeType="danger">
                 {intl.formatMessage(globalMessages.declined)}
               </Badge>
@@ -479,8 +514,8 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                 inProgress={requestDownloadStatus.length > 0}
                 is4k={requestData.is4k}
                 tmdbId={requestData.media.tmdbId}
-                mediaType={requestData.type}
-                plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
+                mediaType={requestData.type as VideoMediaType}
+                playLink={requestData.is4k ? playLink4k : playLink}
                 serviceUrl={
                   requestData.is4k
                     ? requestData.media.serviceUrl4k
@@ -488,24 +523,57 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                 }
               />
             )}
+            <OverQuotaBadge request={requestData} className="ml-2 flex-none" />
           </div>
+          {requestData.status === MediaRequestStatus.DECLINED &&
+            requestData.declineReason && (
+              <DeclineReason
+                reason={requestData.declineReason}
+                className="mt-1"
+              />
+            )}
+          <RequestServerIssue request={requestData} compact className="mt-1" />
           <div className="flex flex-1 items-end space-x-2">
             {requestData.status === MediaRequestStatus.FAILED &&
               hasPermission(Permission.MANAGE_REQUESTS) && (
-                <Button
-                  buttonType="primary"
-                  buttonSize="sm"
-                  disabled={isRetrying}
-                  onClick={() => retryRequest()}
-                >
-                  <ArrowPathIcon
-                    className={isRetrying ? 'animate-spin' : ''}
-                    style={{ marginRight: '0', animationDirection: 'reverse' }}
-                  />
-                  <span className="ml-1.5 hidden sm:block">
-                    {intl.formatMessage(globalMessages.retry)}
-                  </span>
-                </Button>
+                <>
+                  <Tooltip content={intl.formatMessage(globalMessages.retry)}>
+                    <Button
+                      buttonType="primary"
+                      buttonSize="sm"
+                      disabled={isRetrying}
+                      onClick={() => retryRequest()}
+                      // The label is hidden on phones.
+                      aria-label={intl.formatMessage(globalMessages.retry)}
+                    >
+                      <ArrowPathIcon
+                        className={isRetrying ? 'animate-spin' : ''}
+                        style={{
+                          marginRight: '0',
+                          animationDirection: 'reverse',
+                        }}
+                      />
+                      <span className="ml-1.5 hidden sm:block">
+                        {intl.formatMessage(globalMessages.retry)}
+                      </span>
+                    </Button>
+                  </Tooltip>
+                  {/* Change server, profile or folder before retrying. */}
+                  <Tooltip content={intl.formatMessage(messages.editrequest)}>
+                    <Button
+                      buttonType="default"
+                      buttonSize="sm"
+                      disabled={isRetrying}
+                      onClick={() => setShowEditModal(true)}
+                      aria-label={intl.formatMessage(messages.editrequest)}
+                    >
+                      <PencilIcon style={{ marginRight: '0' }} />
+                      <span className="ml-1.5 hidden sm:block">
+                        {intl.formatMessage(globalMessages.edit)}
+                      </span>
+                    </Button>
+                  </Tooltip>
+                </>
               )}
             {requestData.status === MediaRequestStatus.PENDING &&
               hasPermission(Permission.MANAGE_REQUESTS) && (
@@ -515,10 +583,10 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                       buttonType="success"
                       buttonSize="sm"
                       className="hidden sm:block"
-                      onClick={() => modifyRequest('approve')}
-                      disabled={updatingType !== null}
+                      onClick={() => approveRequest()}
+                      disabled={isApproving}
                     >
-                      {updatingType === 'approve' ? <Spinner /> : <CheckIcon />}
+                      {isApproving ? <Spinner /> : <CheckIcon />}
                       <span>{intl.formatMessage(globalMessages.approve)}</span>
                     </Button>
                     <Tooltip
@@ -528,14 +596,10 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                         buttonType="success"
                         buttonSize="sm"
                         className="sm:hidden"
-                        onClick={() => modifyRequest('approve')}
-                        disabled={updatingType !== null}
+                        onClick={() => approveRequest()}
+                        disabled={isApproving}
                       >
-                        {updatingType === 'approve' ? (
-                          <Spinner />
-                        ) : (
-                          <CheckIcon />
-                        )}
+                        {isApproving ? <Spinner /> : <CheckIcon />}
                       </Button>
                     </Tooltip>
                   </div>
@@ -544,10 +608,10 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                       buttonType="danger"
                       buttonSize="sm"
                       className="hidden sm:block"
-                      onClick={() => modifyRequest('decline')}
-                      disabled={updatingType !== null}
+                      onClick={() => setShowDeclineModal(true)}
+                      disabled={isApproving}
                     >
-                      {updatingType === 'decline' ? <Spinner /> : <XMarkIcon />}
+                      <XMarkIcon />
                       <span>{intl.formatMessage(globalMessages.decline)}</span>
                     </Button>
                     <Tooltip
@@ -557,14 +621,10 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                         buttonType="danger"
                         buttonSize="sm"
                         className="sm:hidden"
-                        onClick={() => modifyRequest('decline')}
-                        disabled={updatingType !== null}
+                        onClick={() => setShowDeclineModal(true)}
+                        disabled={isApproving}
                       >
-                        {updatingType === 'decline' ? (
-                          <Spinner />
-                        ) : (
-                          <XMarkIcon />
-                        )}
+                        <XMarkIcon />
                       </Button>
                     </Tooltip>
                   </div>
@@ -582,7 +642,7 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                       buttonSize="sm"
                       className="hidden sm:block"
                       onClick={() => setShowEditModal(true)}
-                      disabled={updatingType !== null}
+                      disabled={isApproving}
                     >
                       <PencilIcon />
                       <span>{intl.formatMessage(globalMessages.edit)}</span>
@@ -594,7 +654,7 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
                       buttonSize="sm"
                       className="sm:hidden"
                       onClick={() => setShowEditModal(true)}
-                      disabled={updatingType !== null}
+                      disabled={isApproving}
                     >
                       <PencilIcon />
                     </Button>
@@ -643,14 +703,15 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
             type="tmdb"
             src={
               title.posterPath
-                ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${title.posterPath}`
+                ? `https://image.tmdb.org/t/p/w300_and_h450_face${title.posterPath}`
                 : '/images/seerr_poster_not_found.png'
             }
             alt=""
             sizes="100vw"
             style={{ width: '100%', height: 'auto' }}
-            width={600}
-            height={900}
+            width={300}
+            height={450}
+            {...pictureLoading(nearness)}
           />
         </Link>
       </div>
@@ -658,6 +719,14 @@ const RequestCard = ({ request, onTitleData }: RequestCardProps) => {
   );
 };
 
-export default withProperties(RequestCard, {
+/** Music gets its own card, having no TMDB title. */
+const RequestCardFor = (props: RequestCardProps) =>
+  props.request.type === MediaType.MUSIC ? (
+    <MusicRequestCard request={props.request} />
+  ) : (
+    <RequestCard {...props} />
+  );
+
+export default withProperties(RequestCardFor, {
   Placeholder: RequestCardPlaceholder,
 });

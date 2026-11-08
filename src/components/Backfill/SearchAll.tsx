@@ -14,7 +14,7 @@ import { useIntl } from 'react-intl';
 const messages = defineMessages('components.Backfill.SearchAll', {
   searchAll: 'Search all stuck',
   explain:
-    'Searches every stuck title one at a time, with a pause between, instead of a few each scan: titles someone requested first. Titles Sonarr or Radarr searched for today are included; ones Backfill searched in the last day are not. Packs that pass auto-approve start downloading as they are found. Each title is a query to every indexer, so this takes a while.',
+    'Searches every stuck title one by one, requested first. Uses many indexer queries, so it takes a while.',
   start: 'Search All Stuck',
   cancel: 'Cancel',
   starting: 'Starting…',
@@ -32,8 +32,8 @@ const messages = defineMessages('components.Backfill.SearchAll', {
 });
 
 /**
- * Searching every stuck title at a steady pace: the button, what it does
- * before it starts, and how far it has got while it runs.
+ * Search-all button: rate-limited search of every stuck title, with a
+ * confirm step and progress.
  */
 export const SearchAllButton = ({
   disabled,
@@ -79,7 +79,7 @@ const SearchAllPanel = ({
       <div className="rounded-lg bg-gray-800 p-4 ring-1 ring-indigo-500/40">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="min-w-0">
-            <p className="font-semibold text-white">
+            <p className="font-semibold text-strong">
               {intl.formatMessage(messages.running)}
             </p>
             <p className="text-sm text-gray-300">
@@ -98,7 +98,7 @@ const SearchAllPanel = ({
               try {
                 await axios.delete('/api/v1/backfill/search-all');
               } catch (e) {
-                // Still running: offer Stop again, and say why it didn't.
+                // Still running: re-offer Stop and show why.
                 setStopping(false);
                 setProblem(
                   axios.isAxiosError(e) && e.response?.data?.message
@@ -115,7 +115,11 @@ const SearchAllPanel = ({
             </span>
           </Button>
         </div>
-        {problem && <p className="mt-2 text-sm text-red-300">{problem}</p>}
+        {problem && (
+          <p className="mt-2 text-sm text-red-300 light:text-danger-text">
+            {problem}
+          </p>
+        )}
         {ready && (
           <div className="mt-3 space-y-2">
             <ProgressBar
@@ -123,7 +127,7 @@ const SearchAllPanel = ({
               done={running.done === running.total}
             />
             {running.current && (
-              <p className="truncate text-xs text-gray-400">
+              <p className="break-words text-xs text-gray-400">
                 {intl.formatMessage(messages.now, { title: running.current })}
               </p>
             )}
@@ -139,7 +143,11 @@ const SearchAllPanel = ({
         <p className="text-sm text-gray-300">
           {intl.formatMessage(messages.explain)}
         </p>
-        {problem && <p className="mt-2 text-sm text-red-300">{problem}</p>}
+        {problem && (
+          <p className="mt-2 text-sm text-red-300 light:text-danger-text">
+            {problem}
+          </p>
+        )}
         <div className="mt-3 flex flex-wrap gap-2">
           <Button
             buttonType="primary"

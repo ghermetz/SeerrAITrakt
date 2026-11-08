@@ -27,7 +27,6 @@ discoverSettingRoutes.post('/', async (req, res) => {
       existingSlider.enabled = slider.enabled;
       existingSlider.order = x;
 
-      // Only allow changes to the following when the slider is not built in
       if (!existingSlider.isBuiltIn) {
         existingSlider.title = slider.title;
         existingSlider.data = slider.data;
@@ -69,13 +68,13 @@ discoverSettingRoutes.post('/add', async (req, res) => {
   return res.json(newSlider);
 });
 
-discoverSettingRoutes.get('/reset', async (_req, res) => {
+discoverSettingRoutes.post('/reset', async (_req, res) => {
   const sliderRepository = getRepository(DiscoverSlider);
 
   await sliderRepository.clear();
   await DiscoverSlider.bootstrapSliders();
-  // The rows are new, so the ones people hid for themselves are gone; ids
-  // can come round again, and would hide the wrong rows.
+  // Clear hidden rows: the rows are recreated and a reused id would hide the
+  // wrong one.
   await getRepository(UserSettings)
     .createQueryBuilder()
     .update()
@@ -97,7 +96,6 @@ discoverSettingRoutes.put('/:sliderId', async (req, res, next) => {
       },
     });
 
-    // Only allow changes to the following when the slider is not built in
     if (!existingSlider.isBuiltIn) {
       existingSlider.title = slider.title;
       existingSlider.data = slider.data;

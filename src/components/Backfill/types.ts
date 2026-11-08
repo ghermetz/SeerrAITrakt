@@ -1,11 +1,11 @@
 import type { PlanSummary } from '@server/lib/backfill/plan';
 
 /*
- * What Backfill's admin API answers (server/routes/backfill.ts). The plan's
- * import paths and Prowlarr's links stay on the server.
+ * Backfill admin API response types (server/routes/backfill.ts). Import paths
+ * and Prowlarr links stay server-side.
  */
 
-export type TitleKind = 'series' | 'movie';
+export type TitleKind = 'series' | 'movie' | 'album';
 
 export type SeriesStatus =
   | 'stuck'
@@ -32,6 +32,8 @@ export interface Readiness {
   torrentClient?: string;
   usenetClient?: string;
   problem?: string;
+  /** Backfill also handles albums. */
+  music: boolean;
 }
 
 export interface SeriesView {
@@ -41,6 +43,9 @@ export interface SeriesView {
   arrId: number;
   tvdbId: number | null;
   tmdbId: number | null;
+  /** Album MusicBrainz id, for its page link. */
+  foreignId?: string | null;
+  artistName?: string | null;
   title: string;
   year: number | null;
   seriesType: string;
@@ -52,7 +57,7 @@ export interface SeriesView {
   lastArrSearchAt: string | null;
   lastSearchedAt: string | null;
   searchError: string | null;
-  /** When the agent looked on its own: it does that once per title. */
+  /** When the agent last ran unprompted; it does so once per title. */
   agentAutoRunAt?: string | null;
 }
 
@@ -70,8 +75,8 @@ export interface EntryView {
   action: 'fill' | 'upgrade' | 'skip' | 'reject';
   reason?: string;
   replaces: number;
-  /** Placed by the AI second opinion, with what it read in the name. */
-  matchedBy?: 'ai';
+  /** `ai` when placed by the AI second opinion; `why` holds its reading. */
+  matchedBy?: 'ai' | 'title';
   why?: string;
 }
 
@@ -95,7 +100,24 @@ export interface LogLine {
   at: string;
   kind: 'info' | 'ok' | 'warn' | 'error';
   message: string;
+  /** Repeat count and last time for a repeated line. */
+  count?: number;
+  lastAt?: string;
 }
+
+/**
+ * A failed download's follow-up. The agent stops after three failed
+ * replacements in a day or when its daily downloads are used up.
+ */
+export type JobFollowUp =
+  | 'replaced'
+  | 'searching'
+  | 'agent'
+  | 'offered'
+  | 'offeredAgain'
+  | 'none'
+  | 'gaveUp'
+  | 'limit';
 
 export interface JobView {
   id: number;
@@ -116,7 +138,14 @@ export interface JobView {
   rejected: number;
   fileCount: number;
   error: string | null;
+  /** Retry time while waiting on the indexer's download limit. */
+  retryAt: string | null;
   approvedByName: string | null;
+  /** After a failure: the follow-up and the replacing download. */
+  followUp: JobFollowUp | null;
+  replacedById: number | null;
+  /** Agent run that started it. */
+  agentRunId: number | null;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
@@ -167,12 +196,14 @@ export interface Overview {
   awaiting: (CandidateView & { series?: SeriesView })[];
 }
 
-/** What Backfill has for one title, as its media page asks. */
+/** Backfill lookup for one title's media page. */
 export type TitleLookup = SeriesView & {
   readyCount: number;
-  /** The first of `jobs`. */
+  /** Agent run currently working on it. */
+  workingRunId?: number | null;
+  /** First of `jobs`. */
   job?: JobView;
-  /** Every download running for it, oldest first. */
+  /** Running downloads, oldest first. */
   jobs: JobView[];
 };
 
@@ -209,6 +240,20 @@ export interface SeriesDetail {
     names: string[];
     available: boolean;
     file?: { quality: string; score?: number; belowCutoff?: boolean };
+  };
+  album?: {
+    title: string;
+    artist: string;
+    profile: string;
+    minFormatScore: number;
+    names: string[];
+    tracks: {
+      id: number;
+      number?: number;
+      title: string;
+      state: 'missing' | 'onDisk';
+      quality?: string;
+    }[];
   };
   arrError?: string;
   candidates: CandidateView[];

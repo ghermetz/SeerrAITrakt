@@ -2,6 +2,7 @@ import Alert from '@app/components/Common/Alert';
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import PageTitle from '@app/components/Common/PageTitle';
+import SaveBar from '@app/components/Common/SaveBar';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
 import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
@@ -21,7 +22,7 @@ const messages = defineMessages(
   'components.UserProfile.UserSettings.UserPasswordChange',
   {
     localPasswordDescription:
-      'This password is used for signing in with the {applicationTitle} local login form. It is separate from your media server password.',
+      'For signing in with email and password, separate from your media server password.',
     password: 'Password',
     currentpassword: 'Current Password',
     newpassword: 'New Password',
@@ -29,17 +30,16 @@ const messages = defineMessages(
     toastSettingsSuccess: 'Password saved successfully!',
     toastSettingsFailure: 'Something went wrong while saving the password.',
     toastSettingsFailureVerifyCurrent:
-      'Something went wrong while saving the password. Was your current password entered correctly?',
+      'Couldn’t save the password. Was your current password right?',
     validationCurrentPassword: 'You must provide your current password',
     validationNewPassword: 'You must provide a new password',
-    validationNewPasswordLength:
-      'Password is too short; should be a minimum of 8 characters',
+    validationNewPasswordLength: 'Use at least 8 characters',
     validationConfirmPassword: 'You must confirm the new password',
     validationConfirmPasswordSame: 'Passwords must match',
     noPasswordSet:
-      'This user account currently does not have a password set. Configure a password below to enable this account to sign in as a "local user."',
+      'This account has no password. Set one below to let it sign in with email and password.',
     noPasswordSetOwnAccount:
-      'Your account currently does not have a password set. Configure a password below to enable sign-in as a "local user" using your email address.',
+      'Your account has no password. Set one below to sign in with your email and password.',
     nopermissionDescription:
       "You do not have permission to modify this user's password.",
   }
@@ -238,7 +238,7 @@ const UserPasswordChange = () => {
                     )}
                 </div>
               </div>
-              <div className="actions">
+              <SaveBar>
                 <div className="flex justify-end">
                   <span className="ml-3 inline-flex rounded-md shadow-sm">
                     <Button
@@ -255,7 +255,7 @@ const UserPasswordChange = () => {
                     </Button>
                   </span>
                 </div>
-              </div>
+              </SaveBar>
             </Form>
           );
         }}

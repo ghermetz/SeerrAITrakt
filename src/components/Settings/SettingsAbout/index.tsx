@@ -39,7 +39,7 @@ const messages = defineMessages('components.Settings.SettingsAbout', {
   uptodate: 'Up to Date',
   versionCheckDisabled: 'Version Check Disabled',
   runningDevelop:
-    'You are running the <code>develop</code> branch of Seerr AI, which is only recommended for those contributing to development or assisting with bleeding-edge testing.',
+    'You’re on the <code>develop</code> branch, meant only for development and testing.',
 });
 
 const SettingsAbout = () => {
@@ -167,7 +167,7 @@ const SettingsAbout = () => {
               href={PROJECT_DOCS_URL}
               target="_blank"
               rel="noreferrer"
-              className="text-indigo-500 transition duration-300 hover:underline"
+              className="text-accent-text transition duration-300 hover:underline"
             >
               {intl.formatMessage(messages.seerrAiGuide)}
             </a>
@@ -177,7 +177,7 @@ const SettingsAbout = () => {
               href="https://docs.seerr.dev"
               target="_blank"
               rel="noreferrer"
-              className="text-indigo-500 transition duration-300 hover:underline"
+              className="text-accent-text transition duration-300 hover:underline"
             >
               https://docs.seerr.dev
             </a>
@@ -187,7 +187,7 @@ const SettingsAbout = () => {
               href={`${PROJECT_URL}/issues`}
               target="_blank"
               rel="noreferrer"
-              className="text-indigo-500 transition duration-300 hover:underline"
+              className="text-accent-text transition duration-300 hover:underline"
             >
               {`${PROJECT_URL}/issues`}
             </a>
@@ -201,7 +201,7 @@ const SettingsAbout = () => {
               href="https://opencollective.com/seerr"
               target="_blank"
               rel="noreferrer"
-              className="text-indigo-500 transition duration-300 hover:underline"
+              className="text-accent-text transition duration-300 hover:underline"
             >
               https://opencollective.com/seerr
             </a>

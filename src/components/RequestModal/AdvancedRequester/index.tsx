@@ -17,6 +17,8 @@ import {
   Transition,
 } from '@headlessui/react';
 import { CheckIcon, ChevronDownIcon } from '@heroicons/react/24/solid';
+import { shownEmail } from '@server/constants/oidc';
+import { mappedFolder } from '@server/constants/requestDefaults';
 import type { SeriesType } from '@server/constants/seriesType';
 import type {
   ServiceCommonServer,
@@ -50,8 +52,8 @@ const messages = defineMessages('components.RequestModal.AdvancedRequester', {
   selecttags: 'Select tags',
   notagoptions: 'No tags.',
   ignoreQuotaTitle: 'Bypass User Quota',
-  ignoreQuotaDescription:
-    "This request will not count against the user's quota limits. Use with caution.",
+  ignoreQuotaDescription: 'Won’t count against the user’s quota.',
+  folderFromProfile: 'Set by the quality profile.',
 });
 
 export type RequestOverrides = {
@@ -68,15 +70,15 @@ interface AdvancedRequesterProps {
   type: 'movie' | 'tv';
   tmdbId?: number;
   is4k: boolean;
-  /** Whether anime detection says the title is anime. */
+  /** Anime detection's verdict. */
   isAnime?: boolean;
-  /** The title's own anime setting, which stands over rules and detection. */
+  /** The title's anime setting; overrides rules and detection. */
   animeSetting?: boolean | null;
-  /** The type already on the request being edited. */
+  /** Series type of the request being edited. */
   requestSeriesType?: SeriesType | null;
-  /** Anime or not as ticked in the dialog; null while left be. */
+  /** The dialog's Anime tick; null while untouched. */
   animeChoice?: boolean | null;
-  /** Told a matching rule's series type, which the dialog's tick starts from. */
+  /** Receives a matching rule's series type, which seeds the dialog's tick. */
   onRuleSeriesType?: (seriesType: SeriesType | null) => void;
   defaultOverrides?: RequestOverrides;
   requestUser?: User;
@@ -135,9 +137,8 @@ const AdvancedRequester = ({
   const [ignoreQuota, setIgnoreQuota] = useState<boolean>(
     defaultOverrides?.ignoreQuota ?? false
   );
-  // Whether it goes as anime, as the dialog's Anime tick shows it (see
-  // AnimeChoice): the tick, else the request's own type when editing, the
-  // title's setting, a matching rule, then detection.
+  // Same precedence as AnimeChoice: tick, edited request's type, title
+  // setting, matching rule, detection.
   const [ruleSeriesType, setRuleSeriesType] = useState<SeriesType | null>(null);
   const anime =
     animeChoice ??
@@ -145,8 +146,8 @@ const AdvancedRequester = ({
       ? requestSeriesType === 'anime'
       : (animeSetting ??
         (ruleSeriesType ? ruleSeriesType === 'anime' : isAnime)));
-  // A series always takes the anime tags; a movie only when there are any,
-  // as it is sent (lib/radarrRouting).
+  // Movies fall back to standard tags when there are no anime ones, matching
+  // lib/radarrRouting.
   const kindTags = (server: ServiceCommonServer, value: boolean) =>
     value && (type === 'tv' || server.activeAnimeTags?.length)
       ? server.activeAnimeTags
@@ -156,12 +157,21 @@ const AdvancedRequester = ({
     currentHasPermission([Permission.MANAGE_REQUESTS]) &&
     ((type === 'movie' ? quota?.movie.limit : quota?.tv.limit) ?? 0) > 0;
 
+  const [selectedUser, setSelectedUser] = useState<User | null>(
+    requestUser ?? null
+  );
+  const selectedUserId = selectedUser?.id;
+  // Read for the person the request is for, with their saved profiles.
+  const profileUserId = selectedUserId ?? requestUser?.id ?? currentUser?.id;
+
   const { data: serverData, isValidating } =
     useSWR<ServiceCommonServerWithDetails>(
       selectedServer !== null
         ? `/api/v1/service/${
             type === 'movie' ? 'radarr' : 'sonarr'
-          }/${selectedServer}`
+          }/${selectedServer}${
+            profileUserId !== undefined ? `?requestUser=${profileUserId}` : ''
+          }`
         : null,
       {
         refreshInterval: 0,
@@ -169,11 +179,39 @@ const AdvancedRequester = ({
         revalidateOnFocus: false,
       }
     );
+  const managesRequests = currentHasPermission(Permission.MANAGE_REQUESTS);
 
-  const [selectedUser, setSelectedUser] = useState<User | null>(
-    requestUser ?? null
-  );
-  const selectedUserId = selectedUser?.id;
+  /**
+   * The profile for anime or not: the request user's saved one where the
+   * server still has it, else the server's.
+   */
+  const kindProfile = (
+    details: ServiceCommonServerWithDetails,
+    value: boolean
+  ): number => {
+    const saved = value ? details.savedAnimeProfileId : details.savedProfileId;
+    if (saved && details.profiles.some((p) => p.id === saved)) {
+      return saved;
+    }
+    return value && details.server.activeAnimeProfileId
+      ? details.server.activeAnimeProfileId
+      : details.server.activeProfileId;
+  };
+
+  /** The folder a profile maps to, if the server has that folder. */
+  const profileFolder = (
+    details: ServiceCommonServerWithDetails | undefined,
+    profileId: number
+  ): string | undefined => {
+    const mapped = mappedFolder(details?.server, profileId);
+    return mapped && details?.rootFolders.some((f) => f.path === mapped)
+      ? mapped
+      : undefined;
+  };
+  // Someone who doesn't manage requests gets a mapped profile's folder.
+  const lockedFolder = managesRequests
+    ? undefined
+    : profileFolder(serverData, selectedProfile);
   const previousSelectedUserIdRef = useRef<number | undefined>(selectedUserId);
 
   const { data: userData } = useSWR<UserResultsResponse>(
@@ -239,18 +277,15 @@ const AdvancedRequester = ({
   useEffect(() => {
     if (serverData) {
       const defaultProfile = serverData.profiles.find(
-        (profile) =>
-          profile.id ===
-          (anime && serverData.server.activeAnimeProfileId
-            ? serverData.server.activeAnimeProfileId
-            : serverData.server.activeProfileId)
+        (profile) => profile.id === kindProfile(serverData, anime)
       );
       const defaultFolder = serverData.rootFolders.find(
         (folder) =>
           folder.path ===
-          (anime && serverData.server.activeAnimeDirectory
-            ? serverData.server.activeAnimeDirectory
-            : serverData.server.activeDirectory)
+          ((defaultProfile && profileFolder(serverData, defaultProfile.id)) ??
+            (anime && serverData.server.activeAnimeDirectory
+              ? serverData.server.activeAnimeDirectory
+              : serverData.server.activeDirectory))
       );
       const defaultLanguage = serverData.languageProfiles?.find(
         (language) =>
@@ -333,23 +368,18 @@ const AdvancedRequester = ({
     defaultOverrides?.ignoreQuota,
   ]);
 
-  /**
-   * Starts the request from that kind of title's folder, profiles and tags:
-   * the server's anime ones, where it has them, or its standard ones.
-   */
+  /** Applies the server's anime (where set) or standard folder, profiles, tags. */
   const applyKindDefaults = (value: boolean) => {
     if (!serverData) {
       return;
     }
     const server = serverData.server;
-    const profile =
-      value && server.activeAnimeProfileId
-        ? server.activeAnimeProfileId
-        : server.activeProfileId;
+    const profile = kindProfile(serverData, value);
     const folder =
-      value && server.activeAnimeDirectory
+      profileFolder(serverData, profile) ??
+      (value && server.activeAnimeDirectory
         ? server.activeAnimeDirectory
-        : server.activeDirectory;
+        : server.activeDirectory);
     const language =
       value && server.activeAnimeLanguageProfileId
         ? server.activeAnimeLanguageProfileId
@@ -369,8 +399,7 @@ const AdvancedRequester = ({
     setSelectedTags(kindTags(server, value) ?? []);
   };
 
-  // Ticking or unticking Anime starts from that kind's folder, profiles and
-  // tags; they can still be changed after.
+  // Re-apply kind defaults when the Anime tick changes.
   const previousChoice = useRef(animeChoice);
   useEffect(() => {
     if (previousChoice.current === animeChoice) {
@@ -379,6 +408,24 @@ const AdvancedRequester = ({
     previousChoice.current = animeChoice;
     applyKindDefaults(anime);
   }, [animeChoice]);
+
+  // A profile mapped to a folder takes it along. An edited request's own
+  // folder stays until its profile changes.
+  const profileSeen = useRef<number | null>(null);
+  useEffect(() => {
+    if (!serverData || selectedProfile === -1) {
+      return;
+    }
+    const first = profileSeen.current === null;
+    profileSeen.current = selectedProfile;
+    if (first && defaultOverrides?.folder) {
+      return;
+    }
+    const mapped = profileFolder(serverData, selectedProfile);
+    if (mapped) {
+      setSelectedFolder(mapped);
+    }
+  }, [selectedProfile, serverData]);
 
   useEffect(() => {
     const selectedUserChanged =
@@ -393,7 +440,8 @@ const AdvancedRequester = ({
   useEffect(() => {
     if (selectedServer !== null || selectedUser) {
       onChange({
-        folder: selectedFolder !== '' ? selectedFolder : undefined,
+        folder:
+          lockedFolder ?? (selectedFolder !== '' ? selectedFolder : undefined),
         profile: selectedProfile !== -1 ? selectedProfile : undefined,
         server: selectedServer ?? undefined,
         user: selectedUser ?? undefined,
@@ -404,6 +452,7 @@ const AdvancedRequester = ({
     }
   }, [
     selectedFolder,
+    lockedFolder,
     selectedServer,
     selectedProfile,
     selectedUser,
@@ -429,14 +478,20 @@ const AdvancedRequester = ({
               tags: selectedTags.length > 0 ? selectedTags : undefined,
               serviceId: selectedServer ?? undefined,
               requestId: requestId ?? undefined,
+              // Match rules against the series type as it will be sent.
+              seriesType:
+                animeChoice === null
+                  ? (requestSeriesType ?? undefined)
+                  : animeChoice
+                    ? 'anime'
+                    : 'standard',
             }
           );
           if (cancelled) {
             return;
           }
-          // A rule that makes this anime (or not) against detection starts
-          // from that kind's settings; its own folder, profile and tags
-          // then apply on top.
+          // A rule overriding detection applies that kind's defaults first;
+          // the rule's own folder, profile and tags go on top.
           setRuleSeriesType(override.seriesType ?? null);
           onRuleSeriesType?.(override.seriesType ?? null);
           if (
@@ -448,7 +503,12 @@ const AdvancedRequester = ({
           ) {
             applyKindDefaults(override.seriesType === 'anime');
           }
-          if (!defaultOverrides?.folder && override.rootFolder) {
+          // A rule's folder gives way to a mapped profile's.
+          if (
+            !defaultOverrides?.folder &&
+            override.rootFolder &&
+            !profileFolder(serverData, override.profileId ?? selectedProfile)
+          ) {
             setSelectedFolder(override.rootFolder);
           }
           if (!defaultOverrides?.profile && override.profileId) {
@@ -487,6 +547,9 @@ const AdvancedRequester = ({
     defaultOverrides?.folder,
     defaultOverrides?.profile,
     defaultOverrides?.tags,
+    // A different tick can match a different rule.
+    animeChoice,
+    requestSeriesType,
   ]);
 
   if (!data && !error) {
@@ -610,11 +673,14 @@ const AdvancedRequester = ({
                 <select
                   id="folder"
                   name="folder"
-                  value={selectedFolder}
+                  value={lockedFolder ?? selectedFolder}
                   onChange={(e) => setSelectedFolder(e.target.value)}
                   onBlur={(e) => setSelectedFolder(e.target.value)}
                   className="border-gray-700 bg-gray-800"
-                  disabled={isValidating || !serverData}
+                  disabled={isValidating || !serverData || !!lockedFolder}
+                  aria-describedby={
+                    lockedFolder ? 'folder-from-profile' : undefined
+                  }
                 >
                   {(isValidating || !serverData) && (
                     <option value="">
@@ -651,6 +717,14 @@ const AdvancedRequester = ({
                       </option>
                     ))}
                 </select>
+                {lockedFolder && (
+                  <p
+                    id="folder-from-profile"
+                    className="mt-1 text-sm text-gray-400"
+                  >
+                    {intl.formatMessage(messages.folderFromProfile)}
+                  </p>
+                )}
               </div>
             )}
             {type === 'tv' &&
@@ -789,7 +863,7 @@ const AdvancedRequester = ({
                   <Label>{intl.formatMessage(messages.requestas)}</Label>
                   <div className="relative">
                     <span className="inline-block w-full rounded-md shadow-sm">
-                      <ListboxButton className="focus:shadow-outline-blue relative w-full cursor-default rounded-md border border-gray-700 bg-gray-800 py-2 pl-3 pr-10 text-left text-white transition duration-150 ease-in-out focus:border-blue-300 focus:outline-none sm:text-sm sm:leading-5">
+                      <ListboxButton className="focus:shadow-outline-blue relative w-full cursor-default rounded-md border border-gray-700 bg-gray-800 py-2 pl-3 pr-10 text-left text-strong transition duration-150 ease-in-out focus:border-blue-300 focus:outline-none sm:text-sm sm:leading-5">
                         <span className="flex items-center">
                           <CachedImage
                             type="avatar"
@@ -802,8 +876,10 @@ const AdvancedRequester = ({
                           <span className="ml-3 block">
                             {selectedUser.displayName}
                           </span>
-                          {selectedUser.displayName.toLowerCase() !==
-                            selectedUser.email && (
+                          {shownEmail(
+                            selectedUser.displayName,
+                            selectedUser.email
+                          ) && (
                             <span className="ml-1 truncate text-gray-400">
                               ({selectedUser.email})
                             </span>
@@ -836,7 +912,7 @@ const AdvancedRequester = ({
                               <div
                                 className={`${
                                   active
-                                    ? 'bg-indigo-600 text-white'
+                                    ? 'bg-accent text-on-accent'
                                     : 'text-gray-300'
                                 } relative cursor-default select-none py-2 pl-8 pr-4`}
                               >
@@ -856,9 +932,8 @@ const AdvancedRequester = ({
                                   <span className="ml-3 block flex-shrink-0">
                                     {user.displayName}
                                   </span>
-                                  {user.displayName.toLowerCase() !==
-                                    user.email && (
-                                    <span className="ml-1 truncate text-gray-400">
+                                  {shownEmail(user.displayName, user.email) && (
+                                    <span className="ml-1 min-w-0 text-gray-400 [overflow-wrap:anywhere]">
                                       ({user.email})
                                     </span>
                                   )}
@@ -866,7 +941,9 @@ const AdvancedRequester = ({
                                 {selected && (
                                   <span
                                     className={`${
-                                      active ? 'text-white' : 'text-indigo-600'
+                                      active
+                                        ? 'text-on-accent'
+                                        : 'text-indigo-600'
                                     } absolute inset-y-0 left-0 flex items-center pl-1.5`}
                                   >
                                     <CheckIcon className="h-5 w-5" />

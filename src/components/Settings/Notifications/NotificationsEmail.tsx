@@ -1,5 +1,6 @@
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
+import SaveBar from '@app/components/Common/SaveBar';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
 import SettingsBadge from '@app/components/Settings/SettingsBadge';
 import useToasts from '@app/hooks/useToasts';
@@ -21,7 +22,7 @@ const messages = defineMessages('components.Settings.Notifications', {
   embedPoster: 'Embed Poster',
   usePublicLogo: 'Use public Seerr AI logo instead of instance logo',
   usePublicLogoTip:
-    'If your Seerr AI instance is not publicly accessible, enable this option so email clients outside your network can display the image. The image will be pulled from the public GitHub repository.',
+    'Turn on if Seerr AI isn’t public, so emails can show the logo. It’s loaded from GitHub.',
   userEmailRequired: 'Require user email',
   emailsender: 'Sender Address',
   smtpHost: 'SMTP Host',
@@ -518,7 +519,7 @@ const NotificationsEmail = () => {
                   )}
               </div>
             </div>
-            <div className="actions">
+            <SaveBar>
               <div className="flex justify-end">
                 <span className="ml-3 inline-flex rounded-md shadow-sm">
                   <Button
@@ -552,7 +553,7 @@ const NotificationsEmail = () => {
                   </Button>
                 </span>
               </div>
-            </div>
+            </SaveBar>
           </Form>
         );
       }}

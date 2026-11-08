@@ -11,10 +11,10 @@ const messages = defineMessages(
   {
     title: 'Blocked release groups',
     description:
-      'Releases from these groups are never taken: Backfill and the admin agent pass over them, and Radarr and Sonarr get a custom format, "Seerr AI: blocked release groups", that every quality profile scores too low to accept. A file already there from one of them is replaced by the next good release, once that has imported. Changes apply straight away.',
+      'Releases from these groups are never taken, by Backfill, the agent, Radarr or Sonarr. Existing files from them are replaced.',
     none: 'No groups are blocked.',
     group: 'Release group',
-    placeholder: 'As in release names, like rothebehap',
+    placeholder: 'As in release names, like quillowsap',
     add: 'Block',
     adding: 'Blocking…',
     remove: 'Unblock {group}',
@@ -31,10 +31,9 @@ const messages = defineMessages(
 const GROUP_NAME = /^[\w][\w.\- ]{0,59}$/;
 
 /**
- * The blocked release groups, changed one at a time: each change is saved
- * and sent to Radarr and Sonarr at once, apart from the form's Save. The
- * list is kept here, from each answer, so the settings form above is not
- * reloaded under unsaved edits.
+ * Blocked release groups, changed one at a time: each change is saved and sent
+ * to Radarr and Sonarr at once, apart from the form's Save. The list is kept
+ * here from each response, so the form above isn't reloaded over unsaved edits.
  */
 const BlockedGroups = ({ initial }: { initial: string[] }) => {
   const intl = useIntl();
@@ -96,7 +95,7 @@ const BlockedGroups = ({ initial }: { initial: string[] }) => {
                 key={group}
                 className="flex items-center gap-1 rounded-full bg-gray-700 py-1 pl-3 pr-1 text-sm text-gray-100 ring-1 ring-gray-600"
               >
-                <NoSymbolIcon className="h-4 w-4 flex-none text-red-400" />
+                <NoSymbolIcon className="h-4 w-4 flex-none text-red-400 light:text-danger-text" />
                 <span className="break-all">{group}</span>
                 <button
                   type="button"
@@ -104,7 +103,7 @@ const BlockedGroups = ({ initial }: { initial: string[] }) => {
                   onClick={() => void change(group, false)}
                   aria-label={intl.formatMessage(messages.remove, { group })}
                   title={intl.formatMessage(messages.remove, { group })}
-                  className="rounded-full p-1 text-gray-400 hover:bg-gray-600 hover:text-white disabled:opacity-50"
+                  className="rounded-full p-1 text-gray-400 hover:bg-gray-600 hover:text-strong disabled:opacity-50"
                 >
                   <XMarkIcon className="h-4 w-4" />
                 </button>
@@ -138,7 +137,7 @@ const BlockedGroups = ({ initial }: { initial: string[] }) => {
               placeholder={intl.formatMessage(messages.placeholder)}
             />
             {typed && !valid && (
-              <p className="mt-1 text-sm text-red-400">
+              <p className="mt-1 text-sm text-red-400 light:text-danger-text">
                 {intl.formatMessage(messages.invalid)}
               </p>
             )}

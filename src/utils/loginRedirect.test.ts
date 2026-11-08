@@ -5,10 +5,12 @@ import { loginUrl, safeRedirect } from './loginRedirect';
 describe('safeRedirect', () => {
   it('keeps a page on this site, with its query and anchor', () => {
     for (const path of [
-      '/tv/259140',
+      '/tv/361251',
       '/discover/movies?genre=28&sortBy=popularity.desc',
-      '/movie/438148#cast',
+      '/movie/549263#cast',
       '/collection/10',
+      // An AI chat fix link, which the chat follows through here.
+      '/backfill/agent/12',
     ]) {
       assert.equal(safeRedirect(path), path);
     }

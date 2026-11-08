@@ -1,34 +1,51 @@
 import AgentRun from '@server/entity/AgentRun';
 import AiSpend from '@server/entity/AiSpend';
 import AiUsage from '@server/entity/AiUsage';
+import AlbumRequest from '@server/entity/AlbumRequest';
+import AutoFixMark from '@server/entity/AutoFixMark';
 import BackfillCandidate from '@server/entity/BackfillCandidate';
 import BackfillJob from '@server/entity/BackfillJob';
 import BackfillSeries from '@server/entity/BackfillSeries';
 import { Blocklist } from '@server/entity/Blocklist';
 import DiscoverSlider from '@server/entity/DiscoverSlider';
+import DownloadCheck from '@server/entity/DownloadCheck';
 import Episode from '@server/entity/Episode';
 import EpisodeRequest from '@server/entity/EpisodeRequest';
 import FutureSeasonSubscription from '@server/entity/FutureSeasonSubscription';
 import Issue from '@server/entity/Issue';
 import IssueComment from '@server/entity/IssueComment';
+import LibraryAccessChange from '@server/entity/LibraryAccessChange';
+import { MatchProblem, MatchWatch } from '@server/entity/MatchWatch';
 import Media from '@server/entity/Media';
 import MediaDeletion from '@server/entity/MediaDeletion';
 import MediaEvent from '@server/entity/MediaEvent';
+import MediaLibraryItem from '@server/entity/MediaLibraryItem';
 import {
   MediaList,
   MediaListItem,
   MediaListMember,
+  MediaListSong,
   MediaListWatchSuggestion,
 } from '@server/entity/MediaList';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { MediaRequestWatcher } from '@server/entity/MediaRequestWatcher';
+import MusicAlbum from '@server/entity/MusicAlbum';
+import MusicMetadata from '@server/entity/MusicMetadata';
 import { NotificationDelivery } from '@server/entity/NotificationDelivery';
+import OidcLink from '@server/entity/OidcLink';
 import OverrideRule from '@server/entity/OverrideRule';
+import QualityApply from '@server/entity/QualityApply';
+import QualityGrabNote from '@server/entity/QualityGrabNote';
+import QualityManaged from '@server/entity/QualityManaged';
+import QualityStepDown from '@server/entity/QualityStepDown';
 import RemovedPlexAccount from '@server/entity/RemovedPlexAccount';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { Session } from '@server/entity/Session';
+import SongFetch from '@server/entity/SongFetch';
+import SongRequest from '@server/entity/SongRequest';
 import { User } from '@server/entity/User';
+import UserApiKey from '@server/entity/UserApiKey';
 import UserPasskey from '@server/entity/UserPasskey';
 import { UserPushSubscription } from '@server/entity/UserPushSubscription';
 import { UserSettings } from '@server/entity/UserSettings';
@@ -51,32 +68,50 @@ const entities = [
   AgentRun,
   AiSpend,
   AiUsage,
+  AlbumRequest,
+  AutoFixMark,
   BackfillCandidate,
   BackfillJob,
   BackfillSeries,
   Blocklist,
   DiscoverSlider,
+  DownloadCheck,
   Issue,
   IssueComment,
   Episode,
   EpisodeRequest,
   FutureSeasonSubscription,
+  MatchProblem,
+  MatchWatch,
   Media,
   MediaDeletion,
   MediaEvent,
+  MediaLibraryItem,
   MediaList,
   MediaListItem,
+  MediaListSong,
   MediaListMember,
   MediaListWatchSuggestion,
   MediaRequest,
   MediaRequestWatcher,
+  LibraryAccessChange,
+  MusicAlbum,
+  MusicMetadata,
   NotificationDelivery,
+  OidcLink,
   OverrideRule,
+  QualityApply,
+  QualityGrabNote,
+  QualityManaged,
+  QualityStepDown,
   RemovedPlexAccount,
   Season,
   SeasonRequest,
   Session,
+  SongFetch,
+  SongRequest,
   User,
+  UserApiKey,
   UserPasskey,
   UserPushSubscription,
   UserSettings,
@@ -184,7 +219,8 @@ const postgresDevConfig: DataSourceOptions = {
   database: process.env.DB_NAME ?? 'seerr',
   ssl: buildSslConfig(),
   poolSize: intFromEnv('DB_POOL_SIZE', 25),
-  // Bounds pool acquisition waits so exhaustion surfaces as errors instead of a silent hang
+  // Bound pool acquisition waits so exhaustion errors instead of hanging
+  // silently.
   connectTimeoutMS: intFromEnv('DB_CONNECT_TIMEOUT_MS', 30000),
   synchronize: false,
   migrationsRun: true,
@@ -205,7 +241,8 @@ const postgresProdConfig: DataSourceOptions = {
   database: process.env.DB_NAME ?? 'seerr',
   ssl: buildSslConfig(),
   poolSize: intFromEnv('DB_POOL_SIZE', 25),
-  // Bounds pool acquisition waits so exhaustion surfaces as errors instead of a silent hang
+  // Bound pool acquisition waits so exhaustion errors instead of hanging
+  // silently.
   connectTimeoutMS: intFromEnv('DB_CONNECT_TIMEOUT_MS', 30000),
   synchronize: false,
   migrationsRun: false,
@@ -215,13 +252,10 @@ const postgresProdConfig: DataSourceOptions = {
   subscribers,
 };
 
-/*
- * Opt-in: DB_TYPE=postgres runs the suite against a real Postgres rather than
- * in-memory SQLite. Production runs Postgres; tests only ever ran SQLite, and
- * that gap let through a datetime column Postgres rejects and a watchlist
- * loop that reproduced cleanly on SQLite. Point DB_HOST and friends at a
- * disposable database — the schema is dropped on every run.
- */
+// Opt-in: DB_TYPE=postgres runs the suite against a real Postgres instead of
+// in-memory SQLite, since production runs Postgres and SQLite-only tests missed
+// Postgres-specific bugs. Point DB_HOST etc. at a disposable database: the
+// schema is dropped every run.
 const postgresTestConfig: DataSourceOptions = {
   type: 'postgres',
   host: process.env.DB_HOST ?? '127.0.0.1',
@@ -229,11 +263,11 @@ const postgresTestConfig: DataSourceOptions = {
   username: process.env.DB_USER,
   password: process.env.DB_PASS,
   database: process.env.DB_NAME ?? 'seerr_test',
-  // No idle reaping. The pool times out idle connections with setTimeout and
-  // cancels that on checkout with clearTimeout; a test that fakes timers can
-  // check a connection out with the fake clearTimeout, leaving the real
-  // timer to close it ten seconds later in the middle of another test. Idle
-  // connections instead just stop holding the test process open.
+  // No idle reaping. The pool expires idle connections with setTimeout and
+  // cancels it on checkout with clearTimeout; a test faking timers can check
+  // out with the fake clearTimeout, leaving the real timer to close the
+  // connection mid-test ten seconds later. Idle connections instead just don't
+  // hold the process open.
   extra: { idleTimeoutMillis: 0, allowExitOnIdle: true },
   synchronize: true,
   dropSchema: true,

@@ -3,17 +3,23 @@ import TheMovieDb, {
   MovieSortOptionsIterable,
   TvSortOptionsIterable,
 } from '@server/api/themoviedb';
+import {
+  ANIMATION_GENRE_ID,
+  ANIME_KEYWORD_ID,
+} from '@server/api/themoviedb/constants';
 import type { TmdbKeyword } from '@server/api/themoviedb/interfaces';
 import { MediaType } from '@server/constants/media';
+import { leftOutServices } from '@server/constants/streamingServices';
+import { watchlistSortOf } from '@server/constants/watchlistSort';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { User } from '@server/entity/User';
-import { Watchlist } from '@server/entity/Watchlist';
 import type {
   GenreSliderItem,
   WatchlistResponse,
 } from '@server/interfaces/api/discoverInterfaces';
 import { featureEnabled } from '@server/lib/features';
+import { savedWatchlistPage } from '@server/lib/savedWatchlist';
 import type { SearchKey } from '@server/lib/searchText';
 import { getSearchText } from '@server/lib/searchText';
 import { getSettings } from '@server/lib/settings';
@@ -27,6 +33,13 @@ import {
   mapTvResult,
 } from '@server/models/Search';
 import { mapNetwork } from '@server/models/Tv';
+import {
+  parseSeasonKey,
+  seasonDates,
+  seasonOf,
+} from '@server/utils/animeSeason';
+import type { AnimeSignals } from '@server/utils/isAnime';
+import { leftOutAsAnime } from '@server/utils/isAnime';
 import { isCollection, isMovie, isPerson } from '@server/utils/typeHelpers';
 import { Router } from 'express';
 import { sortBy } from 'lodash';
@@ -85,6 +98,7 @@ const QueryFilterOptions = z.object({
   voteCountLte: z.coerce.string().optional(),
   network: z.coerce.string().optional(),
   watchProviders: z.coerce.string().optional(),
+  excludeWatchProviders: z.coerce.string().optional(),
   watchRegion: z.coerce.string().optional(),
   status: z.coerce.string().optional(),
   certification: z.coerce.string().optional(),
@@ -95,6 +109,19 @@ const QueryFilterOptions = z.object({
 });
 
 export type FilterOptions = z.infer<typeof QueryFilterOptions>;
+
+/**
+ * Streaming services to exclude, in TMDB's format ("8|9"), or undefined. A
+ * service also chosen for inclusion stays included.
+ */
+const excludedServices = (query: FilterOptions): string | undefined => {
+  const ids = leftOutServices(
+    query.watchProviders,
+    query.excludeWatchProviders
+  );
+  return ids.length ? ids.join('|') : undefined;
+};
+
 const MovieApiQuerySchema = QueryFilterOptions.omit({
   certificationMode: true,
 }).extend({
@@ -136,6 +163,7 @@ discoverRoutes.get('/movies', async (req, res, next) => {
       voteCountGte: query.voteCountGte,
       voteCountLte: query.voteCountLte,
       watchProviders: query.watchProviders,
+      excludeWatchProviders: excludedServices(query),
       watchRegion: query.watchRegion,
       certification: query.certification,
       certificationGte: query.certificationGte,
@@ -448,6 +476,7 @@ discoverRoutes.get('/tv', async (req, res, next) => {
       voteCountGte: query.voteCountGte,
       voteCountLte: query.voteCountLte,
       watchProviders: query.watchProviders,
+      excludeWatchProviders: excludedServices(query),
       watchRegion: query.watchRegion,
       withStatus: query.status,
       certification: query.certification,
@@ -730,6 +759,159 @@ discoverRoutes.get('/tv/upcoming', async (req, res, next) => {
   }
 });
 
+/*
+ * Anime: series airing in a season, premiering in one, most popular, or films,
+ * optionally from one country. Matches Seerr's anime definition elsewhere
+ * (utils/isAnime), so every title listed is one Seerr would send to Sonarr or
+ * Radarr as anime: TMDB's anime tag from any country not excluded by an admin
+ * (unless in Japanese), plus untagged Japanese animation, since many series
+ * (especially new ones) lack the tag. TMDB can't query "tagged OR Japanese
+ * animation", so each page merges the same page of both queries. They never
+ * overlap, so nothing repeats or is missed, and the page count is the longer
+ * one's. Each page is sorted by popularity. Excluded-country titles are dropped
+ * from their page, so a page can have fewer than TMDB's 20 without being last.
+ * The person's region applies, as on every Discover page, but not their
+ * Discover Language: filtering to one language would drop most anime. People
+ * who don't want anime hide the row.
+ */
+discoverRoutes.get('/anime', async (req, res, next) => {
+  const tmdb = createTmdbWithRegionLanguage(req.user);
+  const show = (req.query.show as string | undefined) ?? 'airing';
+  const season = req.query.season
+    ? parseSeasonKey(req.query.season as string)
+    : seasonOf(new Date());
+
+  if (!season) {
+    return next({ status: 400, message: 'Unknown season.' });
+  }
+
+  const { start, end } = seasonDates(season);
+  const leaveOut = getSettings().main.animeExcludedCountries ?? [];
+  const common = {
+    page: Number(req.query.page) || 1,
+    language: req.locale,
+    sortBy: 'popularity.desc' as const,
+    originCountry: (req.query.country as string | undefined)?.toUpperCase(),
+  };
+  const tagged = {
+    ...common,
+    keywords: String(ANIME_KEYWORD_ID),
+    originalLanguage: 'all',
+  };
+  const untagged = {
+    ...common,
+    genre: String(ANIMATION_GENRE_ID),
+    originalLanguage: 'ja',
+    excludeKeywords: String(ANIME_KEYWORD_ID),
+  };
+  const pageOf = <T extends { popularity: number }>(
+    pages: { total_pages: number; total_results: number }[],
+    results: T[]
+  ) => ({
+    page: common.page,
+    totalPages: Math.max(...pages.map((one) => one.total_pages)),
+    totalResults: pages.reduce((sum, one) => sum + one.total_results, 0),
+    results: results.sort((a, b) => b.popularity - a.popularity),
+  });
+
+  try {
+    if (show === 'films') {
+      const pages = await Promise.all([
+        tmdb.getDiscoverMovies(tagged),
+        tmdb.getDiscoverMovies(untagged),
+      ]);
+      // TMDB lists don't include production country, so with a country
+      // excluded, tagged non-Japanese films are looked up. If lookup fails the
+      // film is kept, since TMDB tags it anime.
+      const kept = await Promise.all(
+        pages[0].results.map(async (result) => {
+          if (!leaveOut.length || result.original_language === 'ja') {
+            return [result];
+          }
+          const details: AnimeSignals | undefined = await tmdb
+            .getMovieForScan({ movieId: result.id })
+            .catch(() => undefined);
+          return details &&
+            leftOutAsAnime(
+              { ...details, original_language: result.original_language },
+              leaveOut
+            )
+            ? []
+            : [result];
+        })
+      );
+      const results = [...kept.flat(), ...pages[1].results];
+      const media = await Media.getRelatedMedia(
+        req.user,
+        results.map((result) => ({
+          tmdbId: result.id,
+          mediaType: MediaType.MOVIE,
+        })),
+        { includeActiveRequest: true }
+      );
+
+      const listed = pageOf(pages, results);
+      return res.status(200).json({
+        ...listed,
+        results: listed.results.flatMap((result) => {
+          const info = media.find(
+            (med) =>
+              med.tmdbId === result.id && med.mediaType === MediaType.MOVIE
+          );
+          // An admin marked this title not anime.
+          return info?.animeSetting === false
+            ? []
+            : [mapMovieResult(result, info)];
+        }),
+      });
+    }
+
+    const dates = {
+      ...(show === 'airing' && { airDateGte: start, airDateLte: end }),
+      ...(show === 'premieres' && {
+        firstAirDateGte: start,
+        firstAirDateLte: end,
+      }),
+    };
+    const pages = await Promise.all([
+      tmdb.getDiscoverTv({ ...tagged, ...dates }),
+      tmdb.getDiscoverTv({ ...untagged, ...dates }),
+    ]);
+    const results = [
+      ...pages[0].results.filter((result) => !leftOutAsAnime(result, leaveOut)),
+      ...pages[1].results,
+    ];
+    const media = await Media.getRelatedMedia(
+      req.user,
+      results.map((result) => ({
+        tmdbId: result.id,
+        mediaType: MediaType.TV,
+      })),
+      { includeActiveRequest: true }
+    );
+
+    const listed = pageOf(pages, results);
+    return res.status(200).json({
+      ...listed,
+      results: listed.results.flatMap((result) => {
+        const info = media.find(
+          (med) => med.tmdbId === result.id && med.mediaType === MediaType.TV
+        );
+        return info?.animeSetting === false ? [] : [mapTvResult(result, info)];
+      }),
+    });
+  } catch (e) {
+    logger.debug('Something went wrong retrieving anime', {
+      label: 'API',
+      errorMessage: e.message,
+    });
+    return next({
+      status: 500,
+      message: 'Unable to retrieve anime.',
+    });
+  }
+});
+
 discoverRoutes.get('/trending', async (req, res, next) => {
   const tmdb = createTmdbWithRegionLanguage(req.user);
 
@@ -784,11 +966,8 @@ discoverRoutes.get('/trending', async (req, res, next) => {
       totalPages: data.total_pages,
       totalResults: data.total_results,
       results: data.results.map((result) => {
-        // - If "type" is set (case: "movie" or "tv"), the mediaType must also match.
-        // - If "type" is not set (case: "all"), only filter by tmdbId.
         const selectedMedia = media.find(
-          (med) =>
-            med.tmdbId === result.id && (type ? med.mediaType === type : true)
+          (med) => med.tmdbId === result.id && (!type || med.mediaType === type)
         );
 
         return mapper(result, selectedMedia);
@@ -950,6 +1129,7 @@ discoverRoutes.get<Record<string, unknown>, WatchlistResponse>(
     const itemsPerPage = 20;
     const page = req.query.page ? Number(req.query.page) : 1;
     const offset = (page - 1) * itemsPerPage;
+    const sort = watchlistSortOf(req.query.sort);
 
     const activeUser = await userRepository.findOne({
       where: { id: req.user?.id },
@@ -957,16 +1137,13 @@ discoverRoutes.get<Record<string, unknown>, WatchlistResponse>(
     });
 
     if (activeUser && !activeUser?.plexToken) {
-      // Non-Plex users can only see their own watchlist
-      const [result, total] = await getRepository(Watchlist).findAndCount({
-        where: { requestedBy: { id: activeUser?.id } },
-        relations: {
-          /*requestedBy: true,media:true*/
-        },
-        // loadRelationIds: true,
-        take: itemsPerPage,
-        skip: offset,
-      });
+      // Non-Plex users see their saved watchlist.
+      const [result, total] = await savedWatchlistPage(
+        activeUser.id,
+        offset,
+        itemsPerPage,
+        sort
+      );
       if (total) {
         return res.json({
           page: page,
@@ -977,7 +1154,7 @@ discoverRoutes.get<Record<string, unknown>, WatchlistResponse>(
       }
     }
     if (!activeUser?.plexToken) {
-      // We will just return an empty array if the user has no Plex token
+      // No Plex token: empty list.
       return res.json({
         page: 1,
         totalPages: 1,
@@ -986,10 +1163,9 @@ discoverRoutes.get<Record<string, unknown>, WatchlistResponse>(
       });
     }
 
-    // List watchlist from Plex
     const plexTV = new PlexTvAPI(activeUser.plexToken);
 
-    const watchlist = await plexTV.getWatchlist({ offset });
+    const watchlist = await plexTV.getWatchlist({ offset, sort });
 
     return res.json({
       page,
@@ -1007,9 +1183,8 @@ discoverRoutes.get<Record<string, unknown>, WatchlistResponse>(
 );
 
 /**
- * Titles like the ones this person has been watching, from their watch
- * history. Empty, rather than an error, when there is nothing to go on, so
- * the row simply does not show.
+ * Titles like this person's recent watch history. Empty instead of an error
+ * when there's nothing to go on, so the row just doesn't show.
  */
 discoverRoutes.get('/suggested', async (req, res, next) => {
   const itemsPerPage = 20;
@@ -1073,12 +1248,11 @@ discoverRoutes.get('/suggested', async (req, res, next) => {
 });
 
 /**
- * What each title on a page of posters can be filtered by: names, cast and
- * characters, who made it, genres and keywords. Up to 60 titles a call, as
- * "movie:603,tv:1399".
+ * Filterable text for each title on a poster page: names, cast and characters,
+ * crew, genres and keywords. Up to 60 titles per call, as "movie:603,tv:1399".
  */
 discoverRoutes.get('/search-text', async (req, res, next) => {
-  // The validator may already have split the list; a plain string works too.
+  // The validator may have split the list already; a plain string works too.
   const raw = req.query.ids as unknown;
   const keys = (Array.isArray(raw) ? raw : String(raw ?? '').split(','))
     .map((key) => String(key).trim())

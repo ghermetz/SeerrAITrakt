@@ -7,18 +7,30 @@ import Badge from '@app/components/Common/Badge';
 import Button from '@app/components/Common/Button';
 import CachedImage from '@app/components/Common/CachedImage';
 import ConfirmButton from '@app/components/Common/ConfirmButton';
+import DeclineReason from '@app/components/DeclineReason';
+import DeclineRequestModal from '@app/components/DeclineRequestModal';
+import MusicRequestItem from '@app/components/Music/MusicRequest/MusicRequestItem';
+import OverQuotaBadge from '@app/components/OverQuotaBadge';
 import RequestEta, {
   describeEta,
   expectedLabel,
 } from '@app/components/RequestEta';
 import RequestModal from '@app/components/RequestModal';
+import RequestServerIssue from '@app/components/RequestServerIssue';
 import StatusBadge from '@app/components/StatusBadge';
-import useDeepLinks from '@app/hooks/useDeepLinks';
+import useNearScreen, {
+  bothRefs,
+  useLoadWhenNear,
+} from '@app/hooks/useNearScreen';
+import usePlayLinks from '@app/hooks/usePlayLinks';
+import useRequestAction from '@app/hooks/useRequestAction';
 import type { RequestEta as RequestEtaData } from '@app/hooks/useRequestEtas';
+import useRetryRequest from '@app/hooks/useRetryRequest';
 import useToasts from '@app/hooks/useToasts';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
+import { pictureLoading } from '@app/utils/nearScreen';
 import {
   getRequestDownloadStatus,
   refreshIntervalHelper,
@@ -31,7 +43,12 @@ import {
   TrashIcon,
   XMarkIcon,
 } from '@heroicons/react/24/solid';
-import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
+import type { VideoMediaType } from '@server/constants/media';
+import {
+  MediaRequestStatus,
+  MediaStatus,
+  MediaType,
+} from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { BackfillStatus } from '@server/interfaces/api/backfillStatus';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
@@ -40,7 +57,7 @@ import type { MovieDetails } from '@server/models/Movie';
 import type { TvDetails } from '@server/models/Tv';
 import axios from 'axios';
 import Link from 'next/link';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useInView } from 'react-intersection-observer';
 import { FormattedRelativeTime, useIntl } from 'react-intl';
 import useSWR, { mutate } from 'swr';
@@ -81,18 +98,15 @@ const RequestItemError = ({
   const intl = useIntl();
   const { hasPermission } = useUser();
 
-  const deleteRequest = async () => {
-    await axios.delete(`/api/v1/media/${requestData?.media.id}`);
-    revalidateList();
-    mutate('/api/v1/request/count');
-  };
+  const { run } = useRequestAction();
+  const deleteRequest = () =>
+    run(async () => {
+      await axios.delete(`/api/v1/media/${requestData?.media.id}`);
+      revalidateList();
+      mutate('/api/v1/request/count');
+    }, messages.failedmodify);
 
-  const { mediaUrl: plexUrl, mediaUrl4k: plexUrl4k } = useDeepLinks({
-    mediaUrl: requestData?.media?.mediaUrl,
-    mediaUrl4k: requestData?.media?.mediaUrl4k,
-    iOSPlexUrl: requestData?.media?.iOSPlexUrl,
-    iOSPlexUrl4k: requestData?.media?.iOSPlexUrl4k,
-  });
+  const { playLink, playLink4k } = usePlayLinks(requestData?.media);
 
   const requestDownloadStatus = getRequestDownloadStatus(
     requestData?.media?.[
@@ -104,10 +118,10 @@ const RequestItemError = ({
   );
 
   return (
-    <div className="flex h-64 w-full flex-col justify-center rounded-xl bg-gray-800 py-4 text-gray-400 shadow-md ring-1 ring-red-500 xl:h-28 xl:flex-row">
+    <div className="flex min-h-64 w-full flex-col justify-center rounded-xl bg-gray-800 py-4 text-gray-400 shadow-md ring-1 ring-red-500 xl:h-28 xl:min-h-0 xl:flex-row">
       <div className="flex w-full flex-col justify-between overflow-hidden sm:flex-row">
         <div className="flex w-full flex-col justify-center overflow-hidden pl-4 pr-4 sm:pr-0 xl:w-7/12 2xl:w-2/3">
-          <div className="flex text-lg font-bold text-white xl:text-xl">
+          <div className="flex text-lg font-bold text-strong xl:text-xl">
             {intl.formatMessage(messages.mediaerror, {
               mediaType: intl.formatMessage(
                 requestData?.type
@@ -166,8 +180,8 @@ const RequestItemError = ({
                     title={intl.formatMessage(messages.unknowntitle)}
                     inProgress={requestDownloadStatus.length > 0}
                     is4k={requestData.is4k}
-                    mediaType={requestData.type}
-                    plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
+                    mediaType={requestData.type as VideoMediaType}
+                    playLink={requestData.is4k ? playLink4k : playLink}
                     serviceUrl={
                       requestData.is4k
                         ? requestData.media.serviceUrl4k
@@ -185,7 +199,7 @@ const RequestItemError = ({
                     <span className="card-field-name">
                       {intl.formatMessage(messages.requested)}
                     </span>
-                    <span className="flex truncate text-sm text-gray-300">
+                    <span className="flex min-w-0 flex-wrap text-sm text-gray-300 xl:flex-nowrap xl:truncate">
                       {intl.formatMessage(messages.modifieduserdate, {
                         date: (
                           <FormattedRelativeTime
@@ -201,7 +215,7 @@ const RequestItemError = ({
                         user: (
                           <Link
                             href={`/users/${requestData.requestedBy.id}`}
-                            className="group flex items-center truncate"
+                            className="group flex min-w-0 items-center xl:truncate"
                           >
                             <span className="avatar-sm ml-1.5">
                               <CachedImage
@@ -213,7 +227,7 @@ const RequestItemError = ({
                                 height={20}
                               />
                             </span>
-                            <span className="truncate text-sm group-hover:underline">
+                            <span className="min-w-0 break-words text-sm group-hover:underline xl:truncate">
                               {requestData.requestedBy.displayName}
                             </span>
                           </Link>
@@ -226,7 +240,7 @@ const RequestItemError = ({
                     <span className="card-field-name">
                       {intl.formatMessage(messages.requesteddate)}
                     </span>
-                    <span className="flex truncate text-sm text-gray-300">
+                    <span className="flex min-w-0 text-sm text-gray-300 xl:truncate">
                       <FormattedRelativeTime
                         value={Math.floor(
                           (new Date(requestData.createdAt).getTime() -
@@ -245,7 +259,7 @@ const RequestItemError = ({
                   <span className="card-field-name">
                     {intl.formatMessage(messages.modified)}
                   </span>
-                  <span className="flex truncate text-sm text-gray-300">
+                  <span className="flex min-w-0 flex-wrap text-sm text-gray-300 xl:flex-nowrap xl:truncate">
                     {intl.formatMessage(messages.modifieduserdate, {
                       date: (
                         <FormattedRelativeTime
@@ -261,7 +275,7 @@ const RequestItemError = ({
                       user: (
                         <Link
                           href={`/users/${requestData.modifiedBy.id}`}
-                          className="group flex items-center truncate"
+                          className="group flex min-w-0 items-center xl:truncate"
                         >
                           <span className="avatar-sm ml-1.5">
                             <CachedImage
@@ -273,7 +287,7 @@ const RequestItemError = ({
                               height={20}
                             />
                           </span>
-                          <span className="truncate text-sm group-hover:underline">
+                          <span className="min-w-0 break-words text-sm group-hover:underline xl:truncate">
                             {requestData.modifiedBy.displayName}
                           </span>
                         </Link>
@@ -305,11 +319,11 @@ const RequestItemError = ({
 interface RequestItemProps {
   request: RequestResultsResponse['results'][number];
   revalidateList: () => void;
-  /** When it should arrive; fetched for the whole page by the list. */
+  /** Expected arrival; fetched for the whole page by the list. */
   eta?: RequestEtaData;
-  /** Backfill's state for a stuck title; admins only, fetched by the list. */
+  /** Backfill state for a stuck title; admins only, fetched by the list. */
   backfill?: BackfillLookup;
-  /** For the person who asked: Backfill looking for it, or downloading it. */
+  /** For the requester: whether Backfill is searching or downloading it. */
   backfillStatus?: BackfillStatus;
 }
 
@@ -320,16 +334,10 @@ const RequestItem = ({
   backfill,
   backfillStatus,
 }: RequestItemProps) => {
-  // On screen now, for checking on the request; on screen at any point, for
-  // loading the title, which then stays loaded.
-  const [seen, setSeen] = useState(false);
-  const { ref, inView } = useInView({
-    onChange: (visible) => {
-      if (visible) {
-        setSeen(true);
-      }
-    },
-  });
+  // `near` preloads the title and pictures; `inView` gates request polling.
+  const { ref: nearRef, near, nearness } = useNearScreen();
+  const { ref: viewRef, inView } = useInView();
+  const ref = useMemo(() => bothRefs(nearRef, viewRef), [nearRef, viewRef]);
   const { addToast } = useToasts();
   const intl = useIntl();
   const { user, hasPermission } = useUser();
@@ -338,15 +346,13 @@ const RequestItem = ({
     request.type === 'movie'
       ? `/api/v1/movie/${request.media.tmdbId}`
       : `/api/v1/tv/${request.media.tmdbId}`;
-  const { data: title, error } = useSWR<MovieDetails | TvDetails>(
-    seen ? url : null
-  );
+  const titleKey = useLoadWhenNear(url, near);
+  const { data: title, error } = useSWR<MovieDetails | TvDetails>(titleKey);
   const { data: requestData, mutate: revalidate } = useSWR<
     NonFunctionProperties<MediaRequest>
   >(`/api/v1/request/${request.id}`, {
     fallbackData: request,
-    // Only while it can be seen: a long list scrolled past is not asked
-    // about again until it comes back into view.
+    // Poll only while visible.
     refreshInterval: inView
       ? refreshIntervalHelper<NonFunctionProperties<MediaRequest>>(
           watchRequest,
@@ -355,15 +361,13 @@ const RequestItem = ({
       : 0,
   });
 
-  const [isRetrying, setRetrying] = useState(false);
-  const [updatingType, setUpdatingType] = useState<
-    'approve' | 'decline' | null
-  >(null);
+  const [isApproving, setIsApproving] = useState(false);
+  const [showDeclineModal, setShowDeclineModal] = useState(false);
 
-  const modifyRequest = async (type: 'approve' | 'decline') => {
-    setUpdatingType(type);
+  const approveRequest = async () => {
+    setIsApproving(true);
     try {
-      await axios.post(`/api/v1/request/${request.id}/${type}`);
+      await axios.post(`/api/v1/request/${request.id}/approve`);
       revalidate();
       revalidateList();
       mutate('/api/v1/request/count');
@@ -373,16 +377,17 @@ const RequestItem = ({
         appearance: 'error',
       });
     } finally {
-      setUpdatingType(null);
+      setIsApproving(false);
     }
   };
 
-  const deleteRequest = async () => {
-    await axios.delete(`/api/v1/request/${request.id}`);
-
-    revalidateList();
-    mutate('/api/v1/request/count');
-  };
+  const { run } = useRequestAction();
+  const deleteRequest = () =>
+    run(async () => {
+      await axios.delete(`/api/v1/request/${request.id}`);
+      revalidateList();
+      mutate('/api/v1/request/count');
+    }, messages.failedmodify);
 
   const deleteMediaFile = async () => {
     if (request.media) {
@@ -404,28 +409,13 @@ const RequestItem = ({
     }
   };
 
-  const retryRequest = async () => {
-    setRetrying(true);
+  const { retry: retryRequest, isRetrying } = useRetryRequest(
+    request,
+    revalidate,
+    messages.failedretry
+  );
 
-    try {
-      const result = await axios.post(`/api/v1/request/${request.id}/retry`);
-      revalidate(result.data);
-    } catch {
-      addToast(intl.formatMessage(messages.failedretry), {
-        autoDismiss: true,
-        appearance: 'error',
-      });
-    } finally {
-      setRetrying(false);
-    }
-  };
-
-  const { mediaUrl: plexUrl, mediaUrl4k: plexUrl4k } = useDeepLinks({
-    mediaUrl: requestData?.media?.mediaUrl,
-    mediaUrl4k: requestData?.media?.mediaUrl4k,
-    iOSPlexUrl: requestData?.media?.iOSPlexUrl,
-    iOSPlexUrl4k: requestData?.media?.iOSPlexUrl4k,
-  });
+  const { playLink, playLink4k } = usePlayLinks(requestData?.media);
 
   if (!title && !error) {
     return (
@@ -457,13 +447,27 @@ const RequestItem = ({
       <RequestModal
         show={showEditModal}
         tmdbId={request.media.tmdbId}
-        type={request.type}
+        // Music requests use MusicRequestItem, so this is a video type.
+        type={request.type as VideoMediaType}
         is4k={request.is4k}
-        editRequest={request}
+        // Latest copy: it may have failed since the list loaded.
+        editRequest={requestData}
         onCancel={() => setShowEditModal(false)}
         onComplete={() => {
+          revalidate();
           revalidateList();
           setShowEditModal(false);
+        }}
+      />
+      <DeclineRequestModal
+        show={showDeclineModal}
+        requests={[request]}
+        subTitle={isMovie(title) ? title.title : title.name}
+        onCancel={() => setShowDeclineModal(false)}
+        onComplete={() => {
+          setShowDeclineModal(false);
+          revalidate();
+          revalidateList();
         }}
       />
       <div
@@ -479,14 +483,9 @@ const RequestItem = ({
               style={{ width: '100%', height: '100%', objectFit: 'cover' }}
               fill
               sizes="(min-width: 1280px) 66vw, 100vw"
+              {...pictureLoading(nearness)}
             />
-            <div
-              className="absolute inset-0"
-              style={{
-                backgroundImage:
-                  'linear-gradient(90deg, rgba(31, 41, 55, 0.47) 0%, rgba(31, 41, 55, 1) 100%)',
-              }}
-            />
+            <div className="row-backdrop-fade absolute inset-y-0 -right-px left-0" />
           </div>
         )}
         <div className="relative flex w-full flex-col justify-between overflow-hidden sm:flex-row">
@@ -503,18 +502,19 @@ const RequestItem = ({
                 type="tmdb"
                 src={
                   title.posterPath
-                    ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${title.posterPath}`
+                    ? `https://image.tmdb.org/t/p/w300_and_h450_face${title.posterPath}`
                     : '/images/seerr_poster_not_found.png'
                 }
                 alt=""
                 sizes="100vw"
                 style={{ width: '100%', height: 'auto', objectFit: 'cover' }}
-                width={600}
-                height={900}
+                width={300}
+                height={450}
+                {...pictureLoading(nearness)}
               />
             </Link>
             <div className="flex flex-col justify-center overflow-hidden pl-2 xl:pl-4">
-              <div className="pt-0.5 text-xs font-medium text-white sm:pt-1">
+              <div className="pt-0.5 text-xs font-medium text-strong sm:pt-1">
                 {(isMovie(title)
                   ? title.releaseDate
                   : title.firstAirDate
@@ -526,7 +526,7 @@ const RequestItem = ({
                     ? `/movie/${requestData.media.tmdbId}`
                     : `/tv/${requestData.media.tmdbId}`
                 }
-                className="mr-2 min-w-0 truncate text-lg font-bold text-white hover:underline xl:text-xl"
+                className="mr-2 min-w-0 break-words text-lg font-bold text-strong hover:underline xl:truncate xl:text-xl"
               >
                 {isMovie(title) ? title.title : title.name}
               </Link>
@@ -558,9 +558,19 @@ const RequestItem = ({
                 {intl.formatMessage(globalMessages.status)}
               </span>
               {requestData.status === MediaRequestStatus.DECLINED ? (
-                <Badge badgeType="danger">
-                  {intl.formatMessage(globalMessages.declined)}
-                </Badge>
+                <>
+                  <Badge badgeType="danger">
+                    {intl.formatMessage(globalMessages.declined)}
+                  </Badge>
+                  {/* Inline beside the badge on xl; own wrapping row below. */}
+                  {requestData.declineReason && (
+                    <DeclineReason
+                      reason={requestData.declineReason}
+                      inline
+                      className="ml-2 hidden xl:block"
+                    />
+                  )}
+                </>
               ) : requestData.status === MediaRequestStatus.FAILED ? (
                 <Badge
                   badgeType="danger"
@@ -587,8 +597,8 @@ const RequestItem = ({
                   inProgress={requestDownloadStatus.length > 0}
                   is4k={requestData.is4k}
                   tmdbId={requestData.media.tmdbId}
-                  mediaType={requestData.type}
-                  plexUrl={requestData.is4k ? plexUrl4k : plexUrl}
+                  mediaType={requestData.type as VideoMediaType}
+                  playLink={requestData.is4k ? playLink4k : playLink}
                   serviceUrl={
                     requestData.is4k
                       ? requestData.media.serviceUrl4k
@@ -596,7 +606,16 @@ const RequestItem = ({
                   }
                 />
               )}
+              <OverQuotaBadge request={requestData} className="ml-2" />
             </div>
+            {requestData.status === MediaRequestStatus.DECLINED &&
+              requestData.declineReason && (
+                <DeclineReason
+                  reason={requestData.declineReason}
+                  className="py-0.5 sm:py-1 xl:hidden"
+                />
+              )}
+            <RequestServerIssue request={requestData} className="py-0.5" />
             {backfill && <BackfillRequestChip backfill={backfill} />}
             {backfillStatus && <BackfillStatusLine status={backfillStatus} />}
             {describeEta(intl, eta) && (
@@ -606,7 +625,7 @@ const RequestItem = ({
                 </span>
                 <RequestEta
                   eta={eta}
-                  className="truncate text-sm text-gray-300"
+                  className="min-w-0 break-words text-sm text-gray-300 xl:truncate"
                 />
               </div>
             )}
@@ -619,7 +638,7 @@ const RequestItem = ({
                   <span className="card-field-name">
                     {intl.formatMessage(messages.requested)}
                   </span>
-                  <span className="flex truncate text-sm text-gray-300">
+                  <span className="flex min-w-0 flex-wrap text-sm text-gray-300 xl:flex-nowrap xl:truncate">
                     {intl.formatMessage(messages.modifieduserdate, {
                       date: (
                         <FormattedRelativeTime
@@ -635,7 +654,7 @@ const RequestItem = ({
                       user: (
                         <Link
                           href={`/users/${requestData.requestedBy.id}`}
-                          className="group flex items-center truncate"
+                          className="group flex min-w-0 items-center xl:truncate"
                         >
                           <span className="avatar-sm ml-1.5">
                             <CachedImage
@@ -647,7 +666,7 @@ const RequestItem = ({
                               height={20}
                             />
                           </span>
-                          <span className="truncate text-sm font-semibold group-hover:text-white group-hover:underline">
+                          <span className="min-w-0 break-words text-sm font-semibold group-hover:text-strong group-hover:underline xl:truncate">
                             {requestData.requestedBy.displayName}
                           </span>
                         </Link>
@@ -660,7 +679,7 @@ const RequestItem = ({
                   <span className="card-field-name">
                     {intl.formatMessage(messages.requesteddate)}
                   </span>
-                  <span className="flex truncate text-sm text-gray-300">
+                  <span className="flex min-w-0 text-sm text-gray-300 xl:truncate">
                     <FormattedRelativeTime
                       value={Math.floor(
                         (new Date(requestData.createdAt).getTime() -
@@ -679,7 +698,7 @@ const RequestItem = ({
                 <span className="card-field-name">
                   {intl.formatMessage(messages.modified)}
                 </span>
-                <span className="flex truncate text-sm text-gray-300">
+                <span className="flex min-w-0 flex-wrap text-sm text-gray-300 xl:flex-nowrap xl:truncate">
                   {intl.formatMessage(messages.modifieduserdate, {
                     date: (
                       <FormattedRelativeTime
@@ -695,7 +714,7 @@ const RequestItem = ({
                     user: (
                       <Link
                         href={`/users/${requestData.modifiedBy.id}`}
-                        className="group flex items-center truncate"
+                        className="group flex min-w-0 items-center xl:truncate"
                       >
                         <span className="avatar-sm ml-1.5">
                           <CachedImage
@@ -707,7 +726,7 @@ const RequestItem = ({
                             height={20}
                           />
                         </span>
-                        <span className="truncate text-sm font-semibold group-hover:text-white group-hover:underline">
+                        <span className="min-w-0 break-words text-sm font-semibold group-hover:text-strong group-hover:underline xl:truncate">
                           {requestData.modifiedBy.displayName}
                         </span>
                       </Link>
@@ -721,7 +740,7 @@ const RequestItem = ({
                 <span className="card-field-name">
                   {intl.formatMessage(messages.profileName)}
                 </span>
-                <span className="flex truncate text-sm text-gray-300">
+                <span className="flex min-w-0 break-words text-sm text-gray-300 xl:truncate">
                   {request.profileName}
                 </span>
               </div>
@@ -729,24 +748,45 @@ const RequestItem = ({
           </div>
         </div>
         <div className="z-10 mt-4 flex w-full flex-col justify-center space-y-2 pl-4 pr-4 xl:mt-0 xl:w-96 xl:items-end xl:pl-0">
+          {/*
+            Retry, or change server, profile or folder first; laid out like
+            Approve and Decline.
+          */}
           {requestData.status === MediaRequestStatus.FAILED &&
             hasPermission(Permission.MANAGE_REQUESTS) && (
-              <Button
-                className="w-full"
-                buttonType="primary"
-                disabled={isRetrying}
-                onClick={() => retryRequest()}
-              >
-                <ArrowPathIcon
-                  className={isRetrying ? 'animate-spin' : ''}
-                  style={{ animationDirection: 'reverse' }}
-                />
-                <span>
-                  {intl.formatMessage(
-                    isRetrying ? globalMessages.retrying : globalMessages.retry
-                  )}
+              <div className="flex w-full flex-row space-x-2">
+                <span className="w-full">
+                  <Button
+                    className="w-full"
+                    buttonType="primary"
+                    disabled={isRetrying}
+                    onClick={() => retryRequest()}
+                  >
+                    <ArrowPathIcon
+                      className={isRetrying ? 'animate-spin' : ''}
+                      style={{ animationDirection: 'reverse' }}
+                    />
+                    <span>
+                      {intl.formatMessage(
+                        isRetrying
+                          ? globalMessages.retrying
+                          : globalMessages.retry
+                      )}
+                    </span>
+                  </Button>
                 </span>
-              </Button>
+                <span className="w-full">
+                  <Button
+                    className="w-full"
+                    buttonType="default"
+                    onClick={() => setShowEditModal(true)}
+                    disabled={isRetrying}
+                  >
+                    <PencilIcon />
+                    <span>{intl.formatMessage(globalMessages.edit)}</span>
+                  </Button>
+                </span>
+              </div>
             )}
           {requestData.status !== MediaRequestStatus.PENDING &&
             hasPermission(Permission.MANAGE_REQUESTS) && (
@@ -782,10 +822,10 @@ const RequestItem = ({
                   <Button
                     className="w-full"
                     buttonType="success"
-                    onClick={() => modifyRequest('approve')}
-                    disabled={updatingType !== null}
+                    onClick={() => approveRequest()}
+                    disabled={isApproving}
                   >
-                    {updatingType === 'approve' ? <Spinner /> : <CheckIcon />}
+                    {isApproving ? <Spinner /> : <CheckIcon />}
                     <span>{intl.formatMessage(globalMessages.approve)}</span>
                   </Button>
                 </span>
@@ -793,10 +833,10 @@ const RequestItem = ({
                   <Button
                     className="w-full"
                     buttonType="danger"
-                    onClick={() => modifyRequest('decline')}
-                    disabled={updatingType !== null}
+                    onClick={() => setShowDeclineModal(true)}
+                    disabled={isApproving}
                   >
-                    {updatingType === 'decline' ? <Spinner /> : <XMarkIcon />}
+                    <XMarkIcon />
                     <span>{intl.formatMessage(globalMessages.decline)}</span>
                   </Button>
                 </span>
@@ -812,7 +852,7 @@ const RequestItem = ({
                   className="w-full"
                   buttonType="primary"
                   onClick={() => setShowEditModal(true)}
-                  disabled={updatingType !== null}
+                  disabled={isApproving}
                 >
                   <PencilIcon />
                   <span>{intl.formatMessage(messages.editrequest)}</span>
@@ -837,4 +877,15 @@ const RequestItem = ({
   );
 };
 
-export default RequestItem;
+/** Music gets its own row since it has no TMDB title. */
+const RequestItemFor = (props: RequestItemProps) =>
+  props.request.type === MediaType.MUSIC ? (
+    <MusicRequestItem
+      request={props.request}
+      revalidateList={props.revalidateList}
+    />
+  ) : (
+    <RequestItem {...props} />
+  );
+
+export default RequestItemFor;

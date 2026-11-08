@@ -9,17 +9,16 @@ import {
 } from '@heroicons/react/24/outline';
 import { useIntl } from 'react-intl';
 
-const messages = defineMessages('components.PushOptIn', {
+export const pushOptInMessages = defineMessages('components.PushOptIn', {
   prompttitle: 'Get notified when it is ready',
-  promptdescription:
-    'This device is not set up for notifications yet. It only takes a moment.',
+  promptdescription: 'This device isn’t set up for notifications yet.',
   promptaction: 'Enable notifications',
   deniedtitle: 'Notifications are blocked',
   denieddescription:
-    'Your browser will not ask again. Allow notifications for this site in your browser settings, then reload this page.',
+    'Allow notifications for this site in your browser settings, then reload.',
   blockedtitle: 'This browser will not allow notifications',
   blockeddescription:
-    'Some browsers disable push notifications by default. Check your browser privacy settings, or use a different browser.',
+    'This browser blocks push notifications. Check its privacy settings, or try another browser.',
   installtitle: 'Add Seerr AI to your home screen',
   installdescription:
     'iPhone and iPad only allow notifications from installed apps.',
@@ -28,10 +27,10 @@ const messages = defineMessages('components.PushOptIn', {
   installstepopen: 'Open Seerr AI from the new icon',
   webviewtitle: 'Open Seerr AI in your browser',
   webviewdescription:
-    'Notifications are not available inside this app. Open this page in Safari or Chrome to turn them on.',
+    'Notifications don’t work in this app. Open this page in Safari or Chrome.',
   unsupportedtitle: 'Notifications are not available here',
   unsupporteddescription:
-    'This browser does not support push notifications. You can still be notified by email or Discord from your notification settings.',
+    'This browser can’t do push notifications. Email or Discord still work.',
 });
 
 interface PushOptInContentProps {
@@ -61,24 +60,30 @@ const PushOptInContent = ({
       <div className="flex items-start space-x-3">
         <ArrowUpOnSquareIcon className="h-6 w-6 flex-shrink-0 text-gray-300" />
         <div className="min-w-0 flex-1">
-          <p className="font-medium text-white">
-            {intl.formatMessage(messages.installtitle)}
+          <p className="font-medium text-strong">
+            {intl.formatMessage(pushOptInMessages.installtitle)}
           </p>
           <p className="mt-1 text-sm text-gray-400">
-            {intl.formatMessage(messages.installdescription)}
+            {intl.formatMessage(pushOptInMessages.installdescription)}
           </p>
           <ol className="mt-3 space-y-2 text-sm text-gray-300">
             <li className="flex items-center space-x-2">
               <ArrowUpOnSquareIcon className="h-4 w-4 flex-shrink-0" />
-              <span>{intl.formatMessage(messages.installstepshare)}</span>
+              <span>
+                {intl.formatMessage(pushOptInMessages.installstepshare)}
+              </span>
             </li>
             <li className="flex items-center space-x-2">
               <PlusSmallIcon className="h-4 w-4 flex-shrink-0" />
-              <span>{intl.formatMessage(messages.installstepadd)}</span>
+              <span>
+                {intl.formatMessage(pushOptInMessages.installstepadd)}
+              </span>
             </li>
             <li className="flex items-center space-x-2">
               <BellAlertIcon className="h-4 w-4 flex-shrink-0" />
-              <span>{intl.formatMessage(messages.installstepopen)}</span>
+              <span>
+                {intl.formatMessage(pushOptInMessages.installstepopen)}
+              </span>
             </li>
           </ol>
         </div>
@@ -88,17 +93,19 @@ const PushOptInContent = ({
 
   if (state === 'denied' || state === 'blocked-by-browser') {
     const title =
-      state === 'denied' ? messages.deniedtitle : messages.blockedtitle;
+      state === 'denied'
+        ? pushOptInMessages.deniedtitle
+        : pushOptInMessages.blockedtitle;
     const description =
       state === 'denied'
-        ? messages.denieddescription
-        : messages.blockeddescription;
+        ? pushOptInMessages.denieddescription
+        : pushOptInMessages.blockeddescription;
 
     return (
       <div className="flex items-start space-x-3">
-        <BellSlashIcon className="h-6 w-6 flex-shrink-0 text-yellow-400" />
+        <BellSlashIcon className="h-6 w-6 flex-shrink-0 text-yellow-400 light:text-warning-text" />
         <div className="min-w-0 flex-1">
-          <p className="font-medium text-white">{intl.formatMessage(title)}</p>
+          <p className="font-medium text-strong">{intl.formatMessage(title)}</p>
           <p className="mt-1 text-sm text-gray-400">
             {intl.formatMessage(description)}
           </p>
@@ -112,11 +119,11 @@ const PushOptInContent = ({
       <div className="flex items-start space-x-3">
         <BellSlashIcon className="h-6 w-6 flex-shrink-0 text-gray-300" />
         <div className="min-w-0 flex-1">
-          <p className="font-medium text-white">
-            {intl.formatMessage(messages.webviewtitle)}
+          <p className="font-medium text-strong">
+            {intl.formatMessage(pushOptInMessages.webviewtitle)}
           </p>
           <p className="mt-1 text-sm text-gray-400">
-            {intl.formatMessage(messages.webviewdescription)}
+            {intl.formatMessage(pushOptInMessages.webviewdescription)}
           </p>
         </div>
       </div>
@@ -125,13 +132,13 @@ const PushOptInContent = ({
 
   return (
     <div className="flex items-start space-x-3">
-      <BellAlertIcon className="h-6 w-6 flex-shrink-0 text-indigo-400" />
+      <BellAlertIcon className="h-6 w-6 flex-shrink-0 text-indigo-400 light:text-accent-text" />
       <div className="min-w-0 flex-1">
-        <p className="font-medium text-white">
-          {intl.formatMessage(messages.prompttitle)}
+        <p className="font-medium text-strong">
+          {intl.formatMessage(pushOptInMessages.prompttitle)}
         </p>
         <p className="mt-1 text-sm text-gray-400">
-          {intl.formatMessage(messages.promptdescription)}
+          {intl.formatMessage(pushOptInMessages.promptdescription)}
         </p>
         <Button
           buttonType="primary"
@@ -140,7 +147,7 @@ const PushOptInContent = ({
           onClick={onEnable}
         >
           <BellAlertIcon />
-          <span>{intl.formatMessage(messages.promptaction)}</span>
+          <span>{intl.formatMessage(pushOptInMessages.promptaction)}</span>
         </Button>
       </div>
     </div>

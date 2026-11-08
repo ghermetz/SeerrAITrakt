@@ -11,5 +11,13 @@ export enum ApiErrorCode {
   InvalidNetworkList = 'INVALID_NETWORK_LIST',
   TooManyNetworks = 'TOO_MANY_NETWORKS',
   Unauthorized = 'UNAUTHORIZED',
+  /**
+   * A media server account new here whose email or name belongs to an existing
+   * account: its owner signs in with that account and links the server from
+   * their profile.
+   */
+  ExistingAccount = 'EXISTING_ACCOUNT',
+  /** The media server account is disabled there. */
+  AccountDisabled = 'ACCOUNT_DISABLED',
   Unknown = 'UNKNOWN',
 }

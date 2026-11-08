@@ -1,11 +1,16 @@
 import { IssueStatus, IssueTypeName } from '@server/constants/issue';
 import { getIntl } from '@server/i18n';
 import globalMessages from '@server/i18n/globalMessages';
+import {
+  declineReasonOf,
+  escapeMarkdown,
+} from '@server/lib/notifications/declineReason';
 import { eventText } from '@server/lib/notifications/eventTitles';
+import notificationHttp from '@server/lib/notifications/http';
+import { mediaPagePath } from '@server/lib/notifications/mediaPage';
 import type { NotificationAgentGotify } from '@server/lib/settings';
-import { getSettings } from '@server/lib/settings';
+import { GOTIFY_DEFAULT_PRIORITY, getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
-import axios from 'axios';
 import { Notification, hasNotificationType } from '..';
 import type { NotificationAgent, NotificationPayload } from './agent';
 import { BaseAgent } from './agent';
@@ -54,15 +59,18 @@ class GotifyAgent
     const intl = getIntl(settings.options.locale);
     const { applicationUrl, applicationTitle } = getSettings().main;
     const embedPoster = settings.embedPoster;
-    const priority = settings.options.priority ?? 1;
+    // Older settings may have no saved priority.
+    const priority = settings.options.priority ?? GOTIFY_DEFAULT_PRIORITY;
 
     const event = eventText(payload, intl);
     const title = event ? `${event} - ${payload.subject}` : payload.subject;
 
-    let message = payload.message ? `${payload.message}  \n\n` : '';
+    let message = payload.message
+      ? `${escapeMarkdown(payload.message)}  \n\n`
+      : '';
 
     if (payload.request) {
-      message += `\n**${intl.formatMessage(globalMessages.requestedBy)}:** ${payload.request.requestedBy.displayName}  `;
+      message += `\n**${intl.formatMessage(globalMessages.requestedBy)}:** ${escapeMarkdown(payload.request.requestedBy.displayName)}  `;
 
       let status = '';
       switch (type) {
@@ -80,6 +88,7 @@ class GotifyAgent
           status = intl.formatMessage(globalMessages.declined);
           break;
         case Notification.MEDIA_FAILED:
+        case Notification.REQUEST_FAILED:
           status = intl.formatMessage(globalMessages.failed);
           break;
       }
@@ -87,10 +96,15 @@ class GotifyAgent
       if (status) {
         message += `\n**${intl.formatMessage(globalMessages.requestStatus)}:** ${status}  `;
       }
+
+      const declineReason = declineReasonOf(type, payload);
+      if (declineReason) {
+        message += `\n**${intl.formatMessage(globalMessages.declineReason)}:** ${escapeMarkdown(declineReason)}  `;
+      }
     } else if (payload.comment) {
-      message += `\n${intl.formatMessage(globalMessages.commentFrom, { userName: payload.comment.user.displayName })}:\n${payload.comment.message}  `;
+      message += `\n${intl.formatMessage(globalMessages.commentFrom, { userName: escapeMarkdown(payload.comment.user.displayName) })}:\n${escapeMarkdown(payload.comment.message)}  `;
     } else if (payload.issue) {
-      message += `\n\n**${intl.formatMessage(globalMessages.reportedBy)}:** ${payload.issue.createdBy.displayName}  `;
+      message += `\n\n**${intl.formatMessage(globalMessages.reportedBy)}:** ${escapeMarkdown(payload.issue.createdBy.displayName)}  `;
       message += `\n**${intl.formatMessage(globalMessages.issueType)}:** ${IssueTypeName[payload.issue.issueType]}  `;
       message += `\n**${intl.formatMessage(globalMessages.issueStatus)}:** ${
         payload.issue.status === IssueStatus.OPEN
@@ -110,7 +124,7 @@ class GotifyAgent
     if (applicationUrl && (payload.actionUrl || payload.media)) {
       const actionUrl = payload.actionUrl
         ? `${applicationUrl}${payload.actionUrl}`
-        : `${applicationUrl}/${payload.media!.mediaType}/${payload.media!.tmdbId}`;
+        : `${applicationUrl}${mediaPagePath(payload.media!, payload.request)}`;
       const displayUrl =
         actionUrl.length > 40 ? `${actionUrl.slice(0, 41)}...` : actionUrl;
       message += `\n\n**${intl.formatMessage(globalMessages.openIn, { applicationTitle })}:** [${displayUrl}](${actionUrl})  `;
@@ -157,7 +171,7 @@ class GotifyAgent
       const endpoint = `${settings.options.url}/message?token=${settings.options.token}`;
       const notificationPayload = this.getNotificationPayload(type, payload);
 
-      await axios.post(endpoint, notificationPayload);
+      await notificationHttp.post(endpoint, notificationPayload);
 
       return true;
     } catch (e) {

@@ -13,11 +13,11 @@ import { Router } from 'express';
 const searchRoutes = Router();
 
 /*
- * TMDB's search across everything never returns collections, so they are
- * searched for on their own. Page N of search holds page N of each. The
- * first page of collections (cached, like every page) says how many there
- * are, so pages past the last one are not asked for at all. A collection
- * search that fails leaves the rest of the search as it was.
+ * TMDB's multi search never returns collections, so they're searched
+ * separately; page N of results holds page N of each. The first collections
+ * page (cached, like every page) gives the page count, so pages past the last
+ * aren't fetched. A failed collection search leaves the rest of the results
+ * intact.
  */
 const searchCollections = async (
   tmdb: TheMovieDb,
@@ -61,9 +61,60 @@ const toCollectionResult = (
   backdrop_path: collection.backdrop_path ?? undefined,
 });
 
+/** Search filter: films (with their collections), series or people. */
+type SearchType = 'movie' | 'tv' | 'person';
+
+const SEARCH_TYPES: SearchType[] = ['movie', 'tv', 'person'];
+
+/** Search one kind of title, or everything when none is given. */
+const searchTitles = async (
+  tmdb: TheMovieDb,
+  type: SearchType | undefined,
+  options: { query: string; page: number; language: string }
+): Promise<TmdbSearchMultiResponse> => {
+  // TMDB's film and series searches omit each result's media type: it's the one
+  // asked for.
+  if (type === 'movie') {
+    const found = await tmdb.searchMovies(options);
+    return {
+      ...found,
+      results: found.results.map((result) => ({
+        ...result,
+        media_type: 'movie',
+      })),
+    };
+  }
+  if (type === 'tv') {
+    const found = await tmdb.searchTvShows(options);
+    return {
+      ...found,
+      results: found.results.map((result) => ({
+        ...result,
+        media_type: 'tv',
+      })),
+    };
+  }
+  if (type === 'person') {
+    const found = await tmdb.searchPerson(options);
+    return {
+      ...found,
+      results: found.results.map((result) => ({
+        ...result,
+        media_type: 'person',
+        adult: result.adult ?? false,
+        known_for: result.known_for ?? [],
+      })),
+    };
+  }
+  return tmdb.searchMulti(options);
+};
+
 searchRoutes.get('/', async (req, res, next) => {
   const queryString = req.query.query as string;
   const searchProvider = findSearchProvider(queryString.toLowerCase());
+  const type = SEARCH_TYPES.includes(req.query.type as SearchType)
+    ? (req.query.type as SearchType)
+    : undefined;
   let results: TmdbSearchMultiResponse;
 
   try {
@@ -76,18 +127,31 @@ searchRoutes.get('/', async (req, res, next) => {
         language: (req.query.language as string) ?? req.locale,
         query: queryString,
       });
+      if (type) {
+        const ofType = results.results.filter(
+          (result) => result.media_type === type
+        );
+        results = {
+          ...results,
+          total_results: ofType.length,
+          results: ofType,
+        };
+      }
     } else {
       const tmdb = new TheMovieDb();
       const page = Number(req.query.page) || 1;
       const language = (req.query.language as string) ?? req.locale;
 
+      // Collections are films, so a series or people search leaves them out.
       const [multi, collections] = await Promise.all([
-        tmdb.searchMulti({ query: queryString, page, language }),
-        searchCollections(tmdb, queryString, page, language),
+        searchTitles(tmdb, type, { query: queryString, page, language }),
+        type === 'tv' || type === 'person'
+          ? { page, results: [], total_pages: 0, total_results: 0 }
+          : searchCollections(tmdb, queryString, page, language),
       ]);
 
-      // Collections lead the page: a franchise's name is usually what was
-      // typed. Search goes on for as long as either has more pages.
+      // Collections lead the page: a franchise name is usually what was typed.
+      // Paging continues while either has more pages.
       results = {
         page,
         total_pages: Math.max(multi.total_pages, collections.total_pages),

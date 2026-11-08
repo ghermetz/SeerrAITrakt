@@ -14,7 +14,7 @@ import path from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
 /*
- * The release calendar, against fake Radarr and Sonarr calendars, behind the
+ * The release calendar against fake Radarr and Sonarr calendars, behind the
  * real API validator.
  */
 
@@ -138,7 +138,7 @@ const calendar = (query = '') =>
               try {
                 body = JSON.parse(raw);
               } catch {
-                // An error page: the status is what matters.
+                // An error page: only the status matters.
               }
               resolve({ status: res.statusCode ?? 0, body });
             });
@@ -148,13 +148,13 @@ const calendar = (query = '') =>
     }
   );
 
-// The server caches a calendar for ten minutes per range, so each test asks
-// for a range of its own.
+// The server caches a calendar ten minutes per range, so each test uses its own
+// range.
 describe('the release calendar', () => {
   it('lists each release a film has in range, once, even with a 4K server', async () => {
     const film = {
-      tmdbId: 1291595,
-      title: 'Insidious: Out of the Further',
+      tmdbId: 1382706,
+      title: 'Vesperline: Out of the Hollow',
       hasFile: false,
       inCinemas: utcDay(-40),
       digitalRelease: utcDay(12),
@@ -174,14 +174,14 @@ describe('the release calendar', () => {
       body.items.map((i) => [i.title, i.kind, i.at, i.allDay, i.poster]),
       [
         [
-          'Insidious: Out of the Further',
+          'Vesperline: Out of the Hollow',
           'digital',
           utcDay(12),
           true,
           'https://image.tmdb.org/t/p/original/x.jpg',
         ],
         [
-          'Insidious: Out of the Further',
+          'Vesperline: Out of the Hollow',
           'physical',
           utcDay(30),
           true,
@@ -198,9 +198,9 @@ describe('the release calendar', () => {
 
   it('reads episodes airing together as one line, and apart as two', async () => {
     const show = {
-      title: 'Neagley',
+      title: 'Vossberg',
       tvdbId: 400,
-      tmdbId: 250307,
+      tmdbId: 361418,
       images: [
         {
           coverType: 'poster',
@@ -252,8 +252,8 @@ describe('the release calendar', () => {
         i.at,
       ]),
       [
-        ['Neagley', 250307, 1, [1, 2], null, false, at(3, 1)],
-        ['Neagley', 250307, 1, [3], 'Three', false, at(10, 1)],
+        ['Vossberg', 361418, 1, [1, 2], null, false, at(3, 1)],
+        ['Vossberg', 361418, 1, [3], 'Three', false, at(10, 1)],
       ]
     );
   });
@@ -324,8 +324,8 @@ describe('the release calendar', () => {
   });
 
   it('refuses a fractional week count rather than asking every server for it', async () => {
-    // Each range is cached on its own: weeks=7.0001 and the like would
-    // otherwise each ask every Radarr and Sonarr.
+    // Each range is cached separately: otherwise weeks=7.0001 and the like
+    // would each query every Radarr and Sonarr.
     for (const weeks of ['7.0001', '7.5']) {
       assert.equal((await calendar(`?weeks=${weeks}`)).status, 400);
     }

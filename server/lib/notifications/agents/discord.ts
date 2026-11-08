@@ -7,12 +7,17 @@ import { getRepository } from '@server/datasource';
 import { User } from '@server/entity/User';
 import { getIntl } from '@server/i18n';
 import globalMessages from '@server/i18n/globalMessages';
+import {
+  declineReasonOf,
+  escapeMarkdown,
+} from '@server/lib/notifications/declineReason';
 import { eventText } from '@server/lib/notifications/eventTitles';
+import notificationHttp from '@server/lib/notifications/http';
+import { mediaPagePath } from '@server/lib/notifications/mediaPage';
 import type { NotificationAgentDiscord } from '@server/lib/settings';
 import { NotificationAgentKey, getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import type { AvailableLocale } from '@server/types/languages';
-import axios from 'axios';
 import {
   Notification,
   hasNotificationType,
@@ -108,7 +113,7 @@ class DiscordAgent
     if (payload.request) {
       fields.push({
         name: intl.formatMessage(globalMessages.requestedBy),
-        value: payload.request.requestedBy.displayName,
+        value: escapeMarkdown(payload.request.requestedBy.displayName),
         inline: true,
       });
 
@@ -132,6 +137,7 @@ class DiscordAgent
           status = intl.formatMessage(globalMessages.declined);
           break;
         case Notification.MEDIA_FAILED:
+        case Notification.REQUEST_FAILED:
           color = EmbedColors.RED;
           status = intl.formatMessage(globalMessages.failed);
           break;
@@ -144,19 +150,28 @@ class DiscordAgent
           inline: true,
         });
       }
+
+      const declineReason = declineReasonOf(type, payload);
+      if (declineReason) {
+        fields.push({
+          name: intl.formatMessage(globalMessages.declineReason),
+          value: escapeMarkdown(declineReason),
+          inline: false,
+        });
+      }
     } else if (payload.comment) {
       fields.push({
         name: intl.formatMessage(globalMessages.commentFrom, {
           userName: payload.comment.user.displayName,
         }),
-        value: payload.comment.message,
+        value: escapeMarkdown(payload.comment.message),
         inline: false,
       });
     } else if (payload.issue) {
       fields.push(
         {
           name: intl.formatMessage(globalMessages.reportedBy),
-          value: payload.issue.createdBy.displayName,
+          value: escapeMarkdown(payload.issue.createdBy.displayName),
           inline: true,
         },
         {
@@ -202,6 +217,9 @@ class DiscordAgent
     if (type === Notification.HEALTH) {
       color = EmbedColors.RED;
     }
+    if (type === Notification.WRONG_MATCH) {
+      color = EmbedColors.ORANGE;
+    }
 
     const url = applicationUrl
       ? payload.actionUrl
@@ -209,7 +227,7 @@ class DiscordAgent
         : payload.issue
           ? `${applicationUrl}/issues/${payload.issue.id}`
           : payload.media
-            ? `${applicationUrl}/${payload.media.mediaType}/${payload.media.tmdbId}`
+            ? `${applicationUrl}${mediaPagePath(payload.media, payload.request)}`
             : undefined
       : undefined;
 
@@ -218,7 +236,9 @@ class DiscordAgent
     return {
       title: event ? `${event}: ${payload.subject}` : payload.subject,
       url,
-      description: payload.message,
+      description: payload.message
+        ? escapeMarkdown(payload.message)
+        : undefined,
       color,
       timestamp: new Date().toISOString(),
       fields,
@@ -317,9 +337,8 @@ class DiscordAgent
         allowedRoleIds.push(settings.options.webhookRoleId);
       }
 
-      // Discord webhooks go to a channel, not per-user,
-      // so if use user locale is set, we'll use the locale of the user being notified
-      // if not, we'll use the default locale set in the notification settings
+      // Webhooks post to a channel, so pick the notified user's locale or the
+      // agent default.
       const locale = settings.options.useUserLocale
         ? (payload.notifyUser?.settings?.locale as AvailableLocale)
         : (settings.options.locale as AvailableLocale);
@@ -332,7 +351,7 @@ class DiscordAgent
         );
       }
 
-      await axios.post(webhookUrl.toString(), {
+      await notificationHttp.post(webhookUrl.toString(), {
         username: settings.options.botUsername
           ? settings.options.botUsername
           : getSettings().main.applicationTitle,

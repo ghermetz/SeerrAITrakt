@@ -6,30 +6,34 @@ import type {
 } from '@server/api/downloadclients/types';
 import {
   CLIENT_TIMEOUT_MS,
+  assertAddedHash,
   clientBaseUrl,
+  dataRoot,
   isTorrentHash,
+  sessionKeyOf,
+  sharesData,
 } from '@server/api/downloadclients/types';
 import type { DownloadClientSettings } from '@server/lib/settings';
 import type { AxiosInstance } from 'axios';
 import axios from 'axios';
 
 /*
- * The part of Deluge's Web UI JSON-RPC Seerr reads: the torrents Radarr and
- * Sonarr sent, by hash, which is how they record a torrent as its download
- * id. Deluge signs in with its Web UI password alone, into a session kept in
- * a cookie between passes and renewed when Deluge forgets it; the Web UI is
- * connected to its daemon first if it is not already, as Sonarr does.
+ * Reads, via Deluge's Web UI JSON-RPC, the torrents Radarr and Sonarr sent,
+ * by hash (their download id). Signs in with the Web UI password alone; the
+ * session cookie is kept between passes and renewed when Deluge drops it.
+ * Like Sonarr, connects the Web UI to its daemon first if needed.
  *
- * For Backfill it also adds, picks the files of, and removes torrents.
- * Backfill's category is a label, from Deluge's Label plugin when it is on.
- * Deluge cannot stop a magnet link once its file list is in, so until
- * Backfill has chosen the files the torrent's download speed is held at
- * 1 KiB/s.
+ * For Backfill it also adds torrents, picks their files and removes them.
+ * Backfill's category is a label, via the Label plugin when enabled. Deluge
+ * cannot stop a magnet once its file list is in, so its download speed is
+ * held at 1 KiB/s until Backfill chooses the files.
  */
 
 export interface DelugeTorrent {
-  /** Downloading, Seeding, Paused, Checking, Queued, Error, Allocating,
-   * Moving. */
+  /**
+   * Downloading, Seeding, Paused, Checking, Queued, Error, Allocating,
+   * Moving.
+   */
   state: string;
   total_wanted: number;
   total_done: number;
@@ -87,7 +91,7 @@ export const delugeDownload = (torrent: DelugeTorrent): LiveDownload => {
   }
 };
 
-/** What Backfill reads of a torrent. */
+/** The torrent fields Backfill reads. */
 export interface DelugeTorrentInfo {
   name: string;
   state: string;
@@ -157,13 +161,13 @@ export const delugeTorrent = (
     case 'Queued':
       return { ...base, state: done ? 'done' : 'queued' };
     default:
-      // A magnet link has nothing to want until its file list is in.
+      // A magnet wants nothing until its file list is in.
       if (!wanted) return { ...base, state: 'metadata' };
       return { ...base, state: done ? 'done' : 'downloading' };
   }
 };
 
-/** Deluge's labels: lower case letters, digits, "_" and "-". */
+/** Deluge labels allow only lower-case letters, digits, "_" and "-". */
 export const delugeLabel = (category: string): string =>
   category.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
 
@@ -173,7 +177,7 @@ interface RpcAnswer<T> {
   id: number;
 }
 
-/** Signed-in sessions, by client address, kept between passes. */
+/** Session cookies by sessionKeyOf, kept between passes. */
 const sessions = new Map<string, string>();
 
 class DelugeAPI implements TorrentClient {
@@ -191,8 +195,8 @@ class DelugeAPI implements TorrentClient {
     >
   ) {
     const base = clientBaseUrl(settings);
-    this.sessionKey = base;
     this.password = settings.password ?? '';
+    this.sessionKey = sessionKeyOf(base, '', this.password);
     this.axios = axios.create({
       baseURL: `${base}/json`,
       timeout: CLIENT_TIMEOUT_MS,
@@ -231,7 +235,7 @@ class DelugeAPI implements TorrentClient {
     await this.ensureConnected();
   }
 
-  /** The Web UI talks to a daemon; connect it to the first one if needed. */
+  /** Connects the Web UI to its first daemon if needed. */
   private async ensureConnected(): Promise<void> {
     const connected = await this.raw<boolean>('web.connected', []);
     if (connected.result) return;
@@ -248,7 +252,7 @@ class DelugeAPI implements TorrentClient {
       await this.signIn();
     }
     let answer = await this.raw<T>(method, params);
-    // Code 1: not signed in, the session having expired or Deluge restarted.
+    // Code 1: not signed in (session expired or Deluge restarted).
     if (answer.error?.code === 1) {
       sessions.delete(this.sessionKey);
       await this.signIn();
@@ -268,6 +272,7 @@ class DelugeAPI implements TorrentClient {
   public async addTorrent(options: {
     torrent?: Buffer;
     magnet?: string;
+    hash: string;
     category: string;
     metadataOnly?: boolean;
   }): Promise<void> {
@@ -276,8 +281,8 @@ class DelugeAPI implements TorrentClient {
       add_paused: !!options.torrent,
       stop_at_ratio: true,
       stop_ratio: 0,
-      // Stopped once done, never removed: Deluge set to remove torrents at
-      // their ratio would otherwise take this one before it is imported.
+      // Stop once done, never remove: a Deluge set to remove at ratio would
+      // otherwise remove it before import.
       remove_at_ratio: false,
       max_download_speed: options.metadataOnly ? 1 : -1,
     };
@@ -298,6 +303,14 @@ class DelugeAPI implements TorrentClient {
     }
     if (!hash) {
       throw new Error('Deluge would not add the torrent.');
+    }
+    try {
+      assertAddedHash(this.product, hash, options.hash);
+    } catch (e) {
+      await this.call('core.remove_torrent', [hash, false]).catch(
+        () => undefined
+      );
+      throw e;
     }
     if (await this.labelsOn()) {
       await this.call('label.set_torrent', [
@@ -324,13 +337,13 @@ class DelugeAPI implements TorrentClient {
         INFO_FIELDS,
       ]);
     } catch (e) {
-      // Deluge 1.3 answers an unknown hash with an error.
+      // Deluge 1.3 errors on an unknown hash.
       if (/KeyError|InvalidTorrent/i.test(String((e as Error).message))) {
         return undefined;
       }
       throw e;
     }
-    // Deluge 2 answers it with no fields at all.
+    // Deluge 2 returns no fields for it.
     return torrent && 'state' in torrent
       ? delugeTorrent(hash, torrent as DelugeTorrentInfo)
       : undefined;
@@ -393,7 +406,7 @@ class DelugeAPI implements TorrentClient {
     }
   }
 
-  /** Starts it, at full speed again if it was added to fetch its files. */
+  /** Starts it, restoring full speed if added to fetch its files. */
   public async startTorrent(hash: string): Promise<void> {
     const id = hash.toLowerCase();
     await this.call('core.set_torrent_options', [
@@ -408,7 +421,22 @@ class DelugeAPI implements TorrentClient {
   }
 
   public async deleteTorrent(hash: string): Promise<void> {
-    await this.call('core.remove_torrent', [hash.toLowerCase(), true]);
+    const id = hash.toLowerCase();
+    const all = await this.call<
+      Record<string, { name?: string; save_path?: string }>
+    >('core.get_torrents_status', [{}, ['name', 'save_path']]);
+    const rootOf = (t?: { name?: string; save_path?: string }) =>
+      dataRoot(t?.save_path ?? '', t?.name ?? '');
+    const others = Object.entries(all ?? {})
+      .filter(([key]) => key.toLowerCase() !== id)
+      .map(([, t]) => rootOf(t));
+    const own = Object.entries(all ?? {}).find(
+      ([key]) => key.toLowerCase() === id
+    )?.[1];
+    await this.call('core.remove_torrent', [
+      id,
+      !(own && sharesData(rootOf(own), others)),
+    ]);
   }
 
   public async backfillProblems(): Promise<string[]> {
@@ -419,8 +447,18 @@ class DelugeAPI implements TorrentClient {
         ];
   }
 
+  /**
+   * The daemon's version: daemon.get_version on Deluge 2, daemon.info on
+   * Deluge 1.3.
+   */
   public async getVersion(): Promise<string> {
-    const version = await this.call<string>('daemon.info', []);
+    let version: string;
+    try {
+      version = await this.call<string>('daemon.get_version', []);
+    } catch (e) {
+      if (!(e instanceof Error) || !/unknown method/i.test(e.message)) throw e;
+      version = await this.call<string>('daemon.info', []);
+    }
     return version || 'unknown';
   }
 

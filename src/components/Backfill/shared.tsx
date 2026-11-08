@@ -2,13 +2,15 @@ import { durationParts } from '@app/components/Backfill/duration';
 import type {
   CandidateView,
   JobStatus,
+  JobView,
   SeriesStatus,
   TitleKind,
 } from '@app/components/Backfill/types';
 import Badge from '@app/components/Common/Badge';
 import CachedImage from '@app/components/Common/CachedImage';
 import defineMessages from '@app/utils/defineMessages';
-import { FilmIcon } from '@heroicons/react/24/outline';
+import { FilmIcon, SparklesIcon } from '@heroicons/react/24/outline';
+import Link from 'next/link';
 import type { IntlShape } from 'react-intl';
 import { useIntl } from 'react-intl';
 
@@ -32,18 +34,47 @@ const messages = defineMessages('components.Backfill', {
   anime: 'Anime',
   series: 'Series',
   movie: 'Movie',
+  album: 'Album',
   torrent: 'Torrent',
   usenet: 'Usenet',
   fills: 'fills {count} missing',
   upgrades: 'upgrades {count}',
   hasMovie: 'has the movie',
   upgradesMovie: 'upgrades the movie',
+  daysHours: '{days} d {hours} h',
+  aiSearching: 'AI searching',
+  aiSearchingTip: 'The admin agent is looking for what’s missing',
   hoursMinutes: '{hours} h {minutes} min',
   minutes: '{minutes} min',
+  tryingAgainAt: '{stage}; trying again at {time}',
+  followReplaced: 'Replaced by #{id}',
+  followSearching: 'Backfill is searching for another release',
+  followAgent: 'The admin agent is looking for another release',
+  followOffered: 'Backfill offered the next pack',
+  followOfferedAgain:
+    'The pack is offered again, to approve once that is put right',
+  followNone: 'Nothing else was found',
+  followGaveUp:
+    'The admin agent stopped looking: three replacements failed today',
+  followLimit: 'The admin agent’s downloads for today are used up',
 });
 
 export const appName = (kind: TitleKind) =>
-  kind === 'movie' ? 'Radarr' : 'Sonarr';
+  kind === 'album' ? 'Lidarr' : kind === 'movie' ? 'Radarr' : 'Sonarr';
+
+/** The title's media page, when it has one. */
+export const titleHref = (title: {
+  kind: TitleKind;
+  tmdbId: number | null;
+  foreignId?: string | null;
+}): string | undefined =>
+  title.kind === 'album'
+    ? title.foreignId
+      ? `/music/album/${title.foreignId}`
+      : undefined
+    : title.tmdbId
+      ? `/${title.kind === 'movie' ? 'movie' : 'tv'}/${title.tmdbId}`
+      : undefined;
 
 export const formatBytes = (bytes: number): string => {
   if (!bytes || bytes < 0) return '0 B';
@@ -62,10 +93,29 @@ export const formatDuration = (
 ): string => {
   if (!seconds || seconds <= 0) return '';
   const { hours, minutes } = durationParts(seconds);
+  // Over two days: "31 d 2 h", not "746 h 0 min".
+  if (hours >= 48) {
+    return intl.formatMessage(messages.daysHours, {
+      days: Math.floor(hours / 24),
+      hours: hours % 24,
+    });
+  }
   return hours
     ? intl.formatMessage(messages.hoursMinutes, { hours, minutes })
     : intl.formatMessage(messages.minutes, { minutes });
 };
+
+/** A job's stage as text; a rate-limited job shows its local retry time. */
+export const jobStage = (
+  intl: IntlShape,
+  job: Pick<JobView, 'stage' | 'retryAt'>
+): string =>
+  job.stage && job.retryAt
+    ? intl.formatMessage(messages.tryingAgainAt, {
+        stage: job.stage,
+        time: intl.formatTime(job.retryAt),
+      })
+    : (job.stage ?? '');
 
 /** Episode label: "E202 · S05E23" for anime, "S05E23" otherwise. */
 export const episodeLabel = (e: {
@@ -82,6 +132,32 @@ export const episodeLabel = (e: {
       ? `${e.absolute} · ${se}`
       : String(e.absolute)
     : se;
+};
+
+/** Badge for an agent run in progress; links to the run when given `runId`. */
+export const AiSearchingBadge = ({
+  runId,
+  className,
+}: {
+  runId?: number | null;
+  className?: string;
+}) => {
+  const intl = useIntl();
+  return (
+    <Badge
+      badgeType="primary"
+      href={runId ? `/backfill/agent/${runId}` : undefined}
+      className={`items-center gap-1 ${className ?? ''}`}
+    >
+      <SparklesIcon
+        className="h-3 w-3 flex-none"
+        aria-label={intl.formatMessage(messages.aiSearchingTip)}
+      />
+      <span className="truncate">
+        {intl.formatMessage(messages.aiSearching)}
+      </span>
+    </Badge>
+  );
 };
 
 export const SeriesStatusBadge = ({ status }: { status: SeriesStatus }) => {
@@ -101,10 +177,8 @@ export const SeriesStatusBadge = ({ status }: { status: SeriesStatus }) => {
 };
 
 /**
- * A download's status pill. With its progress and its title's kind it says
- * more than the stored status: a download at 100% that is still
- * "downloading" is the client unpacking or running its script, and an
- * import is Sonarr's or Radarr's work, not Backfill's.
+ * Download status pill. Uses progress and kind: 100% while "downloading" means
+ * the client is unpacking or scripting; importing is the *arr's work.
  */
 export const JobStatusBadge = ({
   status,
@@ -143,6 +217,55 @@ export const JobStatusBadge = ({
   return <Badge badgeType={type}>{intl.formatMessage(text)}</Badge>;
 };
 
+/**
+ * A failed download's follow-up, linked to its replacement, the agent run, or
+ * the title's offered pack.
+ */
+export const JobFollowUpNote = ({
+  job,
+  className = '',
+}: {
+  job: Pick<
+    JobView,
+    'status' | 'followUp' | 'replacedById' | 'agentRunId' | 'seriesId'
+  >;
+  className?: string;
+}) => {
+  const intl = useIntl();
+  if (job.status !== 'failed' || !job.followUp) return null;
+  const conversation = job.agentRunId
+    ? `/backfill/agent/${job.agentRunId}`
+    : undefined;
+  const title = `/backfill/series/${job.seriesId}`;
+  const [text, href] = (
+    {
+      replaced: [
+        intl.formatMessage(messages.followReplaced, {
+          id: job.replacedById ?? '',
+        }),
+        job.replacedById ? `/backfill/jobs/${job.replacedById}` : undefined,
+      ],
+      searching: [intl.formatMessage(messages.followSearching), title],
+      agent: [intl.formatMessage(messages.followAgent), conversation],
+      offered: [intl.formatMessage(messages.followOffered), title],
+      offeredAgain: [intl.formatMessage(messages.followOfferedAgain), title],
+      none: [intl.formatMessage(messages.followNone), conversation],
+      gaveUp: [intl.formatMessage(messages.followGaveUp), conversation],
+      limit: [intl.formatMessage(messages.followLimit), conversation],
+    } as const
+  )[job.followUp];
+  return href ? (
+    <Link
+      href={href}
+      className={`text-indigo-300 hover:text-indigo-200 hover:underline light:text-accent-text light:hover:text-accent-text ${className}`}
+    >
+      {text}
+    </Link>
+  ) : (
+    <span className={`text-gray-400 ${className}`}>{text}</span>
+  );
+};
+
 export const TypeBadge = ({
   kind,
   seriesType,
@@ -153,6 +276,9 @@ export const TypeBadge = ({
   const intl = useIntl();
   if (kind === 'movie') {
     return <Badge>{intl.formatMessage(messages.movie)}</Badge>;
+  }
+  if (kind === 'album') {
+    return <Badge>{intl.formatMessage(messages.album)}</Badge>;
   }
   return seriesType === 'anime' ? (
     <Badge badgeType="primary">{intl.formatMessage(messages.anime)}</Badge>
@@ -204,10 +330,7 @@ const SIZES = {
   lg: 'h-[180px] w-[120px]',
 } as const;
 
-/**
- * A list that scrolls inside its section once it is long, so a page of
- * several lists stays one screen to move around in.
- */
+/** Long lists scroll inside their section. */
 export const SCROLL_LIST =
   'max-h-[min(60vh,40rem)] overflow-y-auto overscroll-contain';
 
@@ -269,8 +392,8 @@ export const ProgressBar = ({
   </div>
 );
 
-/** The Backfill page's header buttons: equal and level, however long. */
+/** Equal-size header buttons regardless of label length. */
 export const HEADER_BUTTON =
   'h-full w-full !whitespace-normal !px-1.5 text-center !text-[13px] !leading-tight sm:!px-4 sm:!text-sm lg:w-auto';
-/** On a phone the names alone fit the row; the icons come back wider. */
+/** Header icons are hidden on phones so labels fit. */
 export const HEADER_ICON = 'hidden sm:block';

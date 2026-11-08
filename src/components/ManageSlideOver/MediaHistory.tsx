@@ -56,48 +56,71 @@ interface HistoryEvent {
 
 type Icon = ComponentType<SVGProps<SVGSVGElement>>;
 
-// Class names written out in full: assembled ones are stripped from the
-// production stylesheet.
+// Full class names: Tailwind purges assembled ones.
 const ICONS: Record<string, { icon: Icon; className: string }> = {
-  requested: { icon: ArrowDownTrayIcon, className: 'text-indigo-400' },
-  approved: { icon: CheckCircleIcon, className: 'text-green-400' },
-  declined: { icon: XCircleIcon, className: 'text-red-400' },
-  failed: { icon: ExclamationTriangleIcon, className: 'text-red-400' },
-  processing: { icon: ArrowPathIcon, className: 'text-indigo-400' },
-  partially_available: { icon: CheckBadgeIcon, className: 'text-green-400' },
-  available: { icon: CheckBadgeIcon, className: 'text-green-400' },
+  requested: {
+    icon: ArrowDownTrayIcon,
+    className: 'text-indigo-400 light:text-accent-text',
+  },
+  approved: { icon: CheckCircleIcon, className: 'text-success-text' },
+  declined: {
+    icon: XCircleIcon,
+    className: 'text-red-400 light:text-danger-text',
+  },
+  failed: {
+    icon: ExclamationTriangleIcon,
+    className: 'text-red-400 light:text-danger-text',
+  },
+  processing: {
+    icon: ArrowPathIcon,
+    className: 'text-indigo-400 light:text-accent-text',
+  },
+  partially_available: { icon: CheckBadgeIcon, className: 'text-success-text' },
+  available: { icon: CheckBadgeIcon, className: 'text-success-text' },
   removed: { icon: MinusCircleIcon, className: 'text-gray-400' },
-  files_removed: { icon: TrashIcon, className: 'text-red-400' },
-  blocklisted: { icon: EyeSlashIcon, className: 'text-red-400' },
+  files_removed: {
+    icon: TrashIcon,
+    className: 'text-red-400 light:text-danger-text',
+  },
+  blocklisted: {
+    icon: EyeSlashIcon,
+    className: 'text-red-400 light:text-danger-text',
+  },
   unblocklisted: { icon: EyeIcon, className: 'text-gray-400' },
-  kept: { icon: ShieldCheckIcon, className: 'text-green-400' },
-  searched: { icon: MagnifyingGlassIcon, className: 'text-indigo-400' },
+  kept: { icon: ShieldCheckIcon, className: 'text-success-text' },
+  searched: {
+    icon: MagnifyingGlassIcon,
+    className: 'text-indigo-400 light:text-accent-text',
+  },
   monitoring_failed: {
     icon: ExclamationTriangleIcon,
-    className: 'text-yellow-400',
+    className: 'text-yellow-400 light:text-warning-text',
   },
-  agent: { icon: SparklesIcon, className: 'text-indigo-300' },
-  added: { icon: PlusCircleIcon, className: 'text-green-400' },
+  agent: {
+    icon: SparklesIcon,
+    className: 'text-indigo-300 light:text-accent-text',
+  },
+  added: { icon: PlusCircleIcon, className: 'text-success-text' },
 };
 
 const SHOWN_AT_FIRST = 10;
 
+/** TMDB id for films and series, MusicBrainz id for artists. */
+type MediaHistoryProps =
+  | { tmdbId: number; mediaType: 'movie' | 'tv' }
+  | { artistId: string };
+
 /**
- * What has happened to a title, newest first: requests and their approval,
- * processing and availability, removals, blocklisting and keeps, with who
- * did it. Keyed by the title, so it survives Seerr deleting the media row.
+ * A title's event history, newest first, with who did each. Keyed by the
+ * title so it survives deletion of the media row. Artist events name the album.
  */
-const MediaHistory = ({
-  tmdbId,
-  mediaType,
-}: {
-  tmdbId: number;
-  mediaType: 'movie' | 'tv';
-}) => {
+const MediaHistory = (props: MediaHistoryProps) => {
   const intl = useIntl();
   const [showAll, setShowAll] = useState(false);
   const { data } = useSWR<HistoryEvent[]>(
-    `/api/v1/media/history/${mediaType}/${tmdbId}`
+    'artistId' in props
+      ? `/api/v1/music/artist/${props.artistId}/history`
+      : `/api/v1/media/history/${props.mediaType}/${props.tmdbId}`
   );
 
   if (!data?.length) {
@@ -184,7 +207,7 @@ const MediaHistory = ({
         {!showAll && data.length > SHOWN_AT_FIRST && (
           <button
             type="button"
-            className="w-full border-t border-gray-700 px-4 py-2 text-sm text-indigo-400 hover:bg-gray-700/40 hover:text-indigo-300"
+            className="w-full border-t border-gray-700 px-4 py-2 text-sm text-indigo-400 hover:bg-gray-700/40 hover:text-indigo-300 light:text-accent-text light:hover:text-accent-text"
             onClick={() => setShowAll(true)}
           >
             {intl.formatMessage(messages.showAll, { count: data.length })}

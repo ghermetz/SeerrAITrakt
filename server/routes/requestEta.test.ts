@@ -27,8 +27,8 @@ import path from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
 /*
- * Request ETAs, against a fake Radarr and Sonarr and this server's own
- * history, behind the real API validator.
+ * Request ETAs against a fake Radarr and Sonarr and this server's own history,
+ * behind the real API validator.
  */
 
 setupTestDb();
@@ -36,7 +36,7 @@ setupTestDb();
 const DAY = 24 * 60 * 60 * 1000;
 const inDays = (n: number) => new Date(Date.now() + n * DAY).toISOString();
 
-// TMDB, per title: release dates by region for films, the next episode for
+// TMDB per title: release dates by region for films, the next episode for
 // series. Titles without an entry get none.
 let tmdbReleases: Record<number, unknown> = {};
 let tmdbNextEpisode: Record<number, unknown> = {};
@@ -334,7 +334,7 @@ describe('request ETAs', () => {
   });
 
   it('does not call a film released just because Radarr may search for it', async () => {
-    // The Mongoose: minimum availability "announced", so Radarr counts it
+    // The Pangolin: minimum availability "announced", so Radarr counts it
     // available from announcement, but it opens in cinemas in five weeks.
     radarrMovies = {
       20: {
@@ -689,8 +689,8 @@ describe('release dates as the title page shows them', () => {
   });
 
   it('shows the digital date for a film Radarr has no link for', async () => {
-    // Insidious: Out of the Further — in cinemas already, digital ahead, and
-    // Radarr cannot be asked about it.
+    // Vesperline: Out of the Hollow, already in cinemas, digital ahead, and
+    // Radarr can't be queried for it.
     tmdbReleases[31] = us([
       [3, -33],
       [4, 13],
@@ -725,8 +725,8 @@ describe('release dates as the title page shows them', () => {
   });
 
   it('shows the digital date with minimum availability "announced", as on the live server', async () => {
-    // The live setup: default Radarr on "announced", a film it has no link
-    // for, in cinemas already, digital ahead — Insidious: Out of the Further.
+    // The live setup: default Radarr on "announced", a film it has no link for,
+    // already in cinemas, digital ahead (Vesperline: Out of the Hollow).
     getSettings().radarr = [
       {
         id: 0,
@@ -911,8 +911,8 @@ describe('a title being processed with no request', () => {
     ],
   });
 
-  it('estimates Insidious: in Radarr on "announced", no request, in cinemas, digital ahead', async () => {
-    tmdbReleases[1291595] = us([
+  it('estimates Vesperline: in Radarr on "announced", no request, in cinemas, digital ahead', async () => {
+    tmdbReleases[1382706] = us([
       [3, -33],
       [4, 13],
     ]);
@@ -924,7 +924,7 @@ describe('a title being processed with no request', () => {
     };
     const media = await getRepository(Media).save(
       new Media({
-        tmdbId: 1291595,
+        tmdbId: 1382706,
         mediaType: MediaType.MOVIE,
         status: MediaStatus.PROCESSING,
         serviceId: 0,
@@ -1103,8 +1103,8 @@ describe('the approval notification', () => {
   });
 
   it('writes a release date as the date it is, whatever the time zone', async () => {
-    // TMDB gives calendar dates at midnight UTC. Run with TZ=America/Los_Angeles,
-    // local formatting would write Oct 30 as Oct 29.
+    // TMDB gives calendar dates at midnight UTC; with TZ=America/Los_Angeles,
+    // local formatting would turn Oct 30 into Oct 29.
     const { expectedOnApproval } = await import('@server/lib/requestEta');
     getSettings().radarr = [
       {
@@ -1238,7 +1238,7 @@ describe('the approval notification', () => {
       ]
     );
 
-    // The server loads its translations at startup.
+    // The server loads translations at startup.
     (await import('@server/i18n')).initI18n();
     const { default: WebPushAgent } =
       await import('@server/lib/notifications/agents/webpush');

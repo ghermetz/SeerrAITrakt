@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import ExternalAPI from '@server/api/externalapi';
 import { ApiErrorCode } from '@server/constants/error';
+import type { JellyfinFamilyKind } from '@server/constants/server';
 import { MediaServerType } from '@server/constants/server';
 import availabilitySync from '@server/lib/availabilitySync';
 import { getSettings } from '@server/lib/settings';
@@ -18,25 +19,9 @@ export interface JellyfinUserResponse {
   };
   Policy: {
     IsAdministrator: boolean;
+    IsDisabled?: boolean;
   };
   PrimaryImageTag?: string;
-}
-
-export interface JellyfinDevice {
-  Id: string;
-  Name: string;
-  LastUserName: string;
-  AppName: string;
-  AppVersion: string;
-  LastUserId: string;
-  DateLastActivity: string;
-  Capabilities: Record<string, unknown>;
-}
-
-export interface JellyfinDevicesResponse {
-  Items: JellyfinDevice[];
-  TotalRecordCount: number;
-  StartIndex: number;
 }
 
 export interface JellyfinLoginResponse {
@@ -73,7 +58,8 @@ interface JellyfinMediaFolder {
 }
 
 export interface JellyfinLibrary {
-  type: 'show' | 'movie';
+  /** 'music' comes only from getAllLibraries' musicLibraries. */
+  type: 'show' | 'movie' | 'music';
   key: string;
   title: string;
   agent: string;
@@ -85,6 +71,8 @@ export interface JellyfinLibraryItem {
   HasSubtitles: boolean;
   Type: 'Movie' | 'Episode' | 'Season' | 'Series';
   LocationType: 'FileSystem' | 'Offline' | 'Remote' | 'Virtual';
+  /** Names the title in logs. */
+  ProductionYear?: number;
   SeriesName?: string;
   SeriesId?: string;
   SeasonId?: string;
@@ -104,6 +92,13 @@ export interface JellyfinMediaStream {
   RealFrameRate?: number;
   Language?: string;
   DisplayTitle: string;
+  /** Jellyfin: 'SDR' or 'HDR'. */
+  VideoRange?: string;
+  /** Jellyfin: 'SDR', 'HDR10', 'HDR10Plus', 'HLG', 'DOVI', 'DOVIWithHDR10'... */
+  VideoRangeType?: string;
+  /** Emby: 'None', 'Hdr10', 'Hdr10Plus', 'HyperLogGamma', 'DolbyVision'. */
+  ExtendedVideoType?: string;
+  ExtendedVideoSubType?: string;
 }
 
 export interface JellyfinMediaSource {
@@ -134,19 +129,36 @@ type EpisodeReturn<T> = T extends { includeMediaInfo: true }
   ? JellyfinLibraryItemExtended[]
   : JellyfinLibraryItem[];
 
+/**
+ * An album or artist in a music library. MusicBrainz ids come from file tags:
+ * MusicBrainzReleaseGroup is the album, MusicBrainzAlbum one release,
+ * MusicBrainzAlbumArtist and MusicBrainzArtist the artist.
+ */
+export interface JellyfinMusicItem {
+  Id: string;
+  Name: string;
+  Type: 'MusicAlbum' | 'MusicArtist';
+  ProviderIds?: Record<string, string | undefined>;
+  /** Album or artist folder. */
+  Path?: string;
+  DateCreated?: string;
+  ProductionYear?: number;
+  AlbumArtist?: string;
+  AlbumArtists?: { Name: string; Id: string }[];
+  /** Album track count, when the server sends it. */
+  ChildCount?: number;
+}
+
 export interface JellyfinItemsReponse {
   Items: JellyfinLibraryItemExtended[];
   TotalRecordCount: number;
   StartIndex: number;
 }
 
-/**
- * Longest to wait on the server for watch history: asked while someone
- * waits on a page, so a server that is down must fail rather than hang.
- */
+/** Watch history loads while a page waits, so a down server must fail fast. */
 const WATCH_TIMEOUT_MS = 15_000;
 
-/** What a person has done with an item: played, how far, and when last. */
+/** One user's play state for an item. */
 export interface JellyfinUserData {
   Played?: boolean;
   PlayCount?: number;
@@ -155,45 +167,101 @@ export interface JellyfinUserData {
   LastPlayedDate?: string | null;
 }
 
-/** An item as one person sees it, with their own play state. */
+/** An item with one user's play state. */
 export interface JellyfinUserItem extends JellyfinLibraryItem {
   ProductionYear?: number;
   UserData?: JellyfinUserData;
   ProviderIds?: JellyfinLibraryItemExtended['ProviderIds'];
   Path?: string;
+  /** In 100 ns ticks. */
+  RunTimeTicks?: number;
 }
+
+/** A movie, series, episode or album as the match check reads it. */
+export type JellyfinMatchItem = JellyfinUserItem &
+  Pick<JellyfinMusicItem, 'AlbumArtist' | 'AlbumArtists'> & {
+    Type: string;
+  };
 
 export interface JellyfinUserItemsResponse {
   Items: JellyfinUserItem[];
   TotalRecordCount: number;
 }
 
-/** One account on the server, with whether it is switched off. */
+/** One device session from /Sessions. */
+export interface JellyfinSession {
+  UserId?: string;
+  UserName?: string;
+  DeviceName?: string;
+  NowPlayingItem?: {
+    Type?: string;
+    /** Movie or episode id. */
+    Id: string;
+    Name?: string;
+    SeriesId?: string;
+    SeriesName?: string;
+    /** Episode season and number. */
+    ParentIndexNumber?: number;
+    IndexNumber?: number;
+  };
+  PlayState?: { IsPaused?: boolean };
+}
+
+/** A server account. */
 export interface JellyfinAccount {
   Name: string;
   Id: string;
   Policy?: { IsAdministrator?: boolean; IsDisabled?: boolean };
 }
 
+/** A library as user library access stores it. */
+export interface JellyfinAccessFolder {
+  Name: string;
+  Id: string;
+  /** Emby only; what its user policies list. */
+  Guid?: string;
+  Type: string;
+  CollectionType?: string;
+}
+
+/** An account with the policy fields that grant library access. */
+export interface JellyfinPolicyAccount {
+  Name: string;
+  Id: string;
+  Policy: {
+    IsAdministrator?: boolean;
+    IsDisabled?: boolean;
+    EnableAllFolders?: boolean;
+    EnabledFolders?: string[];
+    /** Other fields, sent back unchanged. */
+    [key: string]: unknown;
+  };
+}
+
 class JellyfinAPI extends ExternalAPI {
   private userId?: string;
-  private mediaServerType: MediaServerType;
+  /** Jellyfin and Emby differ in places. */
+  public readonly kind: JellyfinFamilyKind;
 
+  /** `kind` defaults to 'emby' for an Emby primary server, else 'jellyfin'. */
   constructor(
     jellyfinHost: string,
     authToken?: string | null,
-    deviceId?: string | null
+    deviceId?: string | null,
+    kind?: JellyfinFamilyKind
   ) {
     const settings = getSettings();
+    const serverKind: JellyfinFamilyKind =
+      kind ??
+      (settings.main.mediaServerType === MediaServerType.EMBY
+        ? 'emby'
+        : 'jellyfin');
     const safeDeviceId =
       deviceId && deviceId.length > 0
         ? deviceId
         : Buffer.from('BOT_seerr').toString('base64');
 
-    const version =
-      settings.main.mediaServerType === MediaServerType.EMBY
-        ? '1.0.0'
-        : getAppVersion();
+    const version = serverKind === 'emby' ? '1.0.0' : getAppVersion();
 
     let authHeaderVal = `MediaBrowser Client="Seerr", Device="Seerr", DeviceId="${safeDeviceId}", Version="${version}"`;
     if (authToken) {
@@ -212,7 +280,12 @@ class JellyfinAPI extends ExternalAPI {
       }
     );
 
-    this.mediaServerType = settings.main.mediaServerType;
+    this.kind = serverKind;
+  }
+
+  /** Server name for log text. */
+  private get serverName(): string {
+    return this.kind === 'emby' ? 'Emby' : 'Jellyfin';
   }
 
   public async login(
@@ -238,7 +311,7 @@ class JellyfinAPI extends ExternalAPI {
       return await authenticate(true);
     } catch (e) {
       logger.debug('Failed to authenticate with headers', {
-        label: 'Jellyfin API',
+        label: `${this.serverName} API`,
         error: e.response?.statusText,
         ip: ClientIP,
       });
@@ -260,9 +333,9 @@ class JellyfinAPI extends ExternalAPI {
       }
 
       logger.error(
-        `Something went wrong while authenticating with the Jellyfin server: ${e.message}`,
+        `Something went wrong while authenticating with the ${this.serverName} server: ${e.message}`,
         {
-          label: 'Jellyfin API',
+          label: `${this.serverName} API`,
           error: e.response?.status,
           ip: ClientIP,
         }
@@ -286,7 +359,7 @@ class JellyfinAPI extends ExternalAPI {
     } catch (e) {
       logger.error(
         `Something went wrong while initiating Quick Connect: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
 
       if (!e.response) {
@@ -310,7 +383,7 @@ class JellyfinAPI extends ExternalAPI {
     } catch (e) {
       logger.error(
         `Something went wrong while getting Quick Connect status: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
 
       if (!e.response) {
@@ -333,7 +406,7 @@ class JellyfinAPI extends ExternalAPI {
     } catch (e) {
       logger.error(
         `Something went wrong while authenticating with Quick Connect: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
 
       if (!e.response) {
@@ -346,7 +419,6 @@ class JellyfinAPI extends ExternalAPI {
 
   public setUserId(userId: string): void {
     this.userId = userId;
-    return;
   }
 
   public async getSystemInfo(): Promise<any> {
@@ -372,8 +444,8 @@ class JellyfinAPI extends ExternalAPI {
       return serverResponse.ServerName;
     } catch (e) {
       logger.error(
-        `Something went wrong while getting the server name from the Jellyfin server: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        `Something went wrong while getting the server name from the ${this.serverName} server: ${e.message}`,
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
 
       if (!e.response) {
@@ -391,8 +463,8 @@ class JellyfinAPI extends ExternalAPI {
       return { users: userReponse };
     } catch (e) {
       logger.error(
-        `Something went wrong while getting the account from the Jellyfin server: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        `Something went wrong while getting the account from the ${this.serverName} server: ${e.message}`,
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
 
       if (!e.response) {
@@ -401,6 +473,19 @@ class JellyfinAPI extends ExternalAPI {
 
       throw new ApiError(e.response.status, ApiErrorCode.InvalidAuthToken);
     }
+  }
+
+  /**
+   * Every device session with what it plays. Needs the server API key; never
+   * cached.
+   */
+  public async getSessions(): Promise<JellyfinSession[]> {
+    const sessions = await this.get<JellyfinSession[]>(
+      '/Sessions',
+      undefined,
+      0
+    );
+    return Array.isArray(sessions) ? sessions : [];
   }
 
   public async getUser(): Promise<JellyfinUserResponse> {
@@ -411,8 +496,8 @@ class JellyfinAPI extends ExternalAPI {
       return userReponse;
     } catch (e) {
       logger.error(
-        `Something went wrong while getting the account from the Jellyfin server: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        `Something went wrong while getting the account from the ${this.serverName} server: ${e.message}`,
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
 
       if (!e.response) {
@@ -423,25 +508,24 @@ class JellyfinAPI extends ExternalAPI {
     }
   }
 
-  public async getLibraries(): Promise<JellyfinLibrary[]> {
+  private async getMediaFolders(): Promise<JellyfinMediaFolder[]> {
     try {
       const mediaFolderResponse = await this.get<any>(`/Library/MediaFolders`);
 
-      return this.mapLibraries(mediaFolderResponse.Items);
+      return mediaFolderResponse.Items;
     } catch {
-      // fallback to user views to get libraries
-      // this only and maybe/depending on factors affects LDAP users
+      // Fall back to user views, which some LDAP users need.
       try {
         const mediaFolderResponse = await this.get<any>(
           `/Users/${this.userId ?? 'Me'}/Views`
         );
 
-        return this.mapLibraries(mediaFolderResponse.Items);
+        return mediaFolderResponse.Items;
       } catch (e) {
         logger.error(
-          `Something went wrong while getting libraries from the Jellyfin server: ${e.message}`,
+          `Something went wrong while getting libraries from the ${this.serverName} server: ${e.message}`,
           {
-            label: 'Jellyfin API',
+            label: `${this.serverName} API`,
             error: e.response?.status,
           }
         );
@@ -453,6 +537,33 @@ class JellyfinAPI extends ExternalAPI {
         return [];
       }
     }
+  }
+
+  public async getLibraries(): Promise<JellyfinLibrary[]> {
+    return this.mapLibraries(await this.getMediaFolders());
+  }
+
+  /** Movie and series libraries, and music libraries apart, in one request. */
+  public async getAllLibraries(): Promise<{
+    libraries: JellyfinLibrary[];
+    musicLibraries: JellyfinLibrary[];
+  }> {
+    const folders = await this.getMediaFolders();
+    return {
+      libraries: this.mapLibraries(folders),
+      musicLibraries: folders
+        .filter(
+          (folder) =>
+            folder.Type === 'CollectionFolder' &&
+            folder.CollectionType === 'music'
+        )
+        .map((folder) => ({
+          key: folder.Id,
+          title: folder.Name,
+          type: 'music',
+          agent: 'jellyfin',
+        })),
+    };
   }
 
   private mapLibraries(mediaFolders: JellyfinMediaFolder[]): JellyfinLibrary[] {
@@ -492,8 +603,8 @@ class JellyfinAPI extends ExternalAPI {
       );
     } catch (e) {
       logger.error(
-        `Something went wrong while getting library content from the Jellyfin server: ${e.message}`,
-        { label: 'Jellyfin API', error: e?.response?.status }
+        `Something went wrong while getting library content from the ${this.serverName} server: ${e.message}`,
+        { label: `${this.serverName} API`, error: e?.response?.status }
       );
 
       if (!e.response) {
@@ -507,22 +618,20 @@ class JellyfinAPI extends ExternalAPI {
   public async getRecentlyAdded(id: string): Promise<JellyfinLibraryItem[]> {
     try {
       const endpoint =
-        this.mediaServerType === MediaServerType.JELLYFIN
+        this.kind === 'jellyfin'
           ? `/Items/Latest`
           : `/Users/${this.userId}/Items/Latest`;
       const itemResponse = await this.get<any>(
         `${endpoint}?Limit=12&ParentId=${id}${
-          this.mediaServerType === MediaServerType.JELLYFIN
-            ? `&userId=${this.userId ?? 'Me'}`
-            : ''
+          this.kind === 'jellyfin' ? `&userId=${this.userId ?? 'Me'}` : ''
         }`
       );
 
       return itemResponse;
     } catch (e) {
       logger.error(
-        `Something went wrong while getting library content from the Jellyfin server: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        `Something went wrong while getting library content from the ${this.serverName} server: ${e.message}`,
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
 
       if (!e.response) {
@@ -553,8 +662,8 @@ class JellyfinAPI extends ExternalAPI {
       }
 
       logger.error(
-        `Something went wrong while getting library content from the Jellyfin server: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        `Something went wrong while getting library content from the ${this.serverName} server: ${e.message}`,
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
       if (!e.response) {
         throw new ApiError(502, ApiErrorCode.ConnectionError);
@@ -571,8 +680,8 @@ class JellyfinAPI extends ExternalAPI {
       return seasonResponse.Items;
     } catch (e) {
       logger.error(
-        `Something went wrong while getting the list of seasons from the Jellyfin server: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        `Something went wrong while getting the list of seasons from the ${this.serverName} server: ${e.message}`,
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
 
       if (!e.response) {
@@ -606,8 +715,8 @@ class JellyfinAPI extends ExternalAPI {
       );
     } catch (e) {
       logger.error(
-        `Something went wrong while getting the list of episodes from the Jellyfin server: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        `Something went wrong while getting the list of episodes from the ${this.serverName} server: ${e.message}`,
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
 
       if (!e.response) {
@@ -619,10 +728,9 @@ class JellyfinAPI extends ExternalAPI {
   }
 
   /**
-   * Items as one person sees them, with their own play state. Both
-   * Jellyfin and Emby answer /Items with a UserId, so one call serves both;
-   * errors are left to the caller, which knows whether "no answer" may be
-   * read as "nothing".
+   * Items with one user's play state; Jellyfin and Emby both accept /Items
+   * with UserId. Errors go to the caller, which decides whether a failure
+   * means "nothing".
    */
   public async getUserItems(
     userId: string,
@@ -638,10 +746,7 @@ class JellyfinAPI extends ExternalAPI {
     };
   }
 
-  /**
-   * One page of a library's movies or series, with their paths and the ids
-   * the server matched them to.
-   */
+  /** One page of a library's movies or series, with paths and provider ids. */
   public async getLibraryPage(
     libraryId: string,
     type: 'Movie' | 'Series',
@@ -665,7 +770,75 @@ class JellyfinAPI extends ExternalAPI {
     };
   }
 
-  /** Every account on the server, the switched-off ones included. */
+  /**
+   * Items to compare with Sonarr, Radarr or Lidarr: a library's newest by
+   * DateCreated, or those with the given ids, with paths and provider ids.
+   */
+  public async getMatchItems(
+    query:
+      | {
+          libraryId: string;
+          type: 'Movie' | 'Episode' | 'MusicAlbum';
+          newest: number;
+        }
+      | { ids: string[] },
+    timeout: number
+  ): Promise<JellyfinMatchItem[]> {
+    const params =
+      'ids' in query
+        ? { Ids: query.ids.join(',') }
+        : {
+            ParentId: query.libraryId,
+            Recursive: true,
+            IncludeItemTypes: query.type,
+            SortBy: 'DateCreated',
+            SortOrder: 'Descending',
+            Limit: query.newest,
+          };
+    const response = await this.get<{ Items?: JellyfinMatchItem[] }>('/Items', {
+      params: {
+        ...params,
+        Fields: 'Path,ProviderIds,ProductionYear,DateCreated',
+      },
+      timeout,
+    });
+    return response?.Items ?? [];
+  }
+
+  /**
+   * One page of a music library's albums and artists, with folders and
+   * MusicBrainz ids. `newestFirst` finds recent additions.
+   */
+  public async getMusicItems(
+    libraryId: string,
+    {
+      start,
+      limit,
+      newestFirst = false,
+    }: { start: number; limit: number; newestFirst?: boolean }
+  ): Promise<{ Items: JellyfinMusicItem[]; TotalRecordCount: number }> {
+    const response = await this.get<{
+      Items?: JellyfinMusicItem[];
+      TotalRecordCount?: number;
+    }>('/Items', {
+      params: {
+        ParentId: libraryId,
+        Recursive: true,
+        IncludeItemTypes: 'MusicAlbum,MusicArtist',
+        Fields: 'ProviderIds,Path,DateCreated,ChildCount',
+        SortBy: newestFirst ? 'DateCreated,SortName' : 'SortName',
+        SortOrder: newestFirst ? 'Descending' : 'Ascending',
+        StartIndex: start,
+        Limit: limit,
+      },
+    });
+    return {
+      Items: response?.Items ?? [],
+      TotalRecordCount: response?.TotalRecordCount ?? 0,
+    };
+  }
+
+  /** Every server account, disabled ones included. */
   public async getAccounts(): Promise<JellyfinAccount[]> {
     const accounts = await this.get<JellyfinAccount[]>('/Users', {
       timeout: WATCH_TIMEOUT_MS,
@@ -688,6 +861,50 @@ class JellyfinAPI extends ExternalAPI {
     }
   }
 
+  /**
+   * Every library of any kind. User access lists them by Guid on Emby, by Id
+   * on Jellyfin.
+   */
+  public async getAccessFolders(): Promise<JellyfinAccessFolder[]> {
+    const response = await this.get<{ Items?: JellyfinAccessFolder[] }>(
+      '/Library/MediaFolders',
+      { timeout: WATCH_TIMEOUT_MS },
+      0
+    );
+    return (response?.Items ?? []).filter(
+      (folder) => folder.Type === 'CollectionFolder'
+    );
+  }
+
+  /** Every account with its policy, uncached. */
+  public async getPolicyAccounts(): Promise<JellyfinPolicyAccount[]> {
+    const accounts = await this.get<JellyfinPolicyAccount[]>(
+      '/Users',
+      { timeout: WATCH_TIMEOUT_MS },
+      0
+    );
+    return Array.isArray(accounts) ? accounts : [];
+  }
+
+  /** One account with its policy, uncached. */
+  public async getPolicyAccount(id: string): Promise<JellyfinPolicyAccount> {
+    return this.get<JellyfinPolicyAccount>(
+      `/Users/${encodeURIComponent(id)}`,
+      { timeout: WATCH_TIMEOUT_MS },
+      0
+    );
+  }
+
+  /** Replaces an account's whole policy. */
+  public async setPolicy(
+    id: string,
+    policy: JellyfinPolicyAccount['Policy']
+  ): Promise<void> {
+    await this.axios.post(`/Users/${encodeURIComponent(id)}/Policy`, policy, {
+      timeout: WATCH_TIMEOUT_MS,
+    });
+  }
+
   public async createApiToken(appName: string): Promise<string> {
     try {
       await this.post(`/Auth/Keys?App=${appName}`);
@@ -697,8 +914,8 @@ class JellyfinAPI extends ExternalAPI {
       ).AccessToken;
     } catch (e) {
       logger.error(
-        `Something went wrong while creating an API key from the Jellyfin server: ${e.message}`,
-        { label: 'Jellyfin API', error: e.response?.status }
+        `Something went wrong while creating an API key from the ${this.serverName} server: ${e.message}`,
+        { label: `${this.serverName} API`, error: e.response?.status }
       );
 
       if (!e.response) {

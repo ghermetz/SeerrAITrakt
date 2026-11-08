@@ -1,8 +1,11 @@
 import Badge from '@app/components/Common/Badge';
 import BrandLogo from '@app/components/Layout/Sidebar/BrandLogo';
 import VersionStatus from '@app/components/Layout/VersionStatus';
+import SeasonMark from '@app/components/Seasonal/SeasonMark';
+import { loadNavEditor, useNavLayout } from '@app/context/NavLayoutContext';
 import useClickOutside from '@app/hooks/useClickOutside';
 import { useFeatureCheck } from '@app/hooks/useFeature';
+import useLazyModule from '@app/hooks/useLazyModule';
 import { Permission, useUser } from '@app/hooks/useUser';
 import defineMessages from '@app/utils/defineMessages';
 import { Transition, TransitionChild } from '@headlessui/react';
@@ -15,12 +18,15 @@ import {
   ExclamationTriangleIcon,
   EyeSlashIcon,
   FilmIcon,
+  MusicalNoteIcon,
   SparklesIcon,
   TvIcon,
   UsersIcon,
   XMarkIcon,
 } from '@heroicons/react/24/outline';
 import type { Feature } from '@server/constants/features';
+import type { NavItem } from '@server/constants/navigation';
+import { sortByNavOrder, withoutHiddenNav } from '@server/constants/navigation';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { Fragment, useEffect, useRef } from 'react';
@@ -30,10 +36,11 @@ export const menuMessages = defineMessages('components.Layout.Sidebar', {
   dashboard: 'Discover',
   browsemovies: 'Movies',
   browsetv: 'Series',
+  music: 'Music',
   requests: 'Requests',
   calendar: 'Calendar',
   blocklist: 'Blocklist',
-  watchlists: 'Watch Lists',
+  watchlists: 'Lists',
   issues: 'Issues',
   users: 'Users',
   backfill: 'Backfill',
@@ -51,6 +58,8 @@ interface SidebarProps {
 }
 
 interface SidebarLinkProps {
+  /** Its id in each person's saved order (server/constants/navigation). */
+  id: NavItem;
   href: string;
   svgIcon: React.ReactNode;
   messagesKey: keyof typeof menuMessages;
@@ -63,32 +72,60 @@ interface SidebarLinkProps {
   dataTestId?: string;
 }
 
+/** The current page gets the accent gradient. */
+const activeLink =
+  'text-on-accent bg-gradient-to-br from-accent to-accent-alt hover:from-accent-hover hover:to-accent-alt-hover';
+const inactiveLink =
+  'text-strong hover:bg-surface-raised focus:bg-surface-raised';
+
+/** Default order; each person can rearrange. */
 const SidebarLinks: SidebarLinkProps[] = [
   {
+    id: 'discover',
     href: '/',
     messagesKey: 'dashboard',
     svgIcon: <SparklesIcon className="mr-3 h-6 w-6" />,
     activeRegExp: /^\/(discover\/?)?$/,
   },
   {
+    id: 'movies',
     href: '/discover/movies',
     messagesKey: 'browsemovies',
     svgIcon: <FilmIcon className="mr-3 h-6 w-6" />,
     activeRegExp: /^\/discover\/movies$/,
   },
   {
+    id: 'series',
     href: '/discover/tv',
     messagesKey: 'browsetv',
     svgIcon: <TvIcon className="mr-3 h-6 w-6" />,
     activeRegExp: /^\/discover\/tv$/,
   },
   {
+    id: 'lists',
+    href: '/lists',
+    messagesKey: 'watchlists',
+    svgIcon: <BookmarkIcon className="mr-3 h-6 w-6" />,
+    activeRegExp: /^\/lists/,
+  },
+  {
+    id: 'requests',
     href: '/requests',
     messagesKey: 'requests',
     svgIcon: <ClockIcon className="mr-3 h-6 w-6" />,
     activeRegExp: /^\/requests/,
   },
   {
+    id: 'music',
+    href: '/discover/music',
+    messagesKey: 'music',
+    // Only once Lidarr is set up, for people with music on.
+    feature: 'music',
+    svgIcon: <MusicalNoteIcon className="mr-3 h-6 w-6" />,
+    activeRegExp: /^\/(discover\/music|music\/)/,
+  },
+  {
+    id: 'calendar',
     href: '/calendar',
     messagesKey: 'calendar',
     feature: 'releaseCalendar',
@@ -96,12 +133,7 @@ const SidebarLinks: SidebarLinkProps[] = [
     activeRegExp: /^\/calendar/,
   },
   {
-    href: '/lists',
-    messagesKey: 'watchlists',
-    svgIcon: <BookmarkIcon className="mr-3 h-6 w-6" />,
-    activeRegExp: /^\/lists/,
-  },
-  {
+    id: 'blocklist',
     href: '/blocklist',
     messagesKey: 'blocklist',
     svgIcon: <EyeSlashIcon className="mr-3 h-6 w-6" />,
@@ -113,6 +145,7 @@ const SidebarLinks: SidebarLinkProps[] = [
     permissionType: 'or',
   },
   {
+    id: 'issues',
     href: '/issues',
     messagesKey: 'issues',
     svgIcon: <ExclamationTriangleIcon className="mr-3 h-6 w-6" />,
@@ -125,6 +158,7 @@ const SidebarLinks: SidebarLinkProps[] = [
     permissionType: 'or',
   },
   {
+    id: 'users',
     href: '/users',
     messagesKey: 'users',
     svgIcon: <UsersIcon className="mr-3 h-6 w-6" />,
@@ -133,6 +167,7 @@ const SidebarLinks: SidebarLinkProps[] = [
     dataTestId: 'sidebar-menu-users',
   },
   {
+    id: 'backfill',
     href: '/backfill',
     messagesKey: 'backfill',
     svgIcon: <DocumentMagnifyingGlassIcon className="mr-3 h-6 w-6" />,
@@ -141,6 +176,7 @@ const SidebarLinks: SidebarLinkProps[] = [
     dataTestId: 'sidebar-menu-backfill',
   },
   {
+    id: 'settings',
     href: '/settings',
     messagesKey: 'settings',
     svgIcon: <CogIcon className="mr-3 h-6 w-6" />,
@@ -163,7 +199,37 @@ const Sidebar = ({
   const intl = useIntl();
   const { hasPermission } = useUser();
   const featureIsOn = useFeatureCheck();
+  const { draft, setDraft, order, hidden } = useNavLayout();
+  // Discover loads it when customizing starts and reports a failure.
+  const NavEditor = useLazyModule(loadNavEditor, !!draft, () => undefined);
   useClickOutside(navRef, () => setClosed());
+
+  // Usable items in the person's order. Unusable ones (permission, feature
+  // off) keep their place in the order but are left out here.
+  const usable = sortByNavOrder(SidebarLinks, order)
+    .filter((link) => !link.feature || featureIsOn(link.feature))
+    .filter((link) =>
+      link.requiredPermission
+        ? hasPermission(link.requiredPermission, {
+            type: link.permissionType ?? 'and',
+          })
+        : true
+    );
+  const links = withoutHiddenNav(usable, hidden);
+
+  // While arranging the menu (from Discover), the editor replaces the links.
+  const editor =
+    draft && NavEditor ? (
+      <NavEditor
+        items={usable.map((link) => ({
+          id: link.id,
+          name: intl.formatMessage(menuMessages[link.messagesKey]),
+          icon: link.svgIcon as React.ReactElement<{ className?: string }>,
+        }))}
+        draft={draft}
+        onChange={setDraft}
+      />
+    ) : null;
 
   useEffect(() => {
     if (openIssuesCount) {
@@ -195,7 +261,7 @@ const Sidebar = ({
               leaveTo="opacity-0"
             >
               <div className="fixed inset-0">
-                <div className="absolute inset-0 bg-gray-900 opacity-90" />
+                <div className="absolute inset-0 bg-overlay-strong opacity-90" />
               </div>
             </TransitionChild>
             <TransitionChild
@@ -208,7 +274,10 @@ const Sidebar = ({
               leaveTo="-translate-x-full"
             >
               <>
-                <div className="sidebar relative flex h-full w-full max-w-xs flex-1 flex-col bg-gray-800">
+                <div
+                  className="sidebar relative flex h-full w-full max-w-xs flex-1 flex-col bg-sidebar"
+                  data-seerr="sidebar"
+                >
                   <div className="sidebar-close-button absolute right-0 -mr-14 p-1">
                     <button
                       className="flex h-12 w-12 items-center justify-center rounded-full focus:bg-gray-600 focus:outline-none"
@@ -224,23 +293,15 @@ const Sidebar = ({
                   >
                     <div className="flex flex-shrink-0 items-center px-2">
                       <span className="w-full px-4 text-xl text-gray-50">
-                        <Link href="/" className="block h-24 w-64">
+                        <Link href="/" className="relative block h-24 w-64">
                           <BrandLogo />
+                          <SeasonMark className="absolute right-6 top-3 h-6 w-6" />
                         </Link>
                       </span>
                     </div>
                     <nav className="mt-10 flex-1 space-y-4 px-4">
-                      {SidebarLinks.filter(
-                        (link) => !link.feature || featureIsOn(link.feature)
-                      )
-                        .filter((link) =>
-                          link.requiredPermission
-                            ? hasPermission(link.requiredPermission, {
-                                type: link.permissionType ?? 'and',
-                              })
-                            : true
-                        )
-                        .map((sidebarLink) => {
+                      {editor ??
+                        links.map((sidebarLink) => {
                           return (
                             <Link
                               key={`mobile-${sidebarLink.messagesKey}`}
@@ -254,10 +315,10 @@ const Sidebar = ({
                               }}
                               role="button"
                               tabIndex={0}
-                              className={`flex items-center rounded-md px-2 py-2 text-base font-medium leading-6 text-white transition duration-150 ease-in-out focus:outline-none ${
+                              className={`flex items-center rounded-md px-2 py-2 text-base font-medium leading-6 transition duration-150 ease-in-out focus:outline-none ${
                                 router.pathname.match(sidebarLink.activeRegExp)
-                                  ? 'bg-gradient-to-br from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500'
-                                  : 'hover:bg-gray-700 focus:bg-gray-700'
+                                  ? activeLink
+                                  : inactiveLink
                               } `}
                               data-testid={`${sidebarLink.dataTestId}-mobile`}
                             >
@@ -277,7 +338,7 @@ const Sidebar = ({
                   </div>
                 </div>
                 <div className="w-14 flex-shrink-0">
-                  {/* <!-- Force sidebar to shrink to fit close icon --> */}
+                  {/* Shrinks the sidebar to fit the close icon. */}
                 </div>
               </>
             </TransitionChild>
@@ -286,37 +347,29 @@ const Sidebar = ({
       </div>
 
       <div className="fixed bottom-0 left-0 top-0 z-30 hidden lg:flex lg:flex-shrink-0">
-        <div className="sidebar flex w-64 flex-col">
+        <div className="sidebar flex w-64 flex-col" data-seerr="sidebar">
           <div className="flex h-0 flex-1 flex-col">
             <div className="flex flex-1 flex-col overflow-y-auto pb-4">
               <div className="flex flex-shrink-0 items-center">
                 <span className="w-full px-4 py-2 text-2xl text-gray-50">
-                  <Link href="/" className="block h-24">
+                  <Link href="/" className="relative block h-24">
                     <BrandLogo eager />
+                    <SeasonMark className="absolute right-0 top-3 h-6 w-6" />
                   </Link>
                 </span>
               </div>
               <nav className="mt-8 flex-1 space-y-4 px-4">
-                {SidebarLinks.filter(
-                  (link) => !link.feature || featureIsOn(link.feature)
-                )
-                  .filter((link) =>
-                    link.requiredPermission
-                      ? hasPermission(link.requiredPermission, {
-                          type: link.permissionType ?? 'and',
-                        })
-                      : true
-                  )
-                  .map((sidebarLink) => {
+                {editor ??
+                  links.map((sidebarLink) => {
                     return (
                       <Link
                         key={`desktop-${sidebarLink.messagesKey}`}
                         href={sidebarLink.href}
                         as={sidebarLink.as}
-                        className={`group flex items-center rounded-md px-2 py-2 text-lg font-medium leading-6 text-white transition duration-150 ease-in-out focus:outline-none ${
+                        className={`group flex items-center rounded-md px-2 py-2 text-lg font-medium leading-6 transition duration-150 ease-in-out focus:outline-none ${
                           router.pathname.match(sidebarLink.activeRegExp)
-                            ? 'bg-gradient-to-br from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500'
-                            : 'hover:bg-gray-700 focus:bg-gray-700'
+                            ? activeLink
+                            : inactiveLink
                         } `}
                         data-testid={sidebarLink.dataTestId}
                       >
@@ -329,12 +382,19 @@ const Sidebar = ({
                           hasPermission(Permission.MANAGE_REQUESTS) && (
                             <div className="ml-auto flex">
                               <Badge
-                                className={`rounded-md bg-gradient-to-br ${
+                                badgeType={
                                   router.pathname.match(
                                     sidebarLink.activeRegExp
                                   )
-                                    ? 'border-indigo-600 from-indigo-700 to-purple-700'
-                                    : 'border-indigo-500 from-indigo-600 to-purple-600'
+                                    ? 'deep'
+                                    : 'default'
+                                }
+                                className={`rounded-md ${
+                                  router.pathname.match(
+                                    sidebarLink.activeRegExp
+                                  )
+                                    ? ''
+                                    : '!border-accent-hover bg-gradient-to-br from-accent to-accent-alt'
                                 }`}
                               >
                                 {pendingRequestsCount}
@@ -346,12 +406,19 @@ const Sidebar = ({
                           hasPermission(Permission.MANAGE_ISSUES) && (
                             <div className="ml-auto flex">
                               <Badge
-                                className={`rounded-md bg-gradient-to-br ${
+                                badgeType={
                                   router.pathname.match(
                                     sidebarLink.activeRegExp
                                   )
-                                    ? 'border-indigo-600 from-indigo-700 to-purple-700'
-                                    : 'border-indigo-500 from-indigo-600 to-purple-600'
+                                    ? 'deep'
+                                    : 'default'
+                                }
+                                className={`rounded-md ${
+                                  router.pathname.match(
+                                    sidebarLink.activeRegExp
+                                  )
+                                    ? ''
+                                    : '!border-accent-hover bg-gradient-to-br from-accent to-accent-alt'
                                 }`}
                               >
                                 {openIssuesCount}

@@ -5,14 +5,14 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, it, mock } from 'node:test';
 
 /*
- * Backfill's news, gathered: a burst of downloads finishing is one
+ * Backfill notices are batched: a burst of finished downloads is one
  * notification, grouped by title, sent once things go quiet.
  */
 
 const notice = (over: Partial<Notice>): Notice => ({
   kind: 'finished',
   seriesId: 1,
-  title: 'SpongeBob SquarePants',
+  title: 'ReefRoy TidePants',
   what: 'S17E02',
   url: '/backfill/jobs/1',
   ...over,
@@ -26,7 +26,7 @@ afterEach(() => {
 describe('Backfill notices', () => {
   it('says one thing as it is', () => {
     const one = summarize([notice({})]);
-    assert.equal(one.subject, 'SpongeBob SquarePants: download finished');
+    assert.equal(one.subject, 'ReefRoy TidePants: download finished');
     assert.equal(one.message, 'S17E02');
     assert.equal(one.actionUrl, '/backfill/jobs/1');
   });
@@ -50,7 +50,7 @@ describe('Backfill notices', () => {
     ]);
     assert.equal(
       burst.subject,
-      'SpongeBob SquarePants: 1 download failed, 7 downloads finished'
+      'ReefRoy TidePants: 1 download failed, 7 downloads finished'
     );
     assert.equal(
       burst.message,
@@ -63,7 +63,7 @@ describe('Backfill notices', () => {
     const many = summarize([
       notice({}),
       notice({ what: 'S17E03' }),
-      notice({ seriesId: 2, title: 'Casper', kind: 'found', what: 'a pack' }),
+      notice({ seriesId: 2, title: 'Wendle', kind: 'found', what: 'a pack' }),
     ]);
     assert.equal(
       many.subject,
@@ -71,9 +71,40 @@ describe('Backfill notices', () => {
     );
     assert.equal(
       many.message,
-      'SpongeBob SquarePants: 2 downloads finished\nCasper: 1 pack waits for approval'
+      'ReefRoy TidePants: 2 downloads finished\nWendle: 1 pack waits for approval'
     );
-    assert.equal(many.actionUrl, '/backfill');
+    // A pack waits: Backfill's list of packs waiting for approval.
+    assert.equal(many.actionUrl, '/backfill#awaiting');
+    assert.equal(
+      summarize([notice({}), notice({ seriesId: 2, title: 'Wendle' })])
+        .actionUrl,
+      '/backfill'
+    );
+  });
+
+  it('opens a pack waiting for approval at its review', () => {
+    const pack = (id: number, seriesId = 1) =>
+      notice({
+        kind: 'found',
+        seriesId,
+        what: `pack ${id}`,
+        url: `/backfill/series/${seriesId}?pack=${id}#review`,
+      });
+    // One: that pack, as its notice links.
+    assert.equal(
+      summarize([pack(7)]).actionUrl,
+      '/backfill/series/1?pack=7#review'
+    );
+    // One title, one pack among other news: still that pack.
+    assert.equal(
+      summarize([notice({}), pack(7)]).actionUrl,
+      '/backfill/series/1?pack=7#review'
+    );
+    // One title, two packs: its review, with the best one on show.
+    assert.equal(
+      summarize([pack(7), pack(8)]).actionUrl,
+      '/backfill/series/1#review'
+    );
   });
 
   it('waits until things go quiet, but not forever', () => {
@@ -98,7 +129,7 @@ describe('Backfill notices', () => {
       mock.timers.tick(60_000);
     }
     assert.equal(sent.length, 1);
-    assert.match(sent[0], /^SpongeBob SquarePants: \d+ downloads finished$/);
+    assert.match(sent[0], /^ReefRoy TidePants: \d+ downloads finished$/);
     assert.equal(backfillNotices.held().length, 0);
   });
 });

@@ -1,8 +1,9 @@
 import RadarrAPI from '@server/api/servarr/radarr';
 import SonarrAPI from '@server/api/servarr/sonarr';
 import TheMovieDb from '@server/api/themoviedb';
-import { MediaType } from '@server/constants/media';
+import { MediaType, isVideo } from '@server/constants/media';
 import type Media from '@server/entity/Media';
+import type { DVRSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 
@@ -17,46 +18,28 @@ export class NoArrServerError extends Error {
 /**
  * Removes a title from Radarr or Sonarr and deletes its files.
  *
- * Shared by the manage panel's "remove file" action and by blocklisting, so
- * there is one path that decides which server holds a title. Status changes
- * are left to the caller: removing a file marks media DELETED, while a
- * blocklist keeps it BLOCKLISTED.
+ * Shared by "remove file" and blocklisting. The caller sets the status
+ * (DELETED or BLOCKLISTED).
  */
 export const removeFromArr = async (
   media: Media,
   is4k: boolean,
   { addImportExclusion = false }: { addImportExclusion?: boolean } = {}
 ): Promise<void> => {
+  // Music titles hold Lidarr ids; never read them as Radarr/Sonarr ids.
+  if (!isVideo(media.mediaType)) {
+    throw new NoArrServerError('Radarr or Sonarr');
+  }
   const settings = getSettings();
   const isMovie = media.mediaType === MediaType.MOVIE;
+  const servers: DVRSettings[] = isMovie ? settings.radarr : settings.sonarr;
 
-  let serviceSettings;
-  if (isMovie) {
-    serviceSettings = settings.radarr.find(
-      (radarr) => radarr.isDefault && radarr.is4k === is4k
-    );
-  } else {
-    serviceSettings = settings.sonarr.find(
-      (sonarr) => sonarr.isDefault && sonarr.is4k === is4k
-    );
-  }
-
+  // The server it was sent to, else the default. Id 0 is a valid server.
   const specificServiceId = is4k ? media.serviceId4k : media.serviceId;
-  if (
-    specificServiceId &&
-    specificServiceId >= 0 &&
-    serviceSettings?.id !== specificServiceId
-  ) {
-    if (isMovie) {
-      serviceSettings = settings.radarr.find(
-        (radarr) => radarr.id === specificServiceId
-      );
-    } else {
-      serviceSettings = settings.sonarr.find(
-        (sonarr) => sonarr.id === specificServiceId
-      );
-    }
-  }
+  const serviceSettings =
+    specificServiceId != null && specificServiceId >= 0
+      ? servers.find((server) => server.id === specificServiceId)
+      : servers.find((server) => server.isDefault && server.is4k === is4k);
 
   if (!serviceSettings) {
     const arrName = `${is4k ? '4K ' : ''}${isMovie ? 'Radarr' : 'Sonarr'}`;

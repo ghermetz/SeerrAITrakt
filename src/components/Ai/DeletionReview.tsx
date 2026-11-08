@@ -13,7 +13,7 @@ const messages = defineMessages('components.Ai.DeletionReview', {
   review: 'Review with AI',
   title: 'Review Deletions',
   intro:
-    'Titles that may be deleted by mistake: someone part-way through, rewatched often, recently requested or on a watch list.',
+    'Titles someone may still want: mid-watch, often rewatched, recently requested or on a watch list.',
   none: 'Nothing looks like a mistake.',
   deletes: 'Deletes {date}',
 });
@@ -27,8 +27,8 @@ interface Flagged {
 }
 
 /**
- * A second look at what Maintainerr is about to delete, for those who
- * manage requests: the titles that may be a mistake, each with its Keep.
+ * For request managers: flags Maintainerr deletions that may be mistakes, each
+ * with a Keep action.
  */
 const DeletionReview = () => {
   const intl = useIntl();
@@ -63,7 +63,7 @@ const DeletionReview = () => {
       <button
         type="button"
         onClick={show}
-        className="ml-3 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs text-indigo-300 ring-1 ring-gray-700 transition hover:text-indigo-200 hover:ring-gray-500"
+        className="ml-3 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs text-indigo-300 ring-1 ring-gray-700 transition hover:text-indigo-200 hover:ring-gray-500 light:text-accent-text light:hover:text-accent-text"
       >
         <SparklesIcon className="h-4 w-4" />
         {intl.formatMessage(messages.review)}
@@ -88,11 +88,11 @@ const DeletionReview = () => {
               <div className="flex items-baseline justify-between gap-3">
                 <Link
                   href={`/${item.mediaType}/${item.tmdbId}`}
-                  className="font-semibold text-white hover:underline"
+                  className="font-semibold text-strong hover:underline"
                 >
                   {item.title}
                 </Link>
-                <span className="flex-none text-xs text-red-300">
+                <span className="flex-none text-xs text-red-300 light:text-danger-text">
                   {intl.formatMessage(messages.deletes, {
                     date: intl.formatDate(item.deleteAt, {
                       month: 'short',

@@ -17,26 +17,33 @@ import type {
   TmdbTvDetails,
   TmdbTvSeasonResult,
 } from '@server/api/themoviedb/interfaces';
+import Tvdb from '@server/api/tvdb';
 import { ApiErrorCode } from '@server/constants/error';
 import {
   MediaRequestStatus,
   MediaStatus,
   MediaType,
 } from '@server/constants/media';
-import { MediaServerType } from '@server/constants/server';
+import type { MediaServerKind } from '@server/constants/server';
+import { MEDIA_SERVER_KINDS, typeOfKind } from '@server/constants/server';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import MediaRequest from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
+import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
+import { scheduledJobs } from '@server/job/schedule';
 import availabilitySync from '@server/lib/availabilitySync';
+import { removeServer } from '@server/lib/mediaServerAdmin';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
-import { getSettings } from '@server/lib/settings';
+import { MetadataProviderType, getSettings } from '@server/lib/settings';
 import { setupTestDb } from '@server/test/db';
 import { ApiError } from '@server/types/error';
+import schedule from 'node-schedule';
 
-// --- Mock JellyfinAPI ---
-let getSystemInfoImpl: () => Promise<Record<string, unknown>> = async () => ({
+let getSystemInfoImpl: (
+  kind: JellyfinAPI['kind']
+) => Promise<Record<string, unknown>> = async () => ({
   ServerName: 'Test',
 });
 let getItemDataImpl: (
@@ -52,7 +59,8 @@ let getEpisodesImpl: (
 
 Object.defineProperty(JellyfinAPI.prototype, 'getSystemInfo', {
   get() {
-    return async () => getSystemInfoImpl();
+    const kind = (this as JellyfinAPI).kind;
+    return async () => getSystemInfoImpl(kind);
   },
   set() {},
   configurable: true,
@@ -91,7 +99,6 @@ Object.defineProperty(JellyfinAPI.prototype, 'setUserId', {
   configurable: true,
 });
 
-// --- Mock PlexAPI ---
 let getMetadataImpl: (
   key: string,
   options?: { includeChildren?: boolean }
@@ -129,7 +136,6 @@ Object.defineProperty(PlexAPI.prototype, 'getChildrenMetadata', {
   configurable: true,
 });
 
-// --- Mock SonarrAPI ---
 let getSeriesByIdImpl: (id: number) => Promise<SonarrSeries> = async () => {
   throw new Error('404');
 };
@@ -142,7 +148,6 @@ Object.defineProperty(SonarrAPI.prototype, 'getSeriesById', {
   configurable: true,
 });
 
-// --- Mock RadarrAPI ---
 let getMovieImpl: (id: number) => Promise<RadarrMovie> = async () => {
   throw new Error('404');
 };
@@ -155,7 +160,20 @@ Object.defineProperty(RadarrAPI.prototype, 'getMovie', {
   configurable: true,
 });
 
-// --- Mock TheMovieDb ---
+/** Looking a title up again by its own id, after its stored id is gone. */
+let lookupSeriesImpl: (tvdbId: number) => Promise<SonarrSeries> = async () => {
+  throw new Error('Series not found');
+};
+SonarrAPI.prototype.getSeriesByTvdbId = async function (tvdbId: number) {
+  return lookupSeriesImpl(tvdbId);
+};
+let lookupMovieImpl: (tmdbId: number) => Promise<RadarrMovie> = async () => {
+  throw new Error('Movie not found');
+};
+RadarrAPI.prototype.getMovieByTmdbId = async function (tmdbId: number) {
+  return lookupMovieImpl(tmdbId);
+};
+
 let getTvShowImpl: (args: {
   tvId: number;
   language?: string;
@@ -183,15 +201,13 @@ Object.defineProperty(TheMovieDb.prototype, 'getShowByTvdbIdForScan', {
   configurable: true,
 });
 
-// getTvShowForScan is assigned in the constructor, so the prototype stub misses
-// the instance availabilitySync built when it was first imported
+// getTvShowForScan is assigned in the constructor, so stub the instance built
+// at import; a prototype stub misses it.
 Object.defineProperty(availabilitySync.tmdb, 'getTvShowForScan', {
   value: async (args: { tvId: number; language?: string }) =>
     getTvShowImpl(args),
   configurable: true,
 });
-
-// --- Helpers ---
 
 function fakeTmdbShow(
   tmdbId: number,
@@ -300,21 +316,25 @@ function configureRadarr(overrides: Partial<RadarrSettings>[] = [{}]): void {
   settings.sonarr = [];
 }
 
-function configureJellyfin(): void {
+/** Connects only these servers, the first as primary. */
+function connectServers(...kinds: MediaServerKind[]): void {
   const settings = getSettings();
-  settings.main.mediaServerType = MediaServerType.JELLYFIN;
-  settings.jellyfin = {
-    ...settings.jellyfin,
-    apiKey: 'test-api-key',
-  };
+  settings.main.mediaServerType = typeOfKind(kinds[0]);
+  for (const kind of MEDIA_SERVER_KINDS) {
+    settings[kind].connected = kinds.includes(kind);
+  }
+  settings.jellyfin = { ...settings.jellyfin, apiKey: 'test-api-key' };
+  settings.emby = { ...settings.emby, apiKey: 'test-emby-key' };
+}
+
+function configureJellyfin(): void {
+  connectServers('jellyfin');
 }
 
 function configurePlex(): void {
-  const settings = getSettings();
-  settings.main.mediaServerType = MediaServerType.PLEX;
+  connectServers('plex');
 }
 
-// --- Jellyfin helpers ---
 function fakeJellyfinSeason(
   seasonNumber: number,
   id?: string
@@ -357,7 +377,6 @@ function fakeJellyfinShow(
   };
 }
 
-// --- Plex helpers ---
 function fakePlexSeason(seasonNumber: number, ratingKey: string): PlexMetadata {
   return {
     ratingKey,
@@ -422,7 +441,6 @@ function fakePlexShow(ratingKey: string): PlexMetadata {
   };
 }
 
-// --- Sonarr helpers ---
 function fakeSonarrSeasons(
   totalSeasons: number,
   seasonsWithFiles: Record<number, number>
@@ -457,6 +475,12 @@ describe('AvailabilitySync', () => {
     };
     getMovieImpl = async () => {
       throw new Error('404');
+    };
+    lookupSeriesImpl = async () => {
+      throw new Error('Series not found');
+    };
+    lookupMovieImpl = async () => {
+      throw new Error('Movie not found');
     };
     getTvShowImpl = async ({ tvId }) =>
       fakeTmdbShow(
@@ -714,8 +738,8 @@ describe('AvailabilitySync', () => {
         return undefined;
       };
 
-      // MOCK REAL BEHAVIOR: Jellyfin returns ALL 8 season metadata entries
-      // even though only season 6 has actual episode files.
+      // Jellyfin returns all 8 season entries though only season 6 has
+      // episode files.
       getSeasonsImpl = async (seriesID: string) => {
         if (seriesID === 'jellyfin-house3-id') {
           return Array.from({ length: 8 }, (_, i) =>
@@ -725,7 +749,7 @@ describe('AvailabilitySync', () => {
         return [];
       };
 
-      // Only season 6 has actual episodes
+      // Only season 6 has episodes.
       getEpisodesImpl = async (_seriesID: string, seasonID: string) => {
         if (seasonID === 'jellyfin-house3-s6-id') {
           return fakeJellyfinEpisodes(21);
@@ -1002,8 +1026,7 @@ describe('AvailabilitySync', () => {
         throw new Error('404');
       };
 
-      // Plex returns ALL 8 season metadata entries,
-      // but only season 6 has episode files
+      // Plex returns all 8 season entries; only season 6 has episode files.
       getChildrenMetadataImpl = async (key: string) => {
         if (key === 'plex-house-rk') {
           return Array.from({ length: 8 }, (_, i) =>
@@ -1148,6 +1171,130 @@ describe('AvailabilitySync', () => {
         MediaStatus.DELETED,
         'Show deleted from its origin instance and Plex must not be kept alive by a colliding externalServiceId on another standard instance'
       );
+    });
+
+    describe('a season on its way when the show leaves Sonarr', () => {
+      const seedShow = async (tmdbId: number) => {
+        const media = new Media();
+        media.tmdbId = tmdbId;
+        media.tvdbId = tmdbId + 70000;
+        media.mediaType = MediaType.TV;
+        media.status = MediaStatus.PARTIALLY_AVAILABLE;
+        media.ratingKey = `gone-${tmdbId}`;
+        media.externalServiceId = 300;
+        media.serviceId = 0;
+        media.seasons = [
+          new Season({
+            seasonNumber: 1,
+            status: MediaStatus.AVAILABLE,
+            status4k: MediaStatus.UNKNOWN,
+          }),
+          new Season({
+            seasonNumber: 2,
+            status: MediaStatus.PROCESSING,
+            status4k: MediaStatus.UNKNOWN,
+          }),
+        ];
+        await getRepository(Media).save(media);
+        const inserted = await getRepository(MediaRequest)
+          .createQueryBuilder()
+          .insert()
+          .into(MediaRequest)
+          .values({
+            status: MediaRequestStatus.APPROVED,
+            media: { id: media.id },
+            requestedBy: { id: 1 },
+            type: MediaType.TV,
+            is4k: false,
+          })
+          .callListeners(false)
+          .execute();
+        await getRepository(SeasonRequest)
+          .createQueryBuilder()
+          .insert()
+          .into(SeasonRequest)
+          .values({
+            seasonNumber: 2,
+            status: MediaRequestStatus.APPROVED,
+            request: { id: inserted.identifiers[0].id },
+          })
+          .callListeners(false)
+          .execute();
+        return media;
+      };
+      const reload = (tmdbId: number) =>
+        getRepository(Media).findOneOrFail({
+          where: { tmdbId },
+          relations: ['seasons'],
+        });
+      const requestFor = (media: Media) =>
+        getRepository(MediaRequest).findOneOrFail({
+          where: { media: { id: media.id } },
+        });
+
+      it('counts as deleted and closes its request once Sonarr has no such show', async () => {
+        configurePlex();
+        configureSonarr([{ syncEnabled: true }]);
+        const media = await seedShow(3100);
+
+        await availabilitySync.run();
+
+        const updated = await reload(3100);
+        assert.strictEqual(updated.status, MediaStatus.DELETED);
+        for (const season of updated.seasons) {
+          assert.strictEqual(season.status, MediaStatus.DELETED);
+        }
+        assert.strictEqual(updated.externalServiceId, null);
+        assert.notStrictEqual(
+          (await requestFor(media)).status,
+          MediaRequestStatus.APPROVED
+        );
+      });
+
+      it('stays on its way while Sonarr still has the show, without files yet', async () => {
+        configurePlex();
+        configureSonarr([{ syncEnabled: true }]);
+        const media = await seedShow(3101);
+        getSeriesByIdImpl = async (id: number) =>
+          ({
+            id,
+            tvdbId: 73101,
+            statistics: { episodeFileCount: 0 },
+            seasons: fakeSonarrSeasons(2, {}),
+          }) as unknown as SonarrSeries;
+
+        await availabilitySync.run();
+
+        const updated = await reload(3101);
+        assert.strictEqual(
+          updated.seasons.find((season) => season.seasonNumber === 2)?.status,
+          MediaStatus.PROCESSING
+        );
+        assert.strictEqual(updated.externalServiceId, 300);
+        assert.strictEqual(
+          (await requestFor(media)).status,
+          MediaRequestStatus.APPROVED
+        );
+      });
+
+      it('is found again when the show was added to Sonarr again under a new id', async () => {
+        configurePlex();
+        configureSonarr([{ syncEnabled: true }]);
+        await seedShow(3102);
+        lookupSeriesImpl = async (tvdbId: number) =>
+          ({
+            id: 301,
+            tvdbId,
+            statistics: { episodeFileCount: 10 },
+            seasons: fakeSonarrSeasons(2, { 1: 10 }),
+          }) as unknown as SonarrSeries;
+
+        await availabilitySync.run();
+
+        const updated = await reload(3102);
+        assert.notStrictEqual(updated.status, MediaStatus.DELETED);
+        assert.strictEqual(updated.externalServiceId, 301);
+      });
     });
 
     it('should assume season exists when getChildrenMetadata fails for episodes (safe fallback)', async () => {
@@ -1408,9 +1555,9 @@ describe('AvailabilitySync', () => {
 
       const mediaRepository = getRepository(Media);
 
-      // The Plex scanner writes the same rating key to both versions of a
-      // merged item, and a prior deletion left no externalServiceId4k to
-      // query, so retention rides on the Plex check alone.
+      // Plex writes the same rating key to both versions of a merged item,
+      // and a prior deletion left no externalServiceId4k, so retention relies
+      // on the Plex check alone.
       const media = new Media();
       media.tmdbId = 687163;
       media.mediaType = MediaType.MOVIE;
@@ -1609,6 +1756,9 @@ describe('AvailabilitySync', () => {
     it('should keep service metadata when deleting a 4K movie with an approved 4K request in flight', async () => {
       configurePlex();
       configureRadarr([{ is4k: true, syncEnabled: true }]);
+      // Radarr still has it, without its file yet.
+      getMovieImpl = async (id: number) =>
+        ({ id, tmdbId: 687167, hasFile: false }) as RadarrMovie;
 
       const mediaRepository = getRepository(Media);
 
@@ -1658,6 +1808,72 @@ describe('AvailabilitySync', () => {
         'req-in-flight-rk',
         'ratingKey4k must be kept while an approved 4K request is in flight'
       );
+    });
+
+    it('closes an approved request for a movie Radarr no longer has, so it can be requested again', async () => {
+      configurePlex();
+      configureRadarr([{ is4k: true, syncEnabled: true }]);
+
+      const mediaRepository = getRepository(Media);
+      const media = new Media();
+      media.tmdbId = 687169;
+      media.mediaType = MediaType.MOVIE;
+      media.status = MediaStatus.UNKNOWN;
+      media.status4k = MediaStatus.AVAILABLE;
+      media.ratingKey4k = 'gone-rk';
+      media.serviceId4k = 0;
+      media.externalServiceId4k = 513;
+      await mediaRepository.save(media);
+      await getRepository(MediaRequest)
+        .createQueryBuilder()
+        .insert()
+        .into(MediaRequest)
+        .values({
+          status: MediaRequestStatus.APPROVED,
+          media: { id: media.id },
+          requestedBy: { id: 1 },
+          type: MediaType.MOVIE,
+          is4k: true,
+        })
+        .callListeners(false)
+        .execute();
+
+      await availabilitySync.run();
+
+      const updated = await mediaRepository.findOneOrFail({
+        where: { tmdbId: 687169 },
+      });
+      assert.strictEqual(updated.status4k, MediaStatus.DELETED);
+      assert.strictEqual(updated.externalServiceId4k, null);
+      const request = await getRepository(MediaRequest).findOneOrFail({
+        where: { media: { id: media.id } },
+      });
+      assert.strictEqual(request.status, MediaRequestStatus.COMPLETED);
+    });
+
+    it('finds a movie removed from Radarr and added again under a new id', async () => {
+      configurePlex();
+      configureRadarr([{ is4k: true, syncEnabled: true }]);
+      lookupMovieImpl = async (tmdbId: number) =>
+        ({ id: 900, tmdbId, hasFile: true }) as RadarrMovie;
+
+      const mediaRepository = getRepository(Media);
+      const media = new Media();
+      media.tmdbId = 687170;
+      media.mediaType = MediaType.MOVIE;
+      media.status = MediaStatus.UNKNOWN;
+      media.status4k = MediaStatus.AVAILABLE;
+      media.serviceId4k = 0;
+      media.externalServiceId4k = 514;
+      await mediaRepository.save(media);
+
+      await availabilitySync.run();
+
+      const updated = await mediaRepository.findOneOrFail({
+        where: { tmdbId: 687170 },
+      });
+      assert.strictEqual(updated.status4k, MediaStatus.AVAILABLE);
+      assert.strictEqual(updated.externalServiceId4k, 900);
     });
 
     it('should null service metadata when deleting a 4K movie with no open request', async () => {
@@ -2047,6 +2263,107 @@ describe('AvailabilitySync', () => {
     });
   });
 
+  describe('series numbered by TheTVDB', () => {
+    const season = (seasonNumber: number, episodeCount: number) => ({
+      id: 500 + seasonNumber,
+      air_date: '2020-01-01',
+      episode_count: episodeCount,
+      name: `Season ${seasonNumber}`,
+      overview: '',
+      season_number: seasonNumber,
+    });
+
+    it('does not count a season only TMDB has as missing', async () => {
+      configurePlex();
+      configureSonarr([{ syncEnabled: true }]);
+      const settings = getSettings();
+      const before = { ...settings.metadataSettings };
+      settings.metadataSettings.tv = MetadataProviderType.TVDB;
+      // Login is not needed for the stand-in lookup below.
+      Object.defineProperty(Tvdb.prototype, 'login', {
+        value: async () => undefined,
+        configurable: true,
+        writable: true,
+      });
+      // TheTVDB: 10 and 15 episodes, then an announced season with none.
+      Object.defineProperty(Tvdb.prototype, 'getTvShow', {
+        value: async () =>
+          fakeTmdbShow(4100, [season(1, 10), season(2, 15), season(3, 0)]),
+        configurable: true,
+        writable: true,
+      });
+
+      try {
+        const mediaRepository = getRepository(Media);
+        const media = new Media();
+        media.tmdbId = 4100;
+        media.mediaType = MediaType.TV;
+        media.status = MediaStatus.AVAILABLE;
+        media.ratingKey = 'plex-lantern-rk';
+        media.externalServiceId = 410;
+        media.seasons = [1, 2, 3].map(
+          (seasonNumber) =>
+            new Season({
+              seasonNumber,
+              status:
+                seasonNumber < 3 ? MediaStatus.AVAILABLE : MediaStatus.UNKNOWN,
+              status4k: MediaStatus.UNKNOWN,
+            })
+        );
+        await mediaRepository.save(media);
+
+        // TMDB splits the same 25 episodes over three seasons.
+        getTvShowImpl = async () =>
+          fakeTmdbShow(4100, [season(1, 10), season(2, 10), season(3, 5)]);
+        getMetadataImpl = async (key: string) => {
+          if (key === 'plex-lantern-rk') {
+            return fakePlexShow('plex-lantern-rk');
+          }
+          throw new Error('404');
+        };
+        getChildrenMetadataImpl = async (key: string) => {
+          if (key === 'plex-lantern-rk') {
+            return [
+              fakePlexSeason(1, 'plex-lantern-s1-rk'),
+              fakePlexSeason(2, 'plex-lantern-s2-rk'),
+            ];
+          }
+          if (key === 'plex-lantern-s1-rk') return fakePlexEpisodes(10);
+          if (key === 'plex-lantern-s2-rk') return fakePlexEpisodes(15);
+          return [];
+        };
+        getSeriesByIdImpl = async (id: number) => {
+          if (id !== 410) throw new Error('404');
+          return {
+            id: 410,
+            title: 'The Lantern House',
+            titleSlug: 'the-lantern-house',
+            monitored: true,
+            statistics: {
+              episodeFileCount: 25,
+              totalEpisodeCount: 25,
+              episodeCount: 25,
+              percentOfEpisodes: 100,
+              sizeOnDisk: 0,
+              seasonCount: 2,
+            },
+            seasons: fakeSonarrSeasons(2, { 1: 10, 2: 15 }),
+          } as unknown as SonarrSeries;
+        };
+
+        await availabilitySync.run();
+
+        const updated = await mediaRepository.findOneOrFail({
+          where: { tmdbId: 4100 },
+          relations: ['seasons'],
+        });
+        assert.strictEqual(updated.status, MediaStatus.AVAILABLE);
+      } finally {
+        settings.metadataSettings = before;
+      }
+    });
+  });
+
   describe('specials season handling', () => {
     const tmdbSeasonsWithSpecials = [
       {
@@ -2423,8 +2740,8 @@ describe('AvailabilitySync', () => {
   });
 
   describe('media server unreachable', () => {
-    // A show whose four seasons are all here, only season 1 of which Sonarr
-    // has files for: the rest came from somewhere else.
+    // All four seasons are here, but Sonarr has files only for season 1: the
+    // rest came from elsewhere.
     const saveShow = async (fields: Partial<Media>) => {
       const media = new Media();
       media.tmdbId = 4700;
@@ -2573,6 +2890,301 @@ describe('AvailabilitySync', () => {
         tmdbId: 4801,
       });
       assert.strictEqual(updated.status, MediaStatus.AVAILABLE);
+    });
+  });
+
+  describe('several media servers', () => {
+    const saveMovie = async (tmdbId: number, fields: Partial<Media>) => {
+      const media = new Media();
+      media.tmdbId = tmdbId;
+      media.mediaType = MediaType.MOVIE;
+      media.status = MediaStatus.AVAILABLE;
+      Object.assign(media, fields);
+      await getRepository(Media).save(media);
+    };
+
+    const reload = (tmdbId: number) =>
+      getRepository(Media).findOneByOrFail({ tmdbId });
+
+    const jellyfinMovie = (id: string): JellyfinLibraryItemExtended => ({
+      ...fakeJellyfinShow(id, '0'),
+      Type: 'Movie',
+    });
+
+    it('keeps a movie another server still has, without the dead link', async () => {
+      connectServers('plex', 'jellyfin');
+      configureRadarr([{ syncEnabled: true }]);
+      await saveMovie(4900, {
+        ratingKey: 'plex-gone-rk',
+        jellyfinMediaId: 'jf-here-id',
+      });
+      // Plex answers 404 for its id; Jellyfin has the movie.
+      getItemDataImpl = async (id) =>
+        id === 'jf-here-id' ? jellyfinMovie(id) : undefined;
+
+      await availabilitySync.run();
+
+      const media = await reload(4900);
+      assert.equal(media.status, MediaStatus.AVAILABLE);
+      assert.equal(media.ratingKey, null);
+      assert.equal(media.jellyfinMediaId, 'jf-here-id');
+    });
+
+    it('marks a movie no server has deleted, and forgets every id', async () => {
+      connectServers('jellyfin', 'plex');
+      configureRadarr([{ syncEnabled: true }]);
+      await saveMovie(4901, {
+        ratingKey: 'plex-gone-rk',
+        jellyfinMediaId: 'jf-gone-id',
+      });
+
+      await availabilitySync.run();
+
+      const media = await reload(4901);
+      assert.equal(media.status, MediaStatus.DELETED);
+      assert.equal(media.ratingKey, null);
+      assert.equal(media.jellyfinMediaId, null);
+    });
+
+    it('keeps the id of a server that could not answer for the title', async () => {
+      connectServers('plex', 'jellyfin');
+      configureRadarr([{ syncEnabled: true }]);
+      await saveMovie(4902, {
+        ratingKey: 'plex-busy-rk',
+        jellyfinMediaId: 'jf-here-id',
+      });
+      getMetadataImpl = async () => {
+        throw new Error('Request failed with status code 503');
+      };
+      getItemDataImpl = async (id) =>
+        id === 'jf-here-id' ? jellyfinMovie(id) : undefined;
+
+      await availabilitySync.run();
+
+      const media = await reload(4902);
+      assert.equal(media.status, MediaStatus.AVAILABLE);
+      assert.equal(media.ratingKey, 'plex-busy-rk');
+    });
+
+    it('counts a season on any server', async () => {
+      connectServers('plex', 'jellyfin');
+      configureSonarr([{ syncEnabled: true }]);
+      const media = new Media();
+      media.tmdbId = 4910;
+      media.mediaType = MediaType.TV;
+      media.status = MediaStatus.AVAILABLE;
+      media.ratingKey = 'plex-show-rk';
+      media.jellyfinMediaId = 'jf-show-id';
+      media.seasons = [1, 2, 3, 4].map(
+        (seasonNumber) =>
+          new Season({
+            seasonNumber,
+            status: MediaStatus.AVAILABLE,
+            status4k: MediaStatus.UNKNOWN,
+          })
+      );
+      await getRepository(Media).save(media);
+
+      // Plex has seasons 1 and 2, Jellyfin season 3, nobody season 4.
+      getMetadataImpl = async (key) => {
+        if (key === 'plex-show-rk') return fakePlexShow(key);
+        throw new Error('404');
+      };
+      getChildrenMetadataImpl = async (key) =>
+        key === 'plex-show-rk'
+          ? [1, 2, 3, 4].map((n) => fakePlexSeason(n, `plex-s${n}`))
+          : key === 'plex-s1' || key === 'plex-s2'
+            ? fakePlexEpisodes(5)
+            : [];
+      getItemDataImpl = async (id) =>
+        id === 'jf-show-id' ? fakeJellyfinShow(id, '4910') : undefined;
+      getSeasonsImpl = async () => [
+        fakeJellyfinSeason(3, 'jf-s3'),
+        fakeJellyfinSeason(4, 'jf-s4'),
+      ];
+      getEpisodesImpl = async (_series, season) =>
+        season === 'jf-s3' ? fakeJellyfinEpisodes(3) : [];
+
+      await availabilitySync.run();
+
+      const updated = await getRepository(Media).findOneOrFail({
+        where: { tmdbId: 4910 },
+        relations: ['seasons'],
+      });
+      assert.equal(updated.status, MediaStatus.PARTIALLY_AVAILABLE);
+      assert.deepEqual(
+        updated.seasons
+          .sort((a, b) => a.seasonNumber - b.seasonNumber)
+          .map((season) => season.status),
+        [
+          MediaStatus.AVAILABLE,
+          MediaStatus.AVAILABLE,
+          MediaStatus.AVAILABLE,
+          MediaStatus.DELETED,
+        ]
+      );
+      assert.equal(updated.ratingKey, 'plex-show-rk');
+      assert.equal(updated.jellyfinMediaId, 'jf-show-id');
+    });
+
+    it('keeps a movie on Emby alone, dropping Plex and Jellyfin links', async () => {
+      connectServers('plex', 'jellyfin', 'emby');
+      configureRadarr([{ syncEnabled: true }]);
+      await saveMovie(4920, {
+        ratingKey: 'plex-gone-rk',
+        jellyfinMediaId: 'jf-gone-id',
+        embyMediaId: '4920',
+      });
+      getItemDataImpl = async (id) =>
+        id === '4920' ? jellyfinMovie(id) : undefined;
+
+      await availabilitySync.run();
+
+      const media = await reload(4920);
+      assert.equal(media.status, MediaStatus.AVAILABLE);
+      assert.equal(media.ratingKey, null);
+      assert.equal(media.jellyfinMediaId, null);
+      assert.equal(media.embyMediaId, '4920');
+    });
+
+    it('checks nothing while any connected server cannot be reached', async () => {
+      connectServers('plex', 'jellyfin', 'emby');
+      configureRadarr([{ syncEnabled: true }]);
+      await saveMovie(4921, { embyMediaId: 'emby-id' });
+      getSystemInfoImpl = async (kind) => {
+        if (kind === 'emby') {
+          throw new ApiError(502, ApiErrorCode.ConnectionError);
+        }
+        return { ServerName: 'Test' };
+      };
+
+      await availabilitySync.run();
+
+      const media = await reload(4921);
+      assert.equal(media.status, MediaStatus.AVAILABLE);
+      assert.equal(media.embyMediaId, 'emby-id');
+      assert.equal(availabilitySync.running, false);
+    });
+
+    it('lets go of a server removed while it runs, and runs again', async (t) => {
+      t.after(async () => {
+        await schedule.gracefulShutdown();
+        scheduledJobs.length = 0;
+      });
+      connectServers('plex', 'jellyfin');
+      configureRadarr([{ syncEnabled: true }]);
+      getSettings().sonarr = [];
+      // On Jellyfin alone, and checked before Jellyfin is removed.
+      await saveMovie(4940, { jellyfinMediaId: 'jf-early' });
+      // On both; Jellyfin is removed while Plex is being asked about it.
+      const show = new Media();
+      show.tmdbId = 4941;
+      show.mediaType = MediaType.TV;
+      show.status = MediaStatus.AVAILABLE;
+      show.ratingKey = 'plex-show-rk';
+      show.jellyfinMediaId = 'jf-show-id';
+      show.seasons = [1, 2].map(
+        (seasonNumber) =>
+          new Season({
+            seasonNumber,
+            status: MediaStatus.AVAILABLE,
+            status4k: MediaStatus.UNKNOWN,
+          })
+      );
+      await getRepository(Media).save(show);
+      // On Jellyfin alone, and checked after it is removed.
+      await saveMovie(4942, { jellyfinMediaId: 'jf-late' });
+      getTvShowImpl = async ({ tvId }) =>
+        fakeTmdbShow(tvId, [
+          {
+            id: 1,
+            air_date: '2024-01-01',
+            episode_count: 10,
+            name: 'Season 1',
+            overview: '',
+            season_number: 1,
+          },
+          {
+            id: 2,
+            air_date: '2024-01-01',
+            episode_count: 10,
+            name: 'Season 2',
+            overview: '',
+            season_number: 2,
+          },
+        ]);
+
+      let removed = false;
+      getMetadataImpl = async (key) => {
+        if (key !== 'plex-show-rk') throw new Error('404');
+        if (!removed) {
+          removed = true;
+          await removeServer('jellyfin');
+        }
+        return fakePlexShow(key);
+      };
+      // Plex has season 1 of the show, not season 2.
+      getChildrenMetadataImpl = async (key) =>
+        key === 'plex-show-rk'
+          ? [1, 2].map((n) => fakePlexSeason(n, `plex-s${n}`))
+          : key === 'plex-s1'
+            ? fakePlexEpisodes(5)
+            : [];
+      // Jellyfin, while it is asked, has everything.
+      const askedAfter: string[] = [];
+      getItemDataImpl = async (id) => {
+        if (removed) askedAfter.push(id);
+        return id === 'jf-show-id'
+          ? fakeJellyfinShow(id, '4941')
+          : jellyfinMovie(id);
+      };
+
+      await availabilitySync.run();
+
+      assert.equal(removed, true);
+      assert.equal(availabilitySync.running, false);
+      assert.ok(
+        !askedAfter.includes('jf-late'),
+        'Jellyfin is not asked about titles after it is removed'
+      );
+      const updated = await getRepository(Media).findOneOrFail({
+        where: { tmdbId: 4941 },
+        relations: ['seasons'],
+      });
+      assert.equal(updated.status, MediaStatus.PARTIALLY_AVAILABLE);
+      assert.equal(updated.ratingKey, 'plex-show-rk');
+      assert.equal(
+        updated.jellyfinMediaId,
+        null,
+        "the removed server's id is not written back"
+      );
+      assert.equal(
+        (await reload(4942)).status,
+        MediaStatus.DELETED,
+        'a title checked after the removal is not kept for Jellyfin'
+      );
+      assert.equal(
+        (await reload(4940)).status,
+        MediaStatus.DELETED,
+        'a title checked before the removal is checked again'
+      );
+    });
+
+    it('leaves a single server’s id alone while Radarr has the file', async () => {
+      connectServers('plex');
+      configureRadarr([{ syncEnabled: true }]);
+      await saveMovie(4930, {
+        ratingKey: 'plex-gone-rk',
+        externalServiceId: 49,
+      });
+      getMovieImpl = async () =>
+        ({ id: 49, tmdbId: 4930, hasFile: true }) as RadarrMovie;
+
+      await availabilitySync.run();
+
+      const media = await reload(4930);
+      assert.equal(media.status, MediaStatus.AVAILABLE);
+      assert.equal(media.ratingKey, 'plex-gone-rk');
     });
   });
 });

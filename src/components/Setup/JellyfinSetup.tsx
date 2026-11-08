@@ -19,8 +19,7 @@ const messages = defineMessages('components.Login', {
   enablessl: 'Use SSL',
   urlBase: 'URL Base',
   email: 'Email Address',
-  emailtooltip:
-    'Address does not need to be associated with your {mediaServerName} instance.',
+  emailtooltip: 'It doesn’t have to match your {mediaServerName} account.',
   validationhostrequired: '{mediaServerName} URL required',
   validationhostformat: 'Valid URL required',
   validationemailrequired: 'You must provide a valid email address',
@@ -45,7 +44,7 @@ const messages = defineMessages('components.Login', {
   servertype: 'Server Type',
   back: 'Go back',
   urlBaseHelp:
-    'If you set a Base URL in Jellyfin (Dashboard > Networking), enter it here (e.g. /jellyfin). Leave blank otherwise.',
+    'Only if Jellyfin has a Base URL (Dashboard > Networking), such as /jellyfin.',
 });
 
 interface JellyfinSetupProps {
@@ -161,7 +160,7 @@ function JellyfinSetup({
     >
       {({ errors, touched, values, setFieldValue, isSubmitting, isValid }) => (
         <Form>
-          <div className="sm:border-t sm:border-gray-800">
+          <div className="sm:border-t sm:border-gray-800 light:sm:border-subtle">
             <div className="flex flex-col sm:flex-row sm:gap-4">
               <div className="w-full">
                 <label htmlFor="hostname" className="text-label">

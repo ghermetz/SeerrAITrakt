@@ -1,17 +1,35 @@
+import Button from '@app/components/Common/Button';
 import CachedImage from '@app/components/Common/CachedImage';
 import { SmallLoadingSpinner } from '@app/components/Common/LoadingSpinner';
+import Tag from '@app/components/Common/Tag';
 import Tooltip from '@app/components/Common/Tooltip';
+import type {
+  ChosenServices,
+  ServiceChoice,
+} from '@app/components/Discover/filters';
+import {
+  allServicesChosen,
+  chooseAllServices,
+  chooseService,
+  nextServiceChoice,
+  serviceChoiceOf,
+} from '@app/components/Discover/filters';
 import RegionSelector from '@app/components/RegionSelector';
 import { encodeURIExtraParams } from '@app/hooks/useDiscover';
 import useSettings from '@app/hooks/useSettings';
 import defineMessages from '@app/utils/defineMessages';
 import { ArrowDownIcon, ArrowUpIcon } from '@heroicons/react/20/solid';
-import { CheckCircleIcon } from '@heroicons/react/24/solid';
+import {
+  CheckCircleIcon,
+  NoSymbolIcon,
+  XMarkIcon,
+} from '@heroicons/react/24/solid';
 import type {
   TmdbCompanySearchResponse,
   TmdbGenre,
   TmdbKeywordSearchResponse,
 } from '@server/api/themoviedb/interfaces';
+import { readStreamingRow } from '@server/constants/streamingServices';
 import type { UserResultsResponse } from '@server/interfaces/api/userInterfaces';
 import type {
   Keyword,
@@ -20,7 +38,7 @@ import type {
 } from '@server/models/common';
 import axios from 'axios';
 import orderBy from 'lodash/orderBy';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import type { MultiValue, SingleValue } from 'react-select';
 import AsyncSelect from 'react-select/async';
@@ -42,7 +60,24 @@ const messages = defineMessages('components.Selector', {
   ended: 'Ended',
   canceled: 'Canceled',
   pilot: 'Pilot',
+  onServices: 'Only on',
+  notOnServices: 'Not on',
+  servicesHint:
+    'Pick a service once to show only it, twice to leave it out, three times to clear.',
+  serviceOn: 'Only on {service}',
+  serviceNotOn: 'Not on {service}',
+  serviceCleared: 'No longer filtering by {service}',
+  clearOn: 'Stop showing only what’s on {service}',
+  clearNotOn: 'Stop leaving out {service}',
+  selectAllServices: 'Select all',
+  deselectAllServices: 'Deselect all',
+  allServicesOn: 'Selected all services',
+  allServicesCleared: 'No longer filtering by service',
+  moreServices: '+{count} more',
 });
+
+/** Chosen services named before the rest are only counted. */
+const CHIPS_SHOWN = 12;
 
 type SingleVal = {
   label: string;
@@ -50,6 +85,8 @@ type SingleVal = {
 };
 
 type BaseSelectorMultiProps = {
+  /** Text box id for a label's htmlFor. */
+  inputId?: string;
   defaultValue?: string;
   isMulti: true;
   isDisabled?: boolean;
@@ -57,6 +94,8 @@ type BaseSelectorMultiProps = {
 };
 
 type BaseSelectorSingleProps = {
+  /** Text box id for a label's htmlFor. */
+  inputId?: string;
   defaultValue?: string;
   isMulti?: false;
   isDisabled?: boolean;
@@ -148,6 +187,7 @@ type GenreSelectorProps = (BaseSelectorMultiProps | BaseSelectorSingleProps) & {
 };
 
 export const GenreSelector = ({
+  inputId,
   isMulti,
   defaultValue,
   isDisabled,
@@ -199,6 +239,7 @@ export const GenreSelector = ({
   return (
     <AsyncSelect
       key={`genre-select-${type}-${defaultDataValue}`}
+      inputId={inputId}
       className="react-select-container"
       classNamePrefix="react-select"
       defaultValue={isMulti ? defaultDataValue : defaultDataValue?.[0]}
@@ -288,6 +329,7 @@ export const StatusSelector = ({
 };
 
 export const KeywordSelector = ({
+  inputId = 'data',
   isMulti,
   isDisabled,
   defaultValue,
@@ -347,7 +389,7 @@ export const KeywordSelector = ({
 
   return (
     <AsyncSelect
-      inputId="data"
+      inputId={inputId}
       isMulti={isMulti}
       isDisabled={isDisabled}
       className="react-select-container"
@@ -372,29 +414,43 @@ export const KeywordSelector = ({
 type WatchProviderSelectorProps = {
   type: 'movie' | 'tv';
   region?: string;
+  /** Show only titles on these services. */
   activeProviders?: number[];
-  onChange: (region: string, value: number[]) => void;
+  /** Exclude titles on these services. */
+  excludedProviders?: number[];
+  onChange: (region: string, on: number[], notOn: number[]) => void;
 };
 
+/*
+ * Each service is on, not on, or neither; a click advances it. Tiles mark
+ * their state with an icon, not only colour, and choices are listed above
+ * the logos so ones hidden under "Show More" stay visible.
+ */
 export const WatchProviderSelector = ({
   type,
   onChange,
   region,
   activeProviders,
+  excludedProviders,
 }: WatchProviderSelectorProps) => {
   const intl = useIntl();
+  const hintId = useId();
+  const onLabelId = useId();
+  const notOnLabelId = useId();
   const { currentSettings } = useSettings();
   const [showMore, setShowMore] = useState(false);
   const [watchRegion, setWatchRegion] = useState(
-    region
-      ? region
-      : currentSettings.discoverRegion
-        ? currentSettings.discoverRegion
-        : 'US'
+    region || currentSettings.discoverRegion || 'US'
   );
-  const [activeProvider, setActiveProvider] = useState<number[]>(
-    activeProviders ?? []
-  );
+  const [services, setServices] = useState<ChosenServices>(() => {
+    const on = activeProviders ?? [];
+    return {
+      on,
+      notOn: (excludedProviders ?? []).filter((id) => !on.includes(id)),
+    };
+  });
+  // Screen reader announcement after each choice.
+  const [announcement, setAnnouncement] = useState('');
   const { data, isLoading } = useSWR<WatchProviderDetails[]>(
     `/api/v1/watchproviders/${
       type === 'movie' ? 'movies' : 'tv'
@@ -402,10 +458,10 @@ export const WatchProviderSelector = ({
   );
 
   useEffect(() => {
-    onChange(watchRegion, activeProvider);
-    // removed onChange as a dependency as we only need to call it when the value(s) change
+    onChange(watchRegion, services.on, services.notOn);
+    // onChange is omitted so it only fires when the values change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProvider, watchRegion]);
+  }, [services, watchRegion]);
 
   const orderedData = useMemo(() => {
     if (!data) {
@@ -415,12 +471,134 @@ export const WatchProviderSelector = ({
     return orderBy(data, ['display_priority'], ['asc']);
   }, [data]);
 
-  const toggleProvider = (id: number) => {
-    if (activeProvider.includes(id)) {
-      setActiveProvider(activeProvider.filter((p) => p !== id));
-    } else {
-      setActiveProvider([...activeProvider, id]);
-    }
+  const nameOf = (id: number) =>
+    orderedData.find((provider) => provider.id === id)?.name ?? `#${id}`;
+
+  const describe = (service: string, choice: ServiceChoice) =>
+    choice === 'on'
+      ? intl.formatMessage(messages.serviceOn, { service })
+      : choice === 'notOn'
+        ? intl.formatMessage(messages.serviceNotOn, { service })
+        : service;
+
+  const choose = (id: number, choice: ServiceChoice) => {
+    setServices((current) => chooseService(current, id, choice));
+    setAnnouncement(
+      choice
+        ? describe(nameOf(id), choice)
+        : intl.formatMessage(messages.serviceCleared, { service: nameOf(id) })
+    );
+  };
+
+  const listedIds = orderedData.map((provider) => provider.id);
+  const nothingChosen = !services.on.length && !services.notOn.length;
+
+  const selectAll = () => {
+    setServices(chooseAllServices(services, listedIds));
+    setAnnouncement(intl.formatMessage(messages.allServicesOn));
+  };
+
+  const deselectAll = () => {
+    setServices({ on: [], notOn: [] });
+    setAnnouncement(intl.formatMessage(messages.allServicesCleared));
+  };
+
+  const tile = (provider: WatchProviderDetails) => {
+    const choice = serviceChoiceOf(services, provider.id);
+    const label = describe(provider.name, choice);
+
+    return (
+      <Tooltip content={label} key={`provider-${provider.id}`}>
+        <button
+          type="button"
+          aria-label={label}
+          aria-describedby={hintId}
+          className={`provider-container relative w-full cursor-pointer rounded-lg transition ${
+            choice === 'on'
+              ? 'bg-gray-600 ring-2 ring-indigo-500 hover:bg-gray-500'
+              : choice === 'notOn'
+                ? 'bg-gray-700 ring-2 ring-danger hover:bg-gray-600'
+                : 'bg-gray-700 ring-1 ring-gray-500 hover:bg-gray-600'
+          }`}
+          onClick={() => choose(provider.id, nextServiceChoice(choice))}
+        >
+          <div
+            className={`relative m-2 aspect-1 transition ${
+              choice === 'notOn' ? 'opacity-40 grayscale' : ''
+            }`}
+          >
+            <CachedImage
+              type="tmdb"
+              src={`https://image.tmdb.org/t/p/w154${provider.logoPath}`}
+              alt=""
+              fill
+              className="rounded-lg object-contain"
+            />
+          </div>
+          {choice === 'on' && (
+            <div className="pointer-events-none absolute -left-1 -top-1 flex items-center justify-center text-indigo-100 opacity-90 light:text-accent-text light:opacity-100">
+              <CheckCircleIcon className="h-6 w-6" />
+            </div>
+          )}
+          {choice === 'notOn' && (
+            <div className="pointer-events-none absolute -left-1 -top-1 flex items-center justify-center rounded-full bg-page text-danger-text">
+              <NoSymbolIcon className="h-6 w-6" />
+            </div>
+          )}
+        </button>
+      </Tooltip>
+    );
+  };
+
+  const chosen = (choice: 'on' | 'notOn') => {
+    const ids = services[choice];
+    if (!ids.length || !data) return null;
+    const labelId = choice === 'on' ? onLabelId : notOnLabelId;
+
+    return (
+      <div
+        role="group"
+        aria-labelledby={labelId}
+        className="flex flex-wrap items-center gap-2"
+      >
+        <span id={labelId} className="text-sm font-semibold text-default">
+          {intl.formatMessage(
+            choice === 'on' ? messages.onServices : messages.notOnServices
+          )}
+        </span>
+        {ids.slice(0, CHIPS_SHOWN).map((id) => (
+          <button
+            type="button"
+            key={`chosen-${choice}-${id}`}
+            aria-label={intl.formatMessage(
+              choice === 'on' ? messages.clearOn : messages.clearNotOn,
+              { service: nameOf(id) }
+            )}
+            onClick={() => choose(id, undefined)}
+            className={`inline-flex min-h-[2rem] items-center gap-1 rounded-full px-3 py-1 text-sm ring-1 ring-inset transition ${
+              choice === 'on'
+                ? 'bg-accent-chip/accent-fill text-on-accent-chip ring-accent-chip hover:bg-accent-chip'
+                : 'bg-danger/20 text-red-200 ring-danger hover:bg-danger/30 light:text-danger-text'
+            }`}
+          >
+            {choice === 'on' ? (
+              <CheckCircleIcon className="h-4 w-4 flex-none" />
+            ) : (
+              <NoSymbolIcon className="h-4 w-4 flex-none" />
+            )}
+            <span>{nameOf(id)}</span>
+            <XMarkIcon className="h-4 w-4 flex-none" />
+          </button>
+        ))}
+        {ids.length > CHIPS_SHOWN && (
+          <span className="text-sm text-muted">
+            {intl.formatMessage(messages.moreServices, {
+              count: ids.length - CHIPS_SHOWN,
+            })}
+          </span>
+        )}
+      </div>
+    );
   };
 
   const initialProviders = orderedData.slice(0, 24);
@@ -433,101 +611,59 @@ export const WatchProviderSelector = ({
         name="watchRegion"
         onChange={(_name, value) => {
           if (value !== watchRegion) {
-            setActiveProvider([]);
+            setServices({ on: [], notOn: [] });
           }
           setWatchRegion(value);
         }}
         disableAll
         watchProviders
       />
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted">
+        <span className="inline-flex items-center gap-1">
+          <CheckCircleIcon className="h-4 w-4 text-accent-text" />
+          {intl.formatMessage(messages.onServices)}
+        </span>
+        <span className="inline-flex items-center gap-1">
+          <NoSymbolIcon className="h-4 w-4 text-danger-text" />
+          {intl.formatMessage(messages.notOnServices)}
+        </span>
+        <span id={hintId}>{intl.formatMessage(messages.servicesHint)}</span>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <Button
+          type="button"
+          buttonSize="sm"
+          disabled={isLoading || allServicesChosen(services, listedIds)}
+          onClick={selectAll}
+        >
+          <CheckCircleIcon />
+          <span>{intl.formatMessage(messages.selectAllServices)}</span>
+        </Button>
+        <Button
+          type="button"
+          buttonSize="sm"
+          disabled={nothingChosen}
+          onClick={deselectAll}
+        >
+          <XMarkIcon />
+          <span>{intl.formatMessage(messages.deselectAllServices)}</span>
+        </Button>
+      </div>
+      {chosen('on')}
+      {chosen('notOn')}
+      <span className="sr-only" aria-live="polite">
+        {announcement}
+      </span>
       {isLoading ? (
         <SmallLoadingSpinner />
       ) : (
         <div className="grid">
           <div className="provider-icons grid gap-2">
-            {initialProviders.map((provider) => {
-              const isActive = activeProvider.includes(provider.id);
-              return (
-                <Tooltip
-                  content={provider.name}
-                  key={`prodiver-${provider.id}`}
-                >
-                  <div
-                    className={`provider-container relative w-full cursor-pointer rounded-lg ring-1 ${
-                      isActive
-                        ? 'bg-gray-600 ring-indigo-500 hover:bg-gray-500'
-                        : 'bg-gray-700 ring-gray-500 hover:bg-gray-600'
-                    }`}
-                    onClick={() => toggleProvider(provider.id)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        toggleProvider(provider.id);
-                      }
-                    }}
-                    role="button"
-                    tabIndex={0}
-                  >
-                    <div className="relative m-2 aspect-1">
-                      <CachedImage
-                        type="tmdb"
-                        src={`https://image.tmdb.org/t/p/w154${provider.logoPath}`}
-                        alt=""
-                        fill
-                        className="rounded-lg object-contain"
-                      />
-                    </div>
-                    {isActive && (
-                      <div className="pointer-events-none absolute -left-1 -top-1 flex items-center justify-center text-indigo-100 opacity-90">
-                        <CheckCircleIcon className="h-6 w-6" />
-                      </div>
-                    )}
-                  </div>
-                </Tooltip>
-              );
-            })}
+            {initialProviders.map(tile)}
           </div>
           {showMore && otherProviders.length > 0 && (
             <div className="provider-icons relative top-2 grid gap-2">
-              {otherProviders.map((provider) => {
-                const isActive = activeProvider.includes(provider.id);
-                return (
-                  <Tooltip
-                    content={provider.name}
-                    key={`prodiver-${provider.id}`}
-                  >
-                    <div
-                      className={`provider-container relative w-full cursor-pointer rounded-lg ring-1 transition ${
-                        isActive
-                          ? 'bg-gray-600 ring-indigo-500 hover:bg-gray-500'
-                          : 'bg-gray-700 ring-gray-500 hover:bg-gray-600'
-                      }`}
-                      onClick={() => toggleProvider(provider.id)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          toggleProvider(provider.id);
-                        }
-                      }}
-                      role="button"
-                      tabIndex={0}
-                    >
-                      <div className="relative m-2 aspect-1">
-                        <CachedImage
-                          type="tmdb"
-                          src={`https://image.tmdb.org/t/p/w154${provider.logoPath}`}
-                          alt=""
-                          fill
-                          className="rounded-lg object-contain"
-                        />
-                      </div>
-                      {isActive && (
-                        <div className="pointer-events-none absolute -left-1 -top-1 flex items-center justify-center text-indigo-100 opacity-90">
-                          <CheckCircleIcon className="h-6 w-6" />
-                        </div>
-                      )}
-                    </div>
-                  </Tooltip>
-                );
-              })}
+              {otherProviders.map(tile)}
             </div>
           )}
           {otherProviders.length > 0 && (
@@ -560,6 +696,7 @@ export const WatchProviderSelector = ({
 };
 
 export const UserSelector = ({
+  inputId,
   isMulti,
   isDisabled,
   defaultValue,
@@ -616,6 +753,7 @@ export const UserSelector = ({
   return (
     <AsyncSelect
       key={`user-select-${defaultDataValue}`}
+      inputId={inputId}
       className="react-select-container"
       classNamePrefix="react-select"
       defaultValue={isMulti ? defaultDataValue : defaultDataValue?.[0]}
@@ -634,3 +772,47 @@ export const UserSelector = ({
 };
 
 export { default as USCertificationSelector } from './USCertificationSelector';
+
+/**
+ * Named on and not-on services of a streaming row, for its card while
+ * customizing Discover.
+ */
+export const WatchProviderTags = ({
+  type,
+  data,
+}: {
+  type: 'movie' | 'tv';
+  data?: string;
+}) => {
+  const intl = useIntl();
+  const { region, on, notOn } = readStreamingRow(data);
+  const { data: providers } = useSWR<WatchProviderDetails[]>(
+    region && (on.length || notOn.length)
+      ? `/api/v1/watchproviders/${
+          type === 'movie' ? 'movies' : 'tv'
+        }?watchRegion=${region}`
+      : null
+  );
+
+  if (!providers) {
+    return null;
+  }
+
+  const nameOf = (id: number) =>
+    providers.find((provider) => provider.id === id)?.name ?? `#${id}`;
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      {on.map((id) => (
+        <Tag key={`on-${id}`} iconSvg={<CheckCircleIcon />}>
+          {intl.formatMessage(messages.serviceOn, { service: nameOf(id) })}
+        </Tag>
+      ))}
+      {notOn.map((id) => (
+        <Tag key={`not-on-${id}`} iconSvg={<NoSymbolIcon />}>
+          {intl.formatMessage(messages.serviceNotOn, { service: nameOf(id) })}
+        </Tag>
+      ))}
+    </div>
+  );
+};

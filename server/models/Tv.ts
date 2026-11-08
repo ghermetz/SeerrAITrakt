@@ -6,6 +6,7 @@ import type {
   TmdbTvRatingResult,
   TmdbTvSeasonResult,
 } from '@server/api/themoviedb/interfaces';
+import type { DownloadStage } from '@server/constants/downloads';
 import type Media from '@server/entity/Media';
 import type { Video } from './Movie';
 import type {
@@ -26,14 +27,26 @@ import {
   mapWatchProviders,
 } from './common';
 
+/** An episode's download progress. */
+export interface EpisodeDownload {
+  stage: DownloadStage;
+  size: number;
+  sizeLeft: number;
+}
+
 interface Episode {
   id: number;
-  /** Per-episode availability, when episode tracking has populated it. */
+  /** Set once episode tracking populates it. */
   available?: boolean;
   available4k?: boolean;
-  /** Covered by a pending or approved request, for itself or its season. */
+  /** Covered by a pending or approved request for it or its season. */
   requested?: boolean;
   requested4k?: boolean;
+  /**
+   * The furthest-along active download: Sonarr's or Backfill's (the admin
+   * agent's go through Backfill).
+   */
+  download?: EpisodeDownload;
   name: string;
   airDate: string | null;
   episodeNumber: number;
@@ -120,7 +133,7 @@ export interface TvDetails {
   onUserWatchlist?: boolean;
 }
 
-/** Which of a season's episodes active requests cover, standard and 4K. */
+/** A season's episodes covered by active requests, standard and 4K. */
 export interface SeasonRequestCoverage {
   wholeSeason: boolean;
   episodes: Set<number>;

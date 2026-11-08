@@ -2,12 +2,14 @@ import Alert from '@app/components/Common/Alert';
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import PageTitle from '@app/components/Common/PageTitle';
+import SaveBar from '@app/components/Common/SaveBar';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
 import AdvancedSection from '@app/components/Settings/AdvancedSection';
 import CreditPanel from '@app/components/Settings/SettingsAi/CreditPanel';
 import type { ModelInfo } from '@app/components/Settings/SettingsAi/ModelPicker';
 import ModelPicker from '@app/components/Settings/SettingsAi/ModelPicker';
 import { aiErrorMessage } from '@app/hooks/useAi';
+import useMediaQuery from '@app/hooks/useMediaQuery';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
@@ -28,7 +30,7 @@ import useSWR, { useSWRConfig } from 'swr';
 const messages = defineMessages('components.Settings.SettingsAi', {
   ai: 'AI',
   description:
-    'A model for the AI features. Each feature sends the model only what it needs, with a small limit on the answer, and repeated questions are answered from memory at no cost. Turn features on or off, for everyone, in Features.',
+    'The model behind the AI features. Each feature sends only what it needs. Turn features on or off in Features.',
   enabled: 'Enable AI Features',
   provider: 'Provider',
   anthropic: 'Claude (Anthropic)',
@@ -36,7 +38,7 @@ const messages = defineMessages('components.Settings.SettingsAi', {
   apiKey: 'API Key',
   apiKeyTip: 'Never shown again once saved.',
   apiKeyAgain:
-    'Enter the key for this provider. A saved key is only used with the provider and address it was saved for.',
+    'Enter this provider’s key. A saved key only works with the provider it was saved for.',
   apiKeyOptional: 'Optional for a server at home.',
   keySaved: 'Key saved',
   keyRemoving: 'Will be removed when you save',
@@ -47,21 +49,22 @@ const messages = defineMessages('components.Settings.SettingsAi', {
   pasteKey: 'Paste the API key',
   baseUrl: 'Server Address',
   baseUrlTip:
-    'Leave empty for OpenAI. For another service or a server at home (Ollama, LM Studio), its OpenAI-compatible address, such as http://your-server:11434/v1. A home server keeps everything in your network.',
+    'Empty for OpenAI. Otherwise an OpenAI-compatible address, such as http://your-server:11434/v1 for Ollama.',
   model: 'Model',
   modelTip:
-    'Used by every feature without its own model below. Smaller models are cheaper and faster, and are enough for most features.',
+    'Used by every feature without its own model. Smaller is cheaper and enough for most.',
   loadModels: 'Reload the Model List',
   chooseModel: 'Choose a model',
   typeModel: 'Type a model name, or add a key to list them',
+  typeModelShort: 'Type a model name',
   modelsFailed: 'The model list could not be loaded: {reason}',
   featureModels: 'Model for Each Feature',
   featureModelsTip:
-    'Optional. A cheaper model for simple features, or a stronger one where it matters. Empty uses the model above.',
+    'Optional: a cheaper or stronger model per feature. Empty uses the model above.',
   sameAsAbove: 'Same as above',
   dailyLimit: 'Daily Limit per Person',
   dailyLimitTip:
-    'AI answers each person gets per day. 0 is no limit. Admins are not limited, and answers from memory do not count.',
+    'AI answers per person per day; 0 for no limit. Admins aren’t limited.',
   test: 'Test',
   testOk: '{model} answered.',
   saved: 'AI settings saved.',
@@ -72,11 +75,12 @@ const messages = defineMessages('components.Settings.SettingsAi', {
   aiRecap: 'Catch Me Up',
   aiDeletionReview: 'Review Deletions',
   aiIssueTriage: 'Suggest Issue Fixes',
+  aiReports: 'Understand Reports',
   aiLogs: 'Explain Logs',
   aiBackfill: 'Backfill Second Opinion',
   aiAgent: 'Admin Agent',
   privacy:
-    'Titles people have watched are sent to the provider for AI Search, suggestions and picks, but never account names or emails. Issue comments are sent as written. Choose a server at home to keep everything in your network.',
+    'Watched titles and issue comments are sent to the provider; names and emails never are. A home server keeps it all local.',
 });
 
 interface AiSettingsForm {
@@ -93,20 +97,20 @@ interface AiSettingsForm {
 
 const SettingsAi = () => {
   const intl = useIntl();
+  // The whole hint does not fit the model field on a phone.
+  const wide = useMediaQuery('(min-width: 640px)');
   const { addToast } = useToasts();
   const { mutate: globalMutate } = useSWRConfig();
   const { data, mutate } = useSWR<AiSettingsForm>('/api/v1/settings/ai');
   const [form, setForm] = useState<AiSettingsForm>();
-  // The list belongs to one provider and address, and is not shown for any
-  // other.
+  // The list is for one provider and address; hidden for any other.
   const [models, setModels] = useState<{ for: string; list: ModelInfo[] }>({
     for: '',
     list: [],
   });
   const [modelsProblem, setModelsProblem] = useState<string>();
   const [listing, setListing] = useState(false);
-  // A typed key is used to list models once it has been entered, not on
-  // every keystroke.
+  // A typed key lists models once entered, not on every keystroke.
   const [enteredKey, setEnteredKey] = useState('');
   const [replacing, setReplacing] = useState(false);
   const [busy, setBusy] = useState<'save' | 'test'>();
@@ -118,8 +122,7 @@ const SettingsAi = () => {
     }
   }, [data, form]);
 
-  // Which list the current choices call for: the provider and address, and
-  // the key it would be fetched with.
+  // The list the current choices call for: provider, address and key.
   const listFor = form
     ? [
         form.provider,
@@ -172,9 +175,8 @@ const SettingsAi = () => {
     [intl]
   );
 
-  // The list loads by itself whenever there is a key it can be fetched with:
-  // on opening the page with one saved, after a key is entered, or when the
-  // provider or address changes. Typing an address waits for a pause.
+  // Load the list whenever a key can fetch it: on open with a saved key, after
+  // one is entered, or on a provider or address change (debounced while typing).
   useEffect(() => {
     if (!form || !listable || models.for === listFor) {
       return;
@@ -254,9 +256,8 @@ const SettingsAi = () => {
   };
 
   const changeProvider = (provider: 'anthropic' | 'openai') => {
-    // Models are named differently by each provider, and a key only works
-    // with its own: what was chosen or typed for the other one is cleared
-    // rather than left to fail, or sent where it does not belong.
+    // Model names and keys are per provider: clear the other one's choice rather
+    // than let it fail or send it where it doesn't belong.
     setForm({
       ...form,
       provider,
@@ -369,16 +370,16 @@ const SettingsAi = () => {
                 <div className="flex flex-wrap items-center gap-2">
                   <div
                     id="aiApiKey"
-                    className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-500 bg-gray-700 px-3 py-2 text-sm text-white"
+                    className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-field-border bg-field px-3 py-2 text-sm text-strong"
                   >
                     {form.removeApiKey ? (
                       <>
-                        <TrashIcon className="h-5 w-5 flex-none text-red-400" />
+                        <TrashIcon className="h-5 w-5 flex-none text-red-400 light:text-danger-text" />
                         <span>{intl.formatMessage(messages.keyRemoving)}</span>
                       </>
                     ) : (
                       <>
-                        <CheckCircleIcon className="h-5 w-5 flex-none text-green-400" />
+                        <CheckCircleIcon className="h-5 w-5 flex-none text-success-text" />
                         <span>{intl.formatMessage(messages.keySaved)}</span>
                       </>
                     )}
@@ -435,7 +436,7 @@ const SettingsAi = () => {
                   {replacing && (
                     <button
                       type="button"
-                      className="mt-2 text-sm text-gray-400 hover:text-white"
+                      className="mt-2 text-sm text-gray-400 hover:text-strong"
                       onClick={() => {
                         setReplacing(false);
                         setEnteredKey('');
@@ -465,13 +466,17 @@ const SettingsAi = () => {
                   models={modelList}
                   loading={listing}
                   emptyLabel={intl.formatMessage(
-                    modelList.length ? messages.chooseModel : messages.typeModel
+                    modelList.length
+                      ? messages.chooseModel
+                      : wide
+                        ? messages.typeModel
+                        : messages.typeModelShort
                   )}
                 />
                 {listable && (
                   <button
                     type="button"
-                    className="flex h-[38px] w-[38px] flex-none items-center justify-center rounded-md border border-gray-500 bg-gray-700 text-gray-300 transition hover:text-white disabled:opacity-50"
+                    className="flex h-[38px] w-[38px] flex-none items-center justify-center rounded-md border border-gray-500 bg-gray-700 text-gray-300 transition hover:text-strong disabled:opacity-50"
                     onClick={() => listModels(form, enteredKey.trim(), listFor)}
                     disabled={listing}
                     aria-label={intl.formatMessage(messages.loadModels)}
@@ -484,7 +489,10 @@ const SettingsAi = () => {
                 )}
               </div>
               {modelsProblem && (
-                <p className="mt-2 text-sm text-red-400" role="alert">
+                <p
+                  className="mt-2 text-sm text-red-400 light:text-danger-text"
+                  role="alert"
+                >
                   {modelsProblem}
                 </p>
               )}
@@ -498,8 +506,7 @@ const SettingsAi = () => {
               </span>
             </label>
             <div className="form-input-area">
-              {/* A text field with a number pad, as elsewhere in settings:
-                  the theme styles text fields, not number fields. */}
+              {/* Text field with a number pad: the theme styles text inputs, not number ones. */}
               <input
                 id="aiDailyLimit"
                 type="text"
@@ -558,7 +565,7 @@ const SettingsAi = () => {
               </div>
             </div>
           </AdvancedSection>
-          <div className="actions">
+          <SaveBar>
             <div className="flex justify-end">
               <span className="ml-3 inline-flex rounded-md shadow-sm">
                 <Button
@@ -584,7 +591,7 @@ const SettingsAi = () => {
                 </Button>
               </span>
             </div>
-          </div>
+          </SaveBar>
         </form>
       </div>
       {data?.hasApiKey && <CreditPanel />}

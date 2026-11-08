@@ -1,3 +1,4 @@
+import Alert from '@app/components/Common/Alert';
 import ProgressCircle from '@app/components/Common/ProgressCircle';
 import defineMessages from '@app/utils/defineMessages';
 import { ChevronDownIcon, ChevronUpIcon } from '@heroicons/react/24/solid';
@@ -11,26 +12,46 @@ const messages = defineMessages('components.RequestModal.QuotaDisplay', {
     '{remaining, plural, =0 {No} other {<strong>#</strong>}} {type} {remaining, plural, one {request} other {requests}} remaining',
   movielimit: '{limit, plural, one {movie} other {movies}}',
   seasonlimit: '{limit, plural, one {season} other {seasons}}',
+  albumlimit: '{limit, plural, one {album} other {albums}}',
   allowedRequests:
     'You are allowed to request <strong>{limit}</strong> {type}{days, plural, =0 {} one { every day} other { every <strong>{days}</strong> days}}.',
   allowedRequestsUser:
     'This user is allowed to request <strong>{limit}</strong> {type}{days, plural, =0 {} one { every day} other { every <strong>{days}</strong> days}}.',
   quotaLink:
-    'You can view a summary of your request limits on your <ProfileLink>profile page</ProfileLink>.',
+    'See your request limits on your <ProfileLink>profile page</ProfileLink>.',
   quotaLinkUser:
-    "You can view a summary of this user's request limits on their <ProfileLink>profile page</ProfileLink>.",
+    'See this user’s request limits on their <ProfileLink>profile page</ProfileLink>.',
   movie: 'movie',
   season: 'season',
+  album: 'album',
   notenoughseasonrequests: 'Not enough season requests remaining',
+  notenoughalbumrequests: 'Not enough album requests remaining',
   requiredquota:
-    'You need to have at least <strong>{seasons}</strong> {seasons, plural, one {season request} other {season requests}} remaining in order to submit a request for this series.',
+    'You need at least <strong>{seasons}</strong> {seasons, plural, one {season request} other {season requests}} left to request this series.',
   requiredquotaUser:
-    'This user needs to have at least <strong>{seasons}</strong> {seasons, plural, one {season request} other {season requests}} remaining in order to submit a request for this series.',
+    'This user needs at least <strong>{seasons}</strong> {seasons, plural, one {season request} other {season requests}} left to request this series.',
+  requiredquotaAlbums:
+    'You need at least <strong>{albums}</strong> {albums, plural, one {album request} other {album requests}} left for this request.',
+  requiredquotaAlbumsUser:
+    'This user needs at least <strong>{albums}</strong> {albums, plural, one {album request} other {album requests}} left for this request.',
+  overQuota:
+    'This is over the request limit, so it waits for an admin to approve it.',
 });
+
+/** A request past the limit, which waits for an admin (Settings → Users). */
+export const OverQuotaAlert = () => {
+  const intl = useIntl();
+  return (
+    <div className="mt-6">
+      <Alert title={intl.formatMessage(messages.overQuota)} type="warning" />
+    </div>
+  );
+};
 
 interface QuotaDisplayProps {
   quota?: QuotaStatus;
-  mediaType: 'movie' | 'tv';
+  /** Music counts albums, as series count seasons. */
+  mediaType: 'movie' | 'tv' | 'music';
   userOverride?: number | null;
   remaining?: number;
   overLimit?: number;
@@ -74,11 +95,19 @@ const QuotaDisplay = ({
         >
           <div className="ml-2 text-lg">
             {overLimit !== undefined
-              ? intl.formatMessage(messages.notenoughseasonrequests)
+              ? intl.formatMessage(
+                  mediaType === 'music'
+                    ? messages.notenoughalbumrequests
+                    : messages.notenoughseasonrequests
+                )
               : intl.formatMessage(messages.requestsremaining, {
                   remaining: remaining ?? quota?.remaining ?? 0,
                   type: intl.formatMessage(
-                    mediaType === 'movie' ? messages.movie : messages.season
+                    mediaType === 'movie'
+                      ? messages.movie
+                      : mediaType === 'music'
+                        ? messages.album
+                        : messages.season
                   ),
                   strong: (msg: React.ReactNode) => <strong>{msg}</strong>,
                 })}
@@ -96,15 +125,25 @@ const QuotaDisplay = ({
         <div className="mt-4">
           {overLimit !== undefined && (
             <div className="mb-2">
-              {intl.formatMessage(
-                userOverride
-                  ? messages.requiredquotaUser
-                  : messages.requiredquota,
-                {
-                  seasons: overLimit,
-                  strong: (msg: React.ReactNode) => <strong>{msg}</strong>,
-                }
-              )}
+              {mediaType === 'music'
+                ? intl.formatMessage(
+                    userOverride
+                      ? messages.requiredquotaAlbumsUser
+                      : messages.requiredquotaAlbums,
+                    {
+                      albums: overLimit,
+                      strong: (msg: React.ReactNode) => <strong>{msg}</strong>,
+                    }
+                  )
+                : intl.formatMessage(
+                    userOverride
+                      ? messages.requiredquotaUser
+                      : messages.requiredquota,
+                    {
+                      seasons: overLimit,
+                      strong: (msg: React.ReactNode) => <strong>{msg}</strong>,
+                    }
+                  )}
             </div>
           )}
           <div>
@@ -118,7 +157,9 @@ const QuotaDisplay = ({
                 type: intl.formatMessage(
                   mediaType === 'movie'
                     ? messages.movielimit
-                    : messages.seasonlimit,
+                    : mediaType === 'music'
+                      ? messages.albumlimit
+                      : messages.seasonlimit,
                   { limit: quota?.limit }
                 ),
                 strong: (msg: React.ReactNode) => <strong>{msg}</strong>,
@@ -132,7 +173,7 @@ const QuotaDisplay = ({
                 ProfileLink: (msg: React.ReactNode) => (
                   <Link
                     href={userOverride ? `/users/${userOverride}` : '/profile'}
-                    className="text-white transition duration-300 hover:underline"
+                    className="text-strong transition duration-300 hover:underline"
                   >
                     {msg}
                   </Link>

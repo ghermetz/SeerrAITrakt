@@ -1,12 +1,13 @@
 import { IssueType, IssueTypeName } from '@server/constants/issue';
 import { MediaType } from '@server/constants/media';
-import { PROJECT_BRANCH, PROJECT_REPO } from '@server/constants/project';
 import { getRepository } from '@server/datasource';
 import { User } from '@server/entity/User';
 import { defineMessages, getIntl } from '@server/i18n';
 import globalMessages from '@server/i18n/globalMessages';
-import PreparedEmail from '@server/lib/email';
+import PreparedEmail, { emailLogoUrl } from '@server/lib/email';
+import { declineReasonOf } from '@server/lib/notifications/declineReason';
 import { eventText } from '@server/lib/notifications/eventTitles';
+import { mediaPagePath } from '@server/lib/notifications/mediaPage';
 import type { NotificationAgentEmail } from '@server/lib/settings';
 import { NotificationAgentKey, getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
@@ -17,9 +18,6 @@ import validator from 'validator';
 import { Notification, shouldSendAdminNotification } from '..';
 import type { NotificationAgent, NotificationPayload } from './agent';
 import { BaseAgent } from './agent';
-
-// Seerr AI's logo, light on the emails' dark background.
-const PUBLIC_LOGO_URL = `https://raw.githubusercontent.com/${PROJECT_REPO}/${PROJECT_BRANCH}/public/logo_ai_dark.svg`;
 
 const messages = defineMessages('notifications.agents.email', {
   issueType: '{type} issue',
@@ -98,15 +96,10 @@ class EmailAgent
     locale?: AvailableLocale
   ): EmailOptions | undefined {
     const intl = getIntl(locale);
-    const settings = getSettings();
-    const { applicationUrl, applicationTitle } = settings.main;
-    const { embedPoster } = settings.notifications.agents.email;
-    const { usePublicLogo } = settings.notifications.agents.email.options;
-    const logoUrl = usePublicLogo
-      ? PUBLIC_LOGO_URL
-      : applicationUrl
-        ? `${applicationUrl}/logo_ai_dark.svg`
-        : undefined;
+    const { applicationUrl, applicationTitle } = getSettings().main;
+    // The settings under test (maybe unsaved), else the saved ones.
+    const { embedPoster, options } = this.getSettings();
+    const logoUrl = emailLogoUrl(options);
 
     if (type === Notification.TEST_NOTIFICATION) {
       return {
@@ -125,11 +118,13 @@ class EmailAgent
       };
     }
 
-    // Backfill's, and several notifications gathered into one, say
-    // everything themselves: a subject, a few lines and a page to open.
+    // These and digests carry their own subject, text and page to open.
     if (
       type === Notification.BACKFILL ||
       type === Notification.HEALTH ||
+      type === Notification.WRONG_MATCH ||
+      type === Notification.PLAYLIST_UPDATE ||
+      type === Notification.LEAVING_SOON ||
       payload.digest
     ) {
       return {
@@ -158,7 +153,9 @@ class EmailAgent
     const mediaType = payload.media
       ? payload.media.mediaType === MediaType.MOVIE
         ? intl.formatMessage(globalMessages.movie)
-        : intl.formatMessage(globalMessages.series)
+        : payload.media.mediaType === MediaType.MUSIC
+          ? intl.formatMessage(globalMessages.music)
+          : intl.formatMessage(globalMessages.series)
       : undefined;
     const is4k = payload.request?.is4k;
 
@@ -203,6 +200,7 @@ class EmailAgent
           );
           break;
         case Notification.MEDIA_FAILED:
+        case Notification.REQUEST_FAILED:
           body = intl.formatMessage(
             is4k ? messages.failedRequest4k : messages.failedRequest,
             {
@@ -210,11 +208,15 @@ class EmailAgent
               service:
                 payload.media?.mediaType === MediaType.MOVIE
                   ? 'Radarr'
-                  : 'Sonarr',
+                  : payload.media?.mediaType === MediaType.MUSIC
+                    ? 'Lidarr'
+                    : 'Sonarr',
             }
           );
           break;
       }
+
+      const declineReason = declineReasonOf(type, payload);
 
       return {
         template: path.join(
@@ -227,13 +229,20 @@ class EmailAgent
         locals: {
           event: eventText(payload, intl),
           body,
+          // The template escapes it.
+          declineReason,
+          declineReasonLabel: declineReason
+            ? intl.formatMessage(globalMessages.declineReason)
+            : undefined,
           mediaName: payload.subject,
           mediaExtra: payload.extra ?? [],
           imageUrl: embedPoster ? payload.image : undefined,
           timestamp: new Date().toTimeString(),
           requestedBy: payload.request.requestedBy.displayName,
           actionUrl: applicationUrl
-            ? `${applicationUrl}/${payload.media?.mediaType}/${payload.media?.tmdbId}`
+            ? payload.media
+              ? `${applicationUrl}${mediaPagePath(payload.media, payload.request)}`
+              : undefined
             : undefined,
           applicationUrl,
           applicationTitle,
@@ -320,8 +329,7 @@ class EmailAgent
     type: Notification,
     payload: NotificationPayload
   ): Promise<boolean> {
-    // Held while a burst to this person is gathered into one (see the
-    // notification manager): only the admin and channel copies go now.
+    // holdUser: the user's copy goes out later in a digest.
     if (payload.notifyUser && !payload.holdUser) {
       if (
         !payload.notifyUser.settings ||

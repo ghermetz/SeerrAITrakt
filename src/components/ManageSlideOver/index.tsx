@@ -16,6 +16,7 @@ import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import { releasesOf } from '@app/utils/downloadSummary';
+import { SERVER_NAMES } from '@app/utils/mediaServerAccounts';
 import { Bars4Icon, ServerIcon } from '@heroicons/react/24/outline';
 import {
   CheckCircleIcon,
@@ -28,7 +29,6 @@ import {
   MediaStatus,
   MediaType,
 } from '@server/constants/media';
-import { MediaServerType } from '@server/constants/server';
 import type { MediaWatchDataResponse } from '@server/interfaces/api/mediaInterfaces';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import type { MovieDetails } from '@server/models/Movie';
@@ -50,9 +50,9 @@ const messages = defineMessages('components.ManageSlideOver', {
   manageModalNoRequests: 'No requests.',
   manageModalClearMedia: 'Clear Data',
   manageModalClearMediaWarning:
-    '* This will irreversibly remove all data for this {mediaType}, including any requests. If this item exists in your {mediaServerName} library, the media information will be recreated during the next scan.',
+    '* Permanently removes all data for this {mediaType}, including requests. If it’s in {mediaServerName}, the next scan adds it back.',
   manageModalRemoveMediaWarning:
-    '* This will irreversibly remove this {mediaType} from {arr}, including all files.',
+    '* Permanently removes this {mediaType} and its files from {arr}.',
   openarr: 'Open in {arr}',
   removearr: 'Remove from {arr}',
   openarr4k: 'Open in 4K {arr}',
@@ -79,7 +79,6 @@ const isMovie = (movie: MovieDetails | TvDetails): movie is MovieDetails => {
 };
 
 interface ManageSlideOverProps {
-  // mediaType: 'movie' | 'tv';
   show?: boolean;
   onClose: () => void;
   revalidate: () => void;
@@ -107,7 +106,10 @@ const ManageSlideOver = ({
   const { addToast } = useToasts();
   const settings = useSettings();
   const { data: watchData } = useSWR<MediaWatchDataResponse>(
-    settings.currentSettings.mediaServerType === MediaServerType.PLEX &&
+    // Plays come from Tautulli, which is Plex-only.
+    settings.currentSettings.mediaServers.some(
+      (server) => server.kind === 'plex'
+    ) &&
       data.mediaInfo &&
       hasPermission(Permission.ADMIN)
       ? `/api/v1/media/${data.mediaInfo.id}/watch_data`
@@ -390,7 +392,7 @@ const ManageSlideOver = ({
                                 days: 7,
                               })}
                             </div>
-                            <div className="text-white">
+                            <div className="text-strong">
                               {styledPlayCount(watchData.data.playCount7Days)}
                             </div>
                           </div>
@@ -400,7 +402,7 @@ const ManageSlideOver = ({
                                 days: 30,
                               })}
                             </div>
-                            <div className="text-white">
+                            <div className="text-strong">
                               {styledPlayCount(watchData.data.playCount30Days)}
                             </div>
                           </div>
@@ -408,7 +410,7 @@ const ManageSlideOver = ({
                             <div className="font-bold">
                               {intl.formatMessage(messages.alltime)}
                             </div>
-                            <div className="text-white">
+                            <div className="text-strong">
                               {styledPlayCount(watchData.data.playCount)}
                             </div>
                           </div>
@@ -550,7 +552,7 @@ const ManageSlideOver = ({
                                 days: 7,
                               })}
                             </div>
-                            <div className="text-white">
+                            <div className="text-strong">
                               {styledPlayCount(watchData.data4k.playCount7Days)}
                             </div>
                           </div>
@@ -560,7 +562,7 @@ const ManageSlideOver = ({
                                 days: 30,
                               })}
                             </div>
-                            <div className="text-white">
+                            <div className="text-strong">
                               {styledPlayCount(
                                 watchData.data4k.playCount30Days
                               )}
@@ -570,7 +572,7 @@ const ManageSlideOver = ({
                             <div className="font-bold">
                               {intl.formatMessage(messages.alltime)}
                             </div>
-                            <div className="text-white">
+                            <div className="text-strong">
                               {styledPlayCount(watchData.data4k.playCount)}
                             </div>
                           </div>
@@ -752,14 +754,12 @@ const ManageSlideOver = ({
                       mediaType: intl.formatMessage(
                         mediaType === 'movie' ? messages.movie : messages.tvshow
                       ),
-                      mediaServerName:
-                        settings.currentSettings.mediaServerType ===
-                        MediaServerType.EMBY
-                          ? 'Emby'
-                          : settings.currentSettings.mediaServerType ===
-                              MediaServerType.PLEX
-                            ? 'Plex'
-                            : 'Jellyfin',
+                      mediaServerName: intl.formatList(
+                        settings.currentSettings.mediaServers.map(
+                          (server) => SERVER_NAMES[server.kind]
+                        ),
+                        { type: 'disjunction' }
+                      ),
                     })}
                   </div>
                 </div>

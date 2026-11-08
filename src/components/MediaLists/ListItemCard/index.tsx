@@ -3,7 +3,7 @@ import TitleCard from '@app/components/TitleCard';
 import type { ListItem, SeriesProgress } from '@app/hooks/useListDetail';
 import defineMessages from '@app/utils/defineMessages';
 import { EyeIcon, TrashIcon } from '@heroicons/react/24/outline';
-import type { MediaStatus, MediaType } from '@server/constants/media';
+import type { MediaStatus } from '@server/constants/media';
 import { useIntl } from 'react-intl';
 
 const messages = defineMessages('components.MediaLists.ListItemCard', {
@@ -18,16 +18,13 @@ const messages = defineMessages('components.MediaLists.ListItemCard', {
 
 interface ListItemCardProps {
   item: ListItem;
-  /** The viewer's own position, when their watch history can answer it. */
+  /** The viewer's progress, when watch history has it. */
   progress?: SeriesProgress;
   onToggleWatched: (item: ListItem) => void;
   onRemove: (item: ListItem) => void;
 }
 
-/**
- * One title on a list: the poster, its watched/remove controls in the card's
- * own action slot, and the episode progress line for a partial series.
- */
+/** A list title: poster, watched/remove controls, and episode progress. */
 const ListItemCard = ({
   item,
   progress,
@@ -40,14 +37,12 @@ const ListItemCard = ({
     <li key={`item-${item.id}`}>
       <div className={item.watchedAt ? 'opacity-60' : undefined}>
         <TitleCard
-          // Fill the grid cell rather than keeping a fixed width: a card
-          // narrower than its column leaves ragged gaps down the page. This
-          // is how the cast and discover grids do it.
+          // Fill the grid cell, as the cast and discover grids do: a fixed
+          // width leaves ragged gaps.
           canExpand
           showListButton={false}
-          // The controls go in the card's own action slot, alongside where
-          // its request button would sit — so they reveal and scale with the
-          // poster as a single element instead of being tracked from outside.
+          // In the card's action slot, so they reveal and scale with the
+          // poster.
           actionSlot={
             <div className="flex w-full space-x-1">
               <Button
@@ -78,22 +73,22 @@ const ListItemCard = ({
           }
           id={item.tmdbId}
           image={item.posterPath ?? undefined}
-          mediaType={item.mediaType as MediaType}
+          mediaType={item.mediaType}
           status={item.mediaInfo?.status as MediaStatus | undefined}
+          outsideLibraries={item.mediaInfo?.outsideLibraries}
           summary={undefined}
           title={item.title ?? String(item.tmdbId)}
           year={item.releaseDate}
         />
       </div>
       {/*
-        A partially available series shows one status badge, which does not
-        say how much of it is actually here. The episode counts come from the
-        rows the episode sync already maintains.
+        A partial series' badge doesn't say how much is here. Counts come
+        from the episode sync's rows.
       */}
       {item.mediaType === 'tv' &&
         !!item.totalEpisodes &&
         (item.availableEpisodes ?? 0) < item.totalEpisodes && (
-          <p className="mt-1 truncate text-xs text-gray-400">
+          <p className="mt-1 break-words text-xs text-muted">
             {intl.formatMessage(messages.episodeprogress, {
               available: item.availableEpisodes ?? 0,
               total: item.totalEpisodes,
@@ -102,15 +97,12 @@ const ListItemCard = ({
         )}
       {progress && (
         <>
-          {/*
-            Up next and the count to catch up on two short lines: as one
-            sentence it did not fit a poster's width and was cut off.
-          */}
+          {/* Two short lines: one sentence doesn't fit a poster's width. */}
           <p
             className={
               progress.state === 'up_next'
-                ? 'mt-1 truncate text-xs font-medium text-indigo-300'
-                : 'mt-1 truncate text-xs text-gray-400'
+                ? 'mt-1 break-words text-xs font-medium text-indigo-300 light:text-accent-text'
+                : 'mt-1 break-words text-xs text-muted'
             }
           >
             {progress.state === 'up_next' && progress.next
@@ -123,7 +115,7 @@ const ListItemCard = ({
                 : intl.formatMessage(messages.notstarted)}
           </p>
           {progress.state === 'up_next' && progress.next && (
-            <p className="truncate text-xs text-gray-400">
+            <p className="break-words text-xs text-muted">
               {intl.formatMessage(messages.tocatchup, {
                 remaining: progress.remaining,
               })}

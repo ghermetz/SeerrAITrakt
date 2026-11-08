@@ -1,15 +1,18 @@
 import { MediaType } from '@server/constants/media';
 import type { DownloadingItem } from '@server/lib/downloadtracker';
-import { downloadStageOf, withLiveProgress } from '@server/lib/downloadtracker';
+import {
+  airedEpisodesOf,
+  downloadStageOf,
+  withLiveProgress,
+} from '@server/lib/downloadtracker';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 /*
- * What Radarr and Sonarr report at each point of a SABnzbd download, as
- * their code sets it: SABnzbd's queue gives queued, paused or downloading;
- * once SABnzbd moves it to its history, verifying, repairing, unpacking and
- * running the post-processing script all read as downloading with nothing
- * left, and done as completed, until Radarr or Sonarr imports it.
+ * What Radarr and Sonarr report through a SABnzbd download, per their code:
+ * SABnzbd's queue gives queued, paused or downloading; once in its history,
+ * verifying, repairing, unpacking and post-processing read as downloading
+ * with nothing left, and done as completed until imported.
  */
 const size = 4_000_000_000;
 
@@ -106,7 +109,7 @@ describe('where a download stands', () => {
   });
 
   it('while a delay profile holds it, with no estimate of its own', () => {
-    // As the live Sonarr queue had it: the time given is when the hold ends.
+    // From a live Sonarr queue: the time given is when the hold ends.
     assert.equal(
       downloadStageOf({
         status: 'delay',
@@ -250,5 +253,29 @@ describe('a queue item brought up to date by its download client', () => {
   it('is the queue item as it was without a reading', () => {
     const plain = item('downloading');
     assert.equal(withLiveProgress(plain, undefined, now), plain);
+  });
+});
+
+describe('airedEpisodesOf', () => {
+  const now = Date.parse('2026-11-05T03:00:00Z');
+  const item = (downloadId: string, airDateUtc?: string | null) => ({
+    downloadId,
+    episode: { airDateUtc },
+  });
+
+  it('leaves out the episodes a season pack lists before they have aired', () => {
+    const pack = [
+      item('pack', '2026-10-09T02:00:00Z'),
+      item('pack', '2026-10-30T02:00:00Z'),
+      item('pack', '2026-11-06T03:00:00Z'),
+      item('pack', null),
+    ];
+    assert.deepEqual(airedEpisodesOf(pack, now), pack.slice(0, 2));
+  });
+
+  it("keeps an episode's own download, and a pack with nothing aired yet", () => {
+    const own = item('one', '2026-11-12T03:00:00Z');
+    const early = [item('early', '2026-11-12T03:00:00Z'), item('early')];
+    assert.deepEqual(airedEpisodesOf([own, ...early], now), [own, ...early]);
   });
 });

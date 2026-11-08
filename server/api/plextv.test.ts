@@ -4,9 +4,8 @@ import assert from 'node:assert/strict';
 import { beforeEach, describe, it } from 'node:test';
 
 /*
- * A user's Plex watchlist and its cache: a reply from Discover that is not
- * a watchlist must never be kept, or If-None-Match pins it and every later
- * request gets a 304 for it.
+ * Watchlist caching: a Discover reply that isn't a watchlist must never be
+ * cached, or If-None-Match pins it and every later request gets a 304.
  */
 
 interface Reply {
@@ -36,12 +35,14 @@ const metadata = (ratingKey: string, tmdbId: number) => ({
 });
 
 /**
- * A PlexTvAPI whose watchlist requests get the given replies in turn, and
- * whose metadata lookups answer from a table. Records the If-None-Match sent.
+ * A PlexTvAPI whose watchlist requests get `replies` in turn and whose
+ * metadata lookups answer from `details`. Records each If-None-Match sent.
  */
 const apiWith = (replies: Reply[], details: Record<string, unknown> = {}) => {
   const api = new PlexTvAPI('token-a');
   const sent: (string | undefined)[] = [];
+  /** Each request's sort param. */
+  const sorts: unknown[] = [];
   const internals = api as unknown as {
     axios: { get: (...args: unknown[]) => Promise<unknown> };
     getRolling: (url: string) => Promise<unknown>;
@@ -49,6 +50,7 @@ const apiWith = (replies: Reply[], details: Record<string, unknown> = {}) => {
   internals.axios.get = async (_url, config) => {
     const headers = (config as { headers?: Record<string, string> }).headers;
     sent.push(headers?.['If-None-Match']);
+    sorts.push((config as { params?: { sort?: unknown } }).params?.sort);
     const reply = replies.shift();
     if (!reply) {
       throw new Error('no more replies');
@@ -68,7 +70,7 @@ const apiWith = (replies: Reply[], details: Record<string, unknown> = {}) => {
     }
     return details[key];
   };
-  return { api, sent };
+  return { api, sent, sorts };
 };
 
 beforeEach(() => {
@@ -89,6 +91,27 @@ describe('PlexTvAPI.getWatchlist', () => {
       [[603], [603]]
     );
     assert.equal(second.totalSize, 1);
+  });
+
+  it('keeps each page of a watchlist apart, with its own ETag', async () => {
+    const { api, sent } = apiWith(
+      [
+        { status: 200, etag: '"p1"', data: watchlist('a') },
+        { status: 200, etag: '"p2"', data: watchlist('b') },
+        { status: 304 },
+      ],
+      { a: metadata('a', 603), b: metadata('b', 604) }
+    );
+    await api.getWatchlist({ offset: 0 });
+    await api.getWatchlist({ offset: 20 });
+    const again = await api.getWatchlist({ offset: 20 });
+    // Page 2 is requested without page 1's ETag, and its 304 serves its own
+    // titles.
+    assert.deepEqual(sent, [undefined, undefined, '"p2"']);
+    assert.deepEqual(
+      again.items.map((i) => i.tmdbId),
+      [604]
+    );
   });
 
   it('never keeps a reply that is not a watchlist, so it cannot be pinned', async () => {
@@ -130,7 +153,7 @@ describe('PlexTvAPI.getWatchlist', () => {
       [603, 604]
     );
     assert.equal(during.totalSize, 2);
-    // Still asking with the good ETag after the bad reply.
+    // The good ETag is still sent after the bad reply.
     assert.deepEqual(sent, [undefined, '"v1"', '"v1"']);
   });
 
@@ -163,6 +186,47 @@ describe('PlexTvAPI.getWatchlist', () => {
     assert.deepEqual(
       result.items.map((i) => i.tmdbId),
       [603]
+    );
+  });
+
+  it('asks Plex for an order only when one is chosen', async () => {
+    const { api, sorts } = apiWith(
+      [
+        { status: 200, data: watchlist('a') },
+        { status: 200, data: watchlist('a') },
+        { status: 200, data: watchlist('a') },
+        { status: 200, data: watchlist('a') },
+      ],
+      { a: metadata('a', 603) }
+    );
+    await api.getWatchlist();
+    await api.getWatchlist({ sort: 'added-desc' });
+    await api.getWatchlist({ sort: 'added-asc' });
+    await api.getWatchlist({ sort: 'title' });
+    assert.deepEqual(sorts, [
+      undefined,
+      'watchlistedAt:desc',
+      'watchlistedAt:asc',
+      'titleSort:asc',
+    ]);
+  });
+
+  it('keeps each order apart, with its own ETag', async () => {
+    const { api, sent } = apiWith(
+      [
+        { status: 200, etag: '"own"', data: watchlist('a', 'b') },
+        { status: 200, etag: '"newest"', data: watchlist('b', 'a') },
+        { status: 304 },
+      ],
+      { a: metadata('a', 603), b: metadata('b', 604) }
+    );
+    await api.getWatchlist();
+    await api.getWatchlist({ sort: 'added-desc' });
+    const again = await api.getWatchlist({ sort: 'added-desc' });
+    assert.deepEqual(sent, [undefined, undefined, '"newest"']);
+    assert.deepEqual(
+      again.items.map((i) => i.tmdbId),
+      [604, 603]
     );
   });
 

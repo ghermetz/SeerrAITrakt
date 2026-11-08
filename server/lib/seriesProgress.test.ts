@@ -1,6 +1,7 @@
 import type { TautulliHistoryRecord } from '@server/api/tautulli';
 import TautulliAPI from '@server/api/tautulli';
 import { MediaStatus, MediaType } from '@server/constants/media';
+import { MediaServerType } from '@server/constants/server';
 import { getRepository } from '@server/datasource';
 import Episode from '@server/entity/Episode';
 import Media from '@server/entity/Media';
@@ -111,7 +112,7 @@ describe('series progress from Tautulli', () => {
 
   /** A series with seasons one and two in the library, plus a special. */
   const seedSeries = async (tmdbId: number) => {
-    // Each test gets its own Plex id, so no cached position carries over.
+    // A fresh Plex id per test, so no cached position carries over.
     const ratingKey = `rk-${tmdbId}-${++ratingKeyCounter}`;
     const media = await getRepository(Media).save(
       new Media({
@@ -152,6 +153,8 @@ describe('series progress from Tautulli', () => {
   beforeEach(async () => {
     plays = [];
     tautulliDown = false;
+    // Tautulli is Plex's watch history, read while Plex is connected.
+    getSettings().main.mediaServerType = MediaServerType.PLEX;
     getSettings().tautulli = {
       hostname: 'tautulli.invalid',
       port: 8181,
@@ -224,9 +227,8 @@ describe('series progress from Tautulli', () => {
     const before = seriesProgressCachedForTests();
     assert.ok(before >= 1);
 
-    // Eleven minutes on, someone else's page asks about another series: the
-    // first position can never be used again and is let go, rather than
-    // kept for the life of the server.
+    // Eleven minutes later, another page asks about another series: the first
+    // position is expired and dropped, not kept for the server's lifetime.
     const later = Date.now() + 11 * 60 * 1000;
     t.mock.method(Date, 'now', () => later);
     await getSeriesProgress(viewer, [506]);
@@ -236,7 +238,7 @@ describe('series progress from Tautulli', () => {
 
   it('answers nothing when Tautulli is not configured', async () => {
     await seedSeries(504);
-    // The settings setter merges, so the fields have to be cleared explicitly.
+    // The settings setter merges, so the fields must be cleared explicitly.
     getSettings().tautulli = { hostname: '', apiKey: '' } as never;
 
     assert.deepEqual(await getSeriesProgress(viewer, [504]), {});

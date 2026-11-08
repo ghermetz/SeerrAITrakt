@@ -1,10 +1,21 @@
 import RadarrAPI from '@server/api/servarr/radarr';
+import { cleanProfileFolders } from '@server/constants/requestDefaults';
 import type { RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
+import { answerHostRefused } from '@server/utils/hostRefused';
 import { Router } from 'express';
 
 const radarrRoutes = Router();
+
+// One default per type (4K or not): clear the others of that type.
+const clearDefaults = (servers: RadarrSettings[], is4k: boolean) => {
+  servers
+    .filter((radarrInstance) => radarrInstance.is4k === is4k)
+    .forEach((radarrInstance) => {
+      radarrInstance.isDefault = false;
+    });
+};
 
 radarrRoutes.get('/', (_req, res) => {
   const settings = getSettings();
@@ -16,18 +27,12 @@ radarrRoutes.post('/', async (req, res) => {
   const settings = getSettings();
 
   const newRadarr = req.body as RadarrSettings;
-  // Never a removed server's id: titles keep the id of the server they are on.
+  newRadarr.profileFolders = cleanProfileFolders(newRadarr.profileFolders);
+  // Never reuse a removed server's id: titles keep the id of their server.
   newRadarr.id = settings.newId('radarr');
 
-  // If we are setting this as the default, clear any previous defaults for the same type first
-  // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
-  // and are the default
   if (req.body.isDefault) {
-    settings.radarr
-      .filter((radarrInstance) => radarrInstance.is4k === req.body.is4k)
-      .forEach((radarrInstance) => {
-        radarrInstance.isDefault = false;
-      });
+    clearDefaults(settings.radarr, req.body.is4k);
   }
 
   settings.radarr = [...settings.radarr, newRadarr];
@@ -70,6 +75,8 @@ radarrRoutes.post<
       message: e.message,
     });
 
+    // Refused for the hostname used: tell the admin how to allow it.
+    if (answerHostRefused(res, 'Radarr', e)) return;
     next({ status: 500, message: 'Failed to connect to Radarr' });
   }
 });
@@ -87,20 +94,18 @@ radarrRoutes.put<{ id: string }, RadarrSettings, RadarrSettings>(
       return next({ status: 404, message: 'Settings instance not found' });
     }
 
-    // If we are setting this as the default, clear any previous defaults for the same type first
-    // ex: if is4k is true, it will only remove defaults for other servers that have is4k set to true
-    // and are the default
     if (req.body.isDefault) {
-      settings.radarr
-        .filter((radarrInstance) => radarrInstance.is4k === req.body.is4k)
-        .forEach((radarrInstance) => {
-          radarrInstance.isDefault = false;
-        });
+      clearDefaults(settings.radarr, req.body.is4k);
     }
 
     settings.radarr[radarrIndex] = {
       ...req.body,
       id: Number(req.params.id),
+      // Kept when not sent, so a client that doesn't know them can't drop them.
+      profileFolders:
+        req.body.profileFolders === undefined
+          ? settings.radarr[radarrIndex].profileFolders
+          : cleanProfileFolders(req.body.profileFolders),
     } as RadarrSettings;
     await settings.save();
 

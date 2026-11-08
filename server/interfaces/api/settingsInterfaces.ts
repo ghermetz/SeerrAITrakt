@@ -1,3 +1,7 @@
+import type { PersonalApiKeyAccess } from '@server/constants/apiKeys';
+import type { MediaServerKind } from '@server/constants/server';
+import type { ThemeDefaults } from '@server/constants/theme';
+import type { SeasonCalendar } from '@server/lib/seasons';
 import type { DnsEntries, DnsStats } from 'dns-caching';
 import type { PaginatedResponse } from './common';
 
@@ -26,16 +30,31 @@ export interface PublicSettingsResponse {
   jellyfinExternalHost?: string;
   jellyfinServerName?: string;
   jellyfinForgotPasswordUrl?: string;
+  embyExternalHost?: string;
+  embyForgotPasswordUrl?: string;
   initialized: boolean;
   applicationTitle: string;
   applicationUrl: string;
-  /** Optional features turned off for everyone. */
+  /** Optional features disabled for everyone. */
   disabledFeatures: string[];
+  /** Countries whose anime counts as anime only in Japanese (utils/isAnime). */
+  animeExcludedCountries: string[];
   hideAvailable: boolean;
   hideBlocklisted: boolean;
   hideRequested: boolean;
   localLogin: boolean;
   mediaServerLogin: boolean;
+  /** Who may create personal API keys (profile API Keys tab). */
+  personalApiKeys: PersonalApiKeyAccess;
+  /** Connected media servers, primary first. */
+  mediaServers: {
+    kind: MediaServerKind;
+    name: string;
+    primary: boolean;
+    signIn: boolean;
+  }[];
+  /** Enabled SSO providers; empty until the Application URL is set. */
+  oidcProviders: { id: string; name: string; logoUrl: string }[];
   movie4kEnabled: boolean;
   series4kEnabled: boolean;
   discoverRegion: string;
@@ -54,10 +73,22 @@ export interface PublicSettingsResponse {
   versionCheck: boolean;
   plexClientIdentifier: string;
   aiReady: boolean;
-  /** Bazarr is set up, so title pages can show their subtitles. */
+  /** Bazarr is set up, so title pages can show subtitles. */
   subtitlesReady: boolean;
-  /** A Trakt Client ID is set: Trakt links and watchlists can be read. */
+  /** A Trakt Client ID is set. */
   traktReady: boolean;
+  /** Lidarr is set up and music is not disabled for everyone. */
+  musicReady: boolean;
+  /** All search lists music below movies and series (Settings → Music). */
+  musicSearch: { inAll: boolean };
+  /** Single songs can be requested (Settings → Music). */
+  musicSongs: boolean;
+  /** Default theme for users without their own (Settings → Appearance). */
+  themeDefault: ThemeDefaults;
+  /** Active seasonal themes and their dates (Settings → Appearance). */
+  seasons: SeasonCalendar;
+  /** Server CSS version (null for none); whether users may add their own. */
+  customCss: { server: string | null; personal: boolean };
 }
 
 export interface CacheItem {
@@ -74,14 +105,15 @@ export interface CacheItem {
 
 export interface CacheResponse {
   apiCaches: CacheItem[];
+  /** Per image cache; music covers and artist pictures share one. */
   imageCache: Record<
-    'tmdb' | 'tvdb' | 'avatar',
+    'tmdb' | 'tvdb' | 'avatar' | 'music',
     { size: number; imageCount: number }
   >;
   /**
-   * The whole image cache on disk (every source, and any left by older
-   * versions) against its limit, in bytes, and whether pictures can be
-   * converted to AVIF and WebP here.
+   * Whole on-disk image cache (all sources, including older versions'
+   * leftovers) and its limit in bytes, plus whether AVIF/WebP conversion is
+   * available.
    */
   imageCacheTotal: { size: number; limit: number; conversion: boolean };
   dnsCache: {
@@ -95,5 +127,4 @@ export interface StatusResponse {
   commitTag: string;
   updateAvailable?: boolean;
   commitsBehind?: number;
-  restartRequired: boolean;
 }

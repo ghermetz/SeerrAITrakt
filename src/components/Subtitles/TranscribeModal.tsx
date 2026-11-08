@@ -1,4 +1,5 @@
 import Modal from '@app/components/Common/Modal';
+import { useSubtitleReasons } from '@app/components/Subtitles/parts';
 import { subtitlesKey } from '@app/hooks/useSubtitles';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
@@ -6,16 +7,17 @@ import defineMessages from '@app/utils/defineMessages';
 import { isTranscribed } from '@app/utils/subtitles';
 import type {
   EpisodeSubtitles,
+  SubtitleError,
   TranscribeScope,
 } from '@server/interfaces/api/subtitlesInterfaces';
-import axios from 'axios';
+import axios, { isAxiosError } from 'axios';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 
 const messages = defineMessages('components.Subtitles.TranscribeModal', {
   title: 'Transcribe Episodes',
   intro:
-    'Whisper listens to each episode and writes its subtitles. It runs one episode at a time and can take several minutes each. Episodes it has already done are left out.',
+    'Whisper writes subtitles from each episode’s audio, one at a time, several minutes each. Episodes already done are skipped.',
   missing: 'Episodes with no subtitles',
   season: 'One season',
   everything: 'Every episode not transcribed yet',
@@ -45,6 +47,7 @@ const TranscribeModal = ({
 }: TranscribeModalProps) => {
   const intl = useIntl();
   const { addToast } = useToasts();
+  const { reasonOf } = useSubtitleReasons('tv');
   const todo = episodes.filter((episode) => !isTranscribed(episode));
   const seasons = [...new Set(todo.map((e) => e.seasonNumber))].sort(
     (a, b) => b - a
@@ -77,11 +80,18 @@ const TranscribeModal = ({
         { appearance: data.added > 0 ? 'success' : 'info', autoDismiss: true }
       );
       onStarted();
-    } catch {
-      addToast(intl.formatMessage(messages.failed), {
-        appearance: 'error',
-        autoDismiss: true,
-      });
+    } catch (e) {
+      // Whisper paused or off is reported as on the card; only Bazarr not
+      // answering offers a retry.
+      const code = isAxiosError(e)
+        ? (e.response?.data as Partial<SubtitleError> | undefined)?.code
+        : undefined;
+      addToast(
+        code && code !== 'bazarrFailed'
+          ? reasonOf(e)
+          : intl.formatMessage(messages.failed),
+        { appearance: 'error', autoDismiss: true }
+      );
     } finally {
       setSending(false);
     }
@@ -110,7 +120,7 @@ const TranscribeModal = ({
         className="h-5 w-5 border-gray-500 bg-gray-700 text-indigo-600"
       />
       <span className="flex flex-1 flex-col">
-        <span className="font-semibold text-white">{label}</span>
+        <span className="font-semibold text-strong">{label}</span>
         <span className="text-xs text-gray-400">
           {intl.formatMessage(messages.episodes, { count: n })}
         </span>
@@ -145,7 +155,7 @@ const TranscribeModal = ({
                 setSeason(Number(e.target.value));
                 setScope('season');
               }}
-              className="rounded-md border border-gray-500 bg-gray-700 py-1.5 text-white"
+              className="rounded-md border border-field-border bg-field py-1.5 text-strong"
             >
               {seasons.map((s) => (
                 <option key={s} value={s}>

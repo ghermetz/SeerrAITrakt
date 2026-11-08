@@ -3,6 +3,7 @@ import IMDBGraphQL from '@server/api/rating/imdbGraphql';
 import RottenTomatoes from '@server/api/rating/rottentomatoes';
 import type { RatingResponse } from '@server/api/ratings';
 import TheMovieDb from '@server/api/themoviedb';
+import type { DownloadStage } from '@server/constants/downloads';
 import {
   MediaRequestStatus,
   MediaStatus,
@@ -13,22 +14,41 @@ import Episode from '@server/entity/Episode';
 import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { Watchlist } from '@server/entity/Watchlist';
+import { detectAnime } from '@server/lib/animeDecision';
+import downloadTracker from '@server/lib/downloadtracker';
 import { featureEnabled } from '@server/lib/features';
 import {
   SeriesFinishedError,
   canSubscribe,
   getSubscription,
+  otherFollowers,
   subscribe,
   unsubscribe,
+  unsubscribeEveryone,
 } from '@server/lib/futureSeasons';
+import { limitToLibraries } from '@server/lib/libraryVisibility';
 import mediaForViewer from '@server/lib/mediaForViewer';
+import { Permission } from '@server/lib/permissions';
 import logger from '@server/logger';
 import { mapTvResult } from '@server/models/Search';
 import type { SeasonRequestCoverage } from '@server/models/Tv';
 import { mapSeasonWithEpisodes, mapTvDetails } from '@server/models/Tv';
-import { isAnime } from '@server/utils/isAnime';
 import { Router } from 'express';
 import { In } from 'typeorm';
+
+/** Rank of an episode's download stages; the furthest along is shown. */
+const STAGE_ORDER: Record<DownloadStage, number> = {
+  failed: 0,
+  needsAttention: 1,
+  waiting: 2,
+  paused: 3,
+  queued: 4,
+  stalled: 5,
+  downloading: 6,
+  finishing: 7,
+  importing: 8,
+  imported: 9,
+};
 
 const tvRoutes = Router();
 
@@ -39,7 +59,7 @@ tvRoutes.get('/:id', async (req, res, next) => {
     const tmdbTv = await tmdb.getTvShow({
       tvId: Number(req.params.id),
     });
-    const metadataProvider = isAnime(tmdbTv)
+    const metadataProvider = detectAnime(tmdbTv)
       ? await getMetadataProvider('anime')
       : await getMetadataProvider('tv');
     const tv = await metadataProvider.getTvShow({
@@ -47,6 +67,7 @@ tvRoutes.get('/:id', async (req, res, next) => {
       language: (req.query.language as string) ?? req.locale,
     });
     const media = await Media.getMedia(tv.id, MediaType.TV);
+    await limitToLibraries([media], req.user);
 
     const onUserWatchlist = await getRepository(Watchlist).exist({
       where: {
@@ -64,7 +85,8 @@ tvRoutes.get('/:id', async (req, res, next) => {
       onUserWatchlist
     );
 
-    // TMDB issue where it doesnt fallback to English when no overview is available in requested locale.
+    // TMDB doesn't fall back to English when the requested locale has no
+    // overview.
     if (!data.overview) {
       const tvEnglish = await metadataProvider.getTvShow({
         tvId: Number(req.params.id),
@@ -92,7 +114,7 @@ tvRoutes.get('/:id/season/:seasonNumber', async (req, res, next) => {
     const tmdbTv = await tmdb.getTvShow({
       tvId: Number(req.params.id),
     });
-    const metadataProvider = isAnime(tmdbTv)
+    const metadataProvider = detectAnime(tmdbTv)
       ? await getMetadataProvider('anime')
       : await getMetadataProvider('tv');
 
@@ -102,7 +124,7 @@ tvRoutes.get('/:id/season/:seasonNumber', async (req, res, next) => {
       language: (req.query.language as string) ?? req.locale,
     });
 
-    // Per-episode availability, when episode tracking has populated it.
+    // Per-episode availability, once episode tracking has populated it.
     const availability = new Map<
       number,
       { available: boolean; available4k: boolean }
@@ -116,6 +138,8 @@ tvRoutes.get('/:id/season/:seasonNumber', async (req, res, next) => {
     const mediaSeason = media?.seasons.find(
       (s) => s.seasonNumber === Number(req.params.seasonNumber)
     );
+    // A copy the viewer's libraries don't hold has no episodes for them.
+    await limitToLibraries([media], req.user);
 
     if (mediaSeason) {
       const episodeRows: Episode[] = await getRepository(Episode).find({
@@ -124,15 +148,18 @@ tvRoutes.get('/:id/season/:seasonNumber', async (req, res, next) => {
 
       for (const row of episodeRows) {
         availability.set(row.episodeNumber, {
-          available: row.status === MediaStatus.AVAILABLE,
-          available4k: row.status4k === MediaStatus.AVAILABLE,
+          available:
+            !media?.outsideLibraries && row.status === MediaStatus.AVAILABLE,
+          available4k:
+            !media?.outsideLibraries4k &&
+            row.status4k === MediaStatus.AVAILABLE,
         });
       }
     }
 
-    // Which episodes active requests already cover, so a Request button is
-    // never offered for one that is on its way. A season request without
-    // episodes covers the whole season.
+    // Episodes active requests already cover, so no Request button is offered
+    // for one on its way. A season request without episodes covers the whole
+    // season.
     const requested: SeasonRequestCoverage = {
       wholeSeason: false,
       episodes: new Set(),
@@ -172,9 +199,45 @@ tvRoutes.get('/:id/season/:seasonNumber', async (req, res, next) => {
       }
     }
 
-    return res
-      .status(200)
-      .json(mapSeasonWithEpisodes(season, availability, requested));
+    const mapped = mapSeasonWithEpisodes(season, availability, requested);
+    // Current downloads, from Sonarr's queue and Backfill's own.
+    if (media) {
+      const progress = [
+        ...(media.serviceId != null && media.externalServiceId != null
+          ? downloadTracker.getSeriesProgress(
+              media.serviceId,
+              media.externalServiceId
+            )
+          : []),
+        ...(media.serviceId4k != null && media.externalServiceId4k != null
+          ? downloadTracker.getSeriesProgress(
+              media.serviceId4k,
+              media.externalServiceId4k
+            )
+          : []),
+      ];
+      for (const episode of mapped.episodes) {
+        const items = progress.filter(
+          (item) =>
+            item.episode?.seasonNumber === mapped.seasonNumber &&
+            item.episode.episodeNumber === episode.episodeNumber
+        );
+        if (!items.length) continue;
+        const furthest = items.reduce((best, item) =>
+          (STAGE_ORDER[item.stage] ?? 0) > (STAGE_ORDER[best.stage] ?? 0) ||
+          (item.stage === best.stage && item.sizeLeft < best.sizeLeft)
+            ? item
+            : best
+        );
+        episode.download = {
+          stage: furthest.stage,
+          size: furthest.size,
+          sizeLeft: furthest.sizeLeft,
+        };
+      }
+    }
+
+    return res.status(200).json(mapped);
   } catch (e) {
     logger.debug('Something went wrong retrieving season', {
       label: 'API',
@@ -315,8 +378,8 @@ tvRoutes.get('/:id/ratings', async (req, res, next) => {
 });
 
 /**
- * Rotten Tomatoes and IMDb together, as for movies. Either source can be
- * down or not know the series; the other is still returned.
+ * Rotten Tomatoes and IMDb together, as for movies. If either source is down or
+ * lacks the series, the other is still returned.
  */
 tvRoutes.get('/:id/ratingscombined', async (req, res, next) => {
   const tmdb = new TheMovieDb();
@@ -376,22 +439,29 @@ tvRoutes.get('/:id/ratingscombined', async (req, res, next) => {
   }
 });
 
-/*
- * Getting a series' new seasons as they premiere, for the signed-in user.
- */
+/* Follow a series' new seasons as they premiere, for the signed-in user. */
 tvRoutes.get<{ id: string }>('/:id/future-seasons', async (req, res, next) => {
   try {
-    const subscription = await getSubscription(
-      req.user?.id as number,
-      Number(req.params.id)
-    );
-    return res
-      .status(200)
-      .json(
-        subscription
-          ? { following: true, fromSeason: subscription.fromSeason }
-          : { following: false }
-      );
+    const userId = req.user?.id as number;
+    const tmdbId = Number(req.params.id);
+    const subscription = await getSubscription(userId, tmdbId);
+    // Other followers mark the series followed for everyone; only request
+    // managers see who they are.
+    const others = await otherFollowers(userId, tmdbId);
+    return res.status(200).json({
+      ...(subscription
+        ? { following: true, fromSeason: subscription.fromSeason }
+        : { following: false }),
+      ...(others.names.length
+        ? {
+            othersFollow: true,
+            othersFrom: others.fromSeason,
+            ...(req.user?.hasPermission(Permission.MANAGE_REQUESTS)
+              ? { others: others.names }
+              : {}),
+          }
+        : {}),
+    });
   } catch (e) {
     return next({ status: 500, message: e.message });
   }
@@ -430,7 +500,17 @@ tvRoutes.delete<{ id: string }>(
   '/:id/future-seasons',
   async (req, res, next) => {
     try {
-      await unsubscribe(req.user?.id as number, Number(req.params.id));
+      if (String(req.query.everyone) === 'true') {
+        if (!req.user?.hasPermission(Permission.MANAGE_REQUESTS)) {
+          return next({
+            status: 403,
+            message: 'Only those who manage requests can stop it for everyone.',
+          });
+        }
+        await unsubscribeEveryone(Number(req.params.id));
+      } else {
+        await unsubscribe(req.user?.id as number, Number(req.params.id));
+      }
       return res.status(204).send();
     } catch (e) {
       return next({ status: 500, message: e.message });

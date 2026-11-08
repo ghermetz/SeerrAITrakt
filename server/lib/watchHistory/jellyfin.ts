@@ -1,27 +1,30 @@
 import type { JellyfinAccount, JellyfinUserItem } from '@server/api/jellyfin';
 import JellyfinAPI from '@server/api/jellyfin';
-import { MediaType } from '@server/constants/media';
+import { MediaType, VIDEO_MEDIA_TYPES } from '@server/constants/media';
+import type { JellyfinFamilyKind } from '@server/constants/server';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { User } from '@server/entity/User';
+import {
+  MEDIA_ID,
+  USER_ID,
+  hostnameFor,
+  serverName,
+} from '@server/lib/mediaServers';
 import type { Play, WatchSource } from '@server/lib/watchHistory/types';
 import { COMPLETE_PERCENT } from '@server/lib/watchHistory/types';
-import { getHostname } from '@server/utils/getHostname';
 import { mapWithConcurrency } from '@server/utils/mapWithConcurrency';
 import { In } from 'typeorm';
 
-/*
- * Jellyfin and Emby keep what each person has watched themselves, item by
- * item: whether it was played to the end, how far, and when last. There is
- * no log of every play, so a title shows once, at its latest play.
- */
+// Jellyfin/Emby keep per-item user data, not a play log: each item appears
+// once, at its latest play.
 
-/** Accounts asked about one title at a time. */
+/** Accounts queried in parallel for one title. */
 const ACCOUNT_CONCURRENCY = 4;
-/** More accounts than this are not all asked who watched something. */
+/** Cap on accounts queried for a title's history. */
 const MAX_ACCOUNTS = 100;
 
-/** One person's item as a play; undefined when they never started it. */
+/** A user's item as a play; undefined if never started. */
 export const playOf = (
   item: JellyfinUserItem,
   viewer: { id: string; name: string }
@@ -34,8 +37,7 @@ export const playOf = (
   if (!started) return undefined;
   const movie = item.Type === 'Movie';
   if (!movie && item.Type !== 'Episode') return undefined;
-  // An episode the server has not placed in a series yet (still being
-  // scanned, or named oddly) cannot be told apart from any other title.
+  // An episode not yet placed in a series can't be attributed to a title.
   if (!movie && !item.SeriesId) return undefined;
   const at = data.LastPlayedDate ? Date.parse(data.LastPlayedDate) : NaN;
   return {
@@ -48,10 +50,8 @@ export const playOf = (
     season: movie ? undefined : item.ParentIndexNumber,
     episode: movie ? undefined : item.IndexNumber,
     finished: !!data.Played,
-    // The server decides when something counts as played (and says so in
-    // Played), so a part-watched item never reads as finished here, even
-    // when its percentage runs past the end because the runtime it knows
-    // is shorter than the file.
+    // Only Played means finished; cap the percentage below COMPLETE_PERCENT,
+    // since it can exceed 100 when the known runtime is shorter than the file.
     percent: data.Played
       ? 100
       : Math.min(
@@ -65,38 +65,43 @@ export const playOf = (
 
 const newestFirst = (a: Play, b: Play) => b.at - a.at;
 
-/** Jellyfin or Emby, which answer the same way. */
+/** Jellyfin or Emby (same API). */
 export class JellyfinWatchSource implements WatchSource {
   public readonly label: string;
   private api: JellyfinAPI;
 
   constructor(
-    public readonly kind: 'jellyfin' | 'emby',
+    public readonly kind: JellyfinFamilyKind,
     apiKey: string,
-    hostname: string = getHostname()
+    hostname: string = hostnameFor(kind)
   ) {
-    this.label = kind === 'emby' ? 'Emby' : 'Jellyfin';
-    this.api = new JellyfinAPI(hostname, apiKey);
+    this.label = serverName(kind);
+    this.api = new JellyfinAPI(hostname, apiKey, undefined, kind);
   }
 
   public viewerOf(user: User): string | undefined {
-    return user.jellyfinUserId || undefined;
+    return user[USER_ID[this.kind]] || undefined;
   }
 
+  /** Deduped: regular and 4K can be the same item. */
   public titleIdsOf(media: Media): string[] {
-    return [media.jellyfinMediaId, media.jellyfinMediaId4k].filter(
-      (id): id is string => !!id
-    );
+    return [
+      ...new Set(
+        MEDIA_ID[this.kind]
+          .map((column) => media[column])
+          .filter((id): id is string => !!id)
+      ),
+    ];
   }
 
   public async mediaFor(titleIds: string[]): Promise<Map<string, Media>> {
     const found = new Map<string, Media>();
     if (!titleIds.length) return found;
     const media = await getRepository(Media).find({
-      where: [
-        { jellyfinMediaId: In(titleIds) },
-        { jellyfinMediaId4k: In(titleIds) },
-      ],
+      where: MEDIA_ID[this.kind].map((column) => ({
+        mediaType: In(VIDEO_MEDIA_TYPES),
+        [column]: In(titleIds),
+      })),
     });
     for (const item of media) {
       for (const id of this.titleIdsOf(item)) found.set(id, item);
@@ -106,10 +111,11 @@ export class JellyfinWatchSource implements WatchSource {
 
   public async usersFor(viewerIds: string[]): Promise<Map<string, User>> {
     if (!viewerIds.length) return new Map();
+    const column = USER_ID[this.kind];
     const users = await getRepository(User).find({
-      where: { jellyfinUserId: In(viewerIds) },
+      where: { [column]: In(viewerIds) },
     });
-    return new Map(users.map((user) => [user.jellyfinUserId as string, user]));
+    return new Map(users.map((user) => [user[column] as string, user]));
   }
 
   public async history(user: User, limit: number): Promise<Play[]> {
@@ -123,8 +129,7 @@ export class JellyfinWatchSource implements WatchSource {
       SortOrder: 'Descending',
       Limit: limit,
     };
-    // Finished and part-watched are asked apart: the server's filters
-    // both have to match when given together.
+    // Separate queries: combined Filters must all match.
     const [finished, started] = await Promise.all([
       this.api.getUserItems(id, { ...query, Filters: 'IsPlayed' }),
       this.api.getUserItems(id, { ...query, Filters: 'IsResumable' }),
@@ -137,7 +142,6 @@ export class JellyfinWatchSource implements WatchSource {
     return [...plays.values()].sort(newestFirst).slice(0, limit);
   }
 
-  /** One account's plays of one title on the server. */
   private async playsOf(
     viewer: { id: string; name: string },
     titleId: string,
@@ -193,8 +197,7 @@ export class JellyfinWatchSource implements WatchSource {
         this.playsOf(viewer, titleId, isShow)
       )
     );
-    // Emby keeps no date for an item marked watched by hand: with no moment
-    // to be after, it counts; after one, it cannot be shown to be.
+    // Undated plays (Emby, marked by hand) count only with no cutoff.
     return plays
       .flat()
       .filter((play) => cutoff <= 0 || play.at > cutoff)

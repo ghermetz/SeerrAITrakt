@@ -14,21 +14,25 @@ import {
 } from '@headlessui/react';
 import {
   ArrowPathIcon,
+  ArrowUturnLeftIcon,
   ChevronDownIcon,
   MagnifyingGlassIcon,
   TrashIcon,
+  WrenchIcon,
 } from '@heroicons/react/24/outline';
-import type { HealthCheck, HealthStatus } from '@server/lib/health';
+import type { HealthCheck, HealthItem, HealthStatus } from '@server/lib/health';
+import type { HealthActivity } from '@server/lib/healthActivity';
+import type { FixOutcome, MatchFix } from '@server/lib/plexFixMatch';
 import axios from 'axios';
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
-import useSWR from 'swr';
+import useSWR, { useSWRConfig } from 'swr';
 
 const messages = defineMessages('components.Settings.SettingsHealth', {
   health: 'Health',
   healthDescription:
-    'Whether connected services answer, and what has quietly gone wrong with requests, titles and users.',
+    'Whether connected services answer, and what has quietly gone wrong.',
   checkAgain: 'Check Again',
   checking: 'Checking…',
   checkedAt: 'Checked {time}',
@@ -55,6 +59,8 @@ const messages = defineMessages('components.Settings.SettingsHealth', {
   searchStarted:
     '{count, plural, one {Searching for # missing episode} other {Searching for # missing episodes}} in {service}.',
   searchStartedMovie: 'Searching for it in {service}.',
+  searchStartedAlbums:
+    '{count, plural, one {Searching for # missing album} other {Searching for # missing albums}} in {service}.',
   searchFailed: 'Could not start the search.',
   pageOf: 'Page {page} of {pages}',
   previous: 'Prev',
@@ -62,21 +68,67 @@ const messages = defineMessages('components.Settings.SettingsHealth', {
   searchAll: 'Search all',
   searchAllConfirm: 'Search all now',
   searchAllExplain:
-    'Searches for every stuck title here that Radarr or Sonarr can act on, not only the ones shown. Each search is a query to your indexers, and many cap how many you can make a day. A season missing entirely is searched as one.',
+    'Searches every stuck title Radarr or Sonarr can act on, not just those shown. Many indexers cap daily searches.',
   searchAllStarted:
     'Searching for {titles, plural, one {# title} other {# titles}} ({episodes, plural, one {# episode or film} other {# episodes and films}}).',
   searchAllStartedWithFailures:
     'Searching for {titles, plural, one {# title} other {# titles}}; {failed, plural, one {# could not be started} other {# could not be started}}.',
   awaitingApproval: 'Waiting on approval for over a week',
   stuckProcessing: 'Processing for over a week',
+  musicNotOnServer: 'Albums in Lidarr, not on your media server after a day',
+  musicNoRelease: 'Requested albums with no release found after a week',
+  musicImportBlocked: 'Downloads Lidarr won’t import',
   missingTvdb: 'Requested series with no TVDB id',
   collectionGaps: 'Collections partly in your library',
   plexMatches: 'Folders matched to another title',
+  recentRequests: 'Recent requests',
+  nightlyCheck: 'Nightly check',
+  foundAt: 'Found {time}',
+  checkOnImport: 'Check new requests as they’re imported',
+  checkOnImportTip:
+    'Looks a few minutes after each import and tells admins once (Wrong Match notification).',
+  settingFailed: 'Could not save the setting.',
+  fixMatches: 'Fix matches from here',
+  fixMatchesTip:
+    'A Fix Match button on each one Seerr AI can put right: it finds the title in Plex by the ID Radarr or Sonarr has, then checks Plex took it.',
+  fixAuto: 'Fix automatically',
+  fixAutoTip:
+    'New ones as they’re found, and up to 20 from the nightly check each night, without asking. Admins are told, and each can be undone below.',
+  fixMatch: 'Fix match',
+  fixing: 'Fixing…',
+  fixed: 'Fixed: Plex now has {title}.',
+  fixRight: 'Plex has it right already.',
+  fixGone: 'It’s no longer on Plex.',
+  fixNotFound: 'Plex found nothing by {searched}.',
+  fixPutBack: 'Plex took it as {title}, so its old match was put back.',
+  fixUnchanged: 'Plex hasn’t shown the new match yet. Check again in a minute.',
+  fixFailed: 'Could not fix it.',
+  fixedLately: 'Fixed lately',
+  fixedFromTo: '{from} → {to}',
+  fixedBy: '{name} · {time}',
+  fixedByItself: 'By itself · {time}',
+  fixUnconfirmed: 'Plex hadn’t shown its IDs yet',
+  undo: 'Undo',
+  undone: 'Undone',
+  undoDone: 'Put back as Plex had it.',
+  undoFailed: 'Could not undo it.',
   plexSignIn: 'Expired Plex sign-ins',
+  qualityProfiles: 'Quality profiles',
   backfill: 'Backfill',
   backfillSearchErrors: 'Titles Backfill could not search',
   backfillAwaiting: 'Packs waiting for approval',
   backfillFailed: 'Downloads that failed this week',
+  downloadCheckWaiting: 'Download Check findings waiting for you',
+  agentWaiting: 'Admin agent conversations waiting for you',
+  thisWeek: 'This week',
+  weekDownloadCheck:
+    'Download Check: {rejected} rejected, {imported} imported, {cleared} cleared',
+  weekDownloadCheckReport:
+    'Download Check (Report only): would have acted on {count, plural, one {# download} other {# downloads}}',
+  weekFailed: '{count} could not be done',
+  weekAgent:
+    'Admin agent: {conversations, plural, one {# conversation} other {# conversations}}, {downloads, plural, one {# download} other {# downloads}} started ({imported} imported, {failed} failed)',
+  weekAgentChanges: '{count, plural, one {# change} other {# changes}} made',
   unreachable: 'Not answering',
   issues: '{count, plural, one {# issue} other {# issues}}',
   statusOk: 'OK',
@@ -87,6 +139,7 @@ const messages = defineMessages('components.Settings.SettingsHealth', {
 interface HealthResponse {
   checkedAt: string;
   checks: HealthCheck[];
+  activity?: HealthActivity;
 }
 
 const PAGE_SIZE = 10;
@@ -115,18 +168,17 @@ const StatusDot = ({ status }: { status: HealthStatus }) => {
 };
 
 /**
- * Asks Radarr or Sonarr to search now for what the title is missing. After
- * one press it says what was asked for and stays done, so it is not sent
- * again by a second tap.
+ * Asks Radarr, Sonarr or Lidarr to search for what the title is missing.
+ * Stays done after one press, so a second tap doesn't resend it.
  */
 const SearchButton = ({
   mediaId,
   is4k,
-  isMovie,
+  mediaType,
 }: {
   mediaId: number;
   is4k: boolean;
-  isMovie: boolean;
+  mediaType: string;
 }) => {
   const intl = useIntl();
   const { addToast } = useToasts();
@@ -147,14 +199,16 @@ const SearchButton = ({
           }>(`/api/v1/media/${mediaId}/search-missing`, { is4k });
           setState('done');
           addToast(
-            isMovie
+            mediaType === 'movie'
               ? intl.formatMessage(messages.searchStartedMovie, {
                   service: data.service,
                 })
-              : intl.formatMessage(messages.searchStarted, {
-                  count: data.searched,
-                  service: data.service,
-                }),
+              : intl.formatMessage(
+                  mediaType === 'music'
+                    ? messages.searchStartedAlbums
+                    : messages.searchStarted,
+                  { count: data.searched, service: data.service }
+                ),
             { appearance: 'success', autoDismiss: true }
           );
         } catch (e) {
@@ -182,9 +236,9 @@ const SearchButton = ({
 };
 
 /**
- * Searches for every stuck title Radarr or Sonarr can act on — not just the
- * ones on screen. Confirmed first, saying what it costs: each search is a
- * query to the indexers, which often cap queries a day.
+ * Searches for every stuck title Radarr or Sonarr can act on, not only those on
+ * screen. Confirms first with the cost: each search queries the indexers,
+ * which often cap queries a day.
  */
 const SearchAll = ({ onDone }: { onDone: () => void }) => {
   const intl = useIntl();
@@ -272,6 +326,309 @@ const SearchAll = ({ onDone }: { onDone: () => void }) => {
   );
 };
 
+interface MatchSettingsData {
+  matchCheckOnImport?: boolean;
+  matchFix?: boolean;
+  matchFixAuto?: boolean;
+}
+
+/** One of Match Check's settings, saved as it's ticked. */
+const MatchSetting = ({
+  id,
+  label,
+  tip,
+  checked,
+  disabled,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  tip: string;
+  checked: boolean;
+  disabled: boolean;
+  onChange: (checked: boolean) => void;
+}) => (
+  <div className="flex items-start gap-3 py-2">
+    <input
+      type="checkbox"
+      id={id}
+      className="mt-0.5 flex-none"
+      checked={checked}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.checked)}
+    />
+    <label htmlFor={id} className="min-w-0 text-sm">
+      <span className="text-gray-100">{label}</span>
+      <span className="block text-xs text-gray-400">{tip}</span>
+    </label>
+  </div>
+);
+
+/**
+ * Match Check's settings: also check new imports as they arrive (not only
+ * nightly), offer Fix for wrong Plex matches, and fix them without asking.
+ */
+const MatchSettings = ({ onChanged }: { onChanged: () => void }) => {
+  const intl = useIntl();
+  const { addToast } = useToasts();
+  const { data, mutate } = useSWR<MatchSettingsData>('/api/v1/settings/main', {
+    revalidateOnFocus: false,
+  });
+  const [saving, setSaving] = useState(false);
+  const onImport = data?.matchCheckOnImport !== false;
+  const fix = data?.matchFix !== false;
+  const auto = fix && data?.matchFixAuto === true;
+
+  const save = async (change: MatchSettingsData) => {
+    setSaving(true);
+    try {
+      await axios.post('/api/v1/settings/main', change);
+      await mutate({ ...data, ...change }, false);
+      // Fix buttons come and go with the setting.
+      if (change.matchFix !== undefined) onChanged();
+    } catch {
+      addToast(intl.formatMessage(messages.settingFailed), {
+        appearance: 'error',
+        autoDismiss: true,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="border-b border-gray-700 py-1">
+      <MatchSetting
+        id="matchCheckOnImport"
+        label={intl.formatMessage(messages.checkOnImport)}
+        tip={intl.formatMessage(messages.checkOnImportTip)}
+        checked={onImport}
+        disabled={!data || saving}
+        onChange={(matchCheckOnImport) => save({ matchCheckOnImport })}
+      />
+      <MatchSetting
+        id="matchFix"
+        label={intl.formatMessage(messages.fixMatches)}
+        tip={intl.formatMessage(messages.fixMatchesTip)}
+        checked={fix}
+        disabled={!data || saving}
+        onChange={(matchFix) => save({ matchFix })}
+      />
+      <div className="pl-6">
+        <MatchSetting
+          id="matchFixAuto"
+          label={intl.formatMessage(messages.fixAuto)}
+          tip={intl.formatMessage(messages.fixAutoTip)}
+          checked={auto}
+          disabled={!data || saving || !fix}
+          onChange={(matchFixAuto) => save({ matchFixAuto })}
+        />
+      </div>
+    </div>
+  );
+};
+
+const FIXES_URL = '/api/v1/settings/health/match-fixes';
+
+const titled = (t: { title: string; year?: number }) =>
+  t.year ? `${t.title} (${t.year})` : t.title;
+
+/** Fixes one wrong Plex match, and says how it went. */
+const FixButton = ({
+  fixKey,
+  onFixed,
+}: {
+  fixKey: string;
+  onFixed: () => void;
+}) => {
+  const intl = useIntl();
+  const { addToast } = useToasts();
+  const { mutate } = useSWRConfig();
+  const [busy, setBusy] = useState(false);
+
+  const said = (outcome: FixOutcome): [string, 'success' | 'warning'] => {
+    switch (outcome.state) {
+      case 'fixed':
+        return [
+          intl.formatMessage(messages.fixed, {
+            title: titled(outcome.fix.to),
+          }),
+          'success',
+        ];
+      case 'right':
+        return [intl.formatMessage(messages.fixRight), 'success'];
+      case 'gone':
+        return [intl.formatMessage(messages.fixGone), 'warning'];
+      case 'notFound':
+        return [
+          intl.formatMessage(messages.fixNotFound, {
+            searched: outcome.searched.join(', '),
+          }),
+          'warning',
+        ];
+      case 'putBack':
+        return [
+          intl.formatMessage(messages.fixPutBack, {
+            title: titled(outcome.to),
+          }),
+          'warning',
+        ];
+      default:
+        return [intl.formatMessage(messages.fixUnchanged), 'warning'];
+    }
+  };
+
+  return (
+    <Button
+      buttonType="ghost"
+      buttonSize="sm"
+      className="mt-2"
+      disabled={busy}
+      onClick={async () => {
+        setBusy(true);
+        try {
+          const { data } = await axios.post<FixOutcome>(
+            '/api/v1/settings/health/fix-match',
+            { key: fixKey }
+          );
+          const [text, appearance] = said(data);
+          addToast(text, { appearance, autoDismiss: true });
+          if (data.state === 'fixed' || data.state === 'right') {
+            await mutate(FIXES_URL);
+            onFixed();
+          }
+        } catch (e) {
+          addToast(
+            e?.response?.data?.message ??
+              intl.formatMessage(messages.fixFailed),
+            { appearance: 'error', autoDismiss: true }
+          );
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      <WrenchIcon />
+      <span>
+        {intl.formatMessage(busy ? messages.fixing : messages.fixMatch)}
+      </span>
+    </Button>
+  );
+};
+
+type ListedFix = MatchFix & {
+  byName?: string | null;
+  undoneByName?: string | null;
+};
+
+/** Matches fixed lately, each with Undo. Nothing when there are none. */
+const FixedLately = ({ onChanged }: { onChanged: () => void }) => {
+  const intl = useIntl();
+  const { addToast } = useToasts();
+  const { data, mutate } = useSWR<{ fixes: ListedFix[] }>(FIXES_URL, {
+    revalidateOnFocus: false,
+  });
+  const [busy, setBusy] = useState<string>();
+  if (!data?.fixes.length) return null;
+
+  const when = (iso: string) =>
+    intl.formatDate(iso, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+
+  return (
+    <div className="border-b border-gray-700 py-2">
+      <h5 className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+        {intl.formatMessage(messages.fixedLately)}
+      </h5>
+      <ul>
+        {data.fixes.map((fix) => (
+          <li key={fix.id} className="py-1.5 text-sm">
+            <span className="break-words text-gray-100">{fix.folder}</span>
+            <span className="mt-0.5 block break-words text-xs text-gray-400">
+              {intl.formatMessage(messages.fixedFromTo, {
+                from: titled(fix.from),
+                to: titled(fix.to),
+              })}
+              {!fix.confirmed &&
+                ` · ${intl.formatMessage(messages.fixUnconfirmed)}`}
+            </span>
+            <span className="mt-0.5 block text-xs text-gray-500">
+              {fix.by === 'auto'
+                ? intl.formatMessage(messages.fixedByItself, {
+                    time: when(fix.at),
+                  })
+                : intl.formatMessage(messages.fixedBy, {
+                    name: fix.byName ?? '',
+                    time: when(fix.at),
+                  })}
+            </span>
+            {fix.undoneAt ? (
+              <span className="mt-1 block text-xs text-gray-500">
+                {intl.formatMessage(messages.undone)}
+              </span>
+            ) : (
+              <Button
+                buttonType="ghost"
+                buttonSize="sm"
+                className="mt-2"
+                disabled={busy !== undefined}
+                onClick={async () => {
+                  setBusy(fix.id);
+                  try {
+                    await axios.post(`${FIXES_URL}/${fix.id}/undo`);
+                    addToast(intl.formatMessage(messages.undoDone), {
+                      appearance: 'success',
+                      autoDismiss: true,
+                    });
+                    await mutate();
+                    onChanged();
+                  } catch (e) {
+                    addToast(
+                      e?.response?.data?.message ??
+                        intl.formatMessage(messages.undoFailed),
+                      { appearance: 'error', autoDismiss: true }
+                    );
+                  } finally {
+                    setBusy(undefined);
+                  }
+                }}
+              >
+                <ArrowUturnLeftIcon />
+                <span>{intl.formatMessage(messages.undo)}</span>
+              </Button>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+};
+
+/** One finding: its title (a link when it has a page) and its detail. */
+const ItemText = ({ item }: { item: HealthItem }) => (
+  <>
+    {item.href ? (
+      <Link
+        href={item.href}
+        className="break-words text-gray-100 hover:text-strong hover:underline sm:line-clamp-2"
+      >
+        {item.title}
+      </Link>
+    ) : (
+      <span className="break-words text-gray-100">{item.title}</span>
+    )}
+    {item.detail && (
+      <span className="mt-0.5 block break-words text-xs text-gray-400">
+        {item.detail}
+      </span>
+    )}
+  </>
+);
+
 const CheckRow = ({
   check,
   checkedAt,
@@ -284,11 +641,11 @@ const CheckRow = ({
 }) => {
   const intl = useIntl();
   const { addToast } = useToasts();
-  // Ten to a page. Page one comes with the check; others are fetched as they
-  // are stepped to, keeping the current page on screen meanwhile.
+  // Ten per page. Page one comes with the check; others load when stepped to,
+  // keeping the current page shown meanwhile.
   const [chosenPage, setPage] = useState(1);
   const pages = Math.max(1, Math.ceil(check.count / PAGE_SIZE));
-  // A list that has shrunk since a later page was opened shows its last page.
+  // A list that shrank since a later page was opened shows its last page.
   const page = Math.min(chosenPage, pages);
   const {
     data: paged,
@@ -298,7 +655,7 @@ const CheckRow = ({
     page > 1 ? `/api/v1/settings/health/checks/${check.id}?page=${page}` : null,
     { revalidateOnFocus: false, keepPreviousData: true }
   );
-  // After Check Again, a later page is fetched again too, not left as it was.
+  // After Check Again, refetch a later page too.
   useEffect(() => {
     void refreshPage();
   }, [checkedAt, refreshPage]);
@@ -335,11 +692,16 @@ const CheckRow = ({
         : check.reachable
           ? intl.formatMessage(messages.issues, { count: check.count })
           : intl.formatMessage(messages.unreachable)
-      : check.count > 0
-        ? String(check.count)
+      : check.count + (check.recentCount ?? 0) > 0
+        ? String(check.count + (check.recentCount ?? 0))
         : intl.formatMessage(messages.none);
+  const matchCheck = check.id === 'plexMatches';
+  const recent = check.recent ?? [];
+  // Match Check always opens: its setting is inside.
   const expandable =
-    check.items.length > 0 || (check.status !== 'ok' && !!check.detail);
+    matchCheck ||
+    check.items.length > 0 ||
+    (check.status !== 'ok' && !!check.detail);
 
   const row = (open?: boolean) => (
     <div className="flex w-full items-center space-x-3 px-4 py-3 text-left">
@@ -379,49 +741,79 @@ const CheckRow = ({
               {row(open)}
             </DisclosureButton>
             <DisclosurePanel className="border-t border-gray-700 bg-gray-900/40 px-4 py-2">
-              {(check.group === 'services' || check.id === 'plexMatches') &&
-                check.detail && (
-                  <p
-                    className={`py-1 text-sm ${
-                      check.reachable || check.group !== 'services'
-                        ? 'text-gray-400'
-                        : 'text-red-300'
-                    }`}
-                  >
-                    {check.detail}
-                  </p>
-                )}
+              {matchCheck && <MatchSettings onChanged={onChanged} />}
+              {matchCheck && <FixedLately onChanged={onChanged} />}
+              {recent.length > 0 && (
+                <div className="border-b border-gray-700 py-2">
+                  <h5 className="text-xs font-semibold uppercase tracking-wider text-gray-400">
+                    {intl.formatMessage(messages.recentRequests)}
+                  </h5>
+                  <ul>
+                    {recent.map((item, index) => (
+                      <li
+                        key={`${item.at}-${index}`}
+                        className="py-1.5 text-sm"
+                      >
+                        <ItemText item={item} />
+                        {item.at && (
+                          <span className="mt-0.5 block text-xs text-gray-500">
+                            {intl.formatMessage(messages.foundAt, {
+                              time: intl.formatDate(item.at, {
+                                month: 'short',
+                                day: 'numeric',
+                                hour: 'numeric',
+                                minute: '2-digit',
+                              }),
+                            })}
+                          </span>
+                        )}
+                        {item.fix && (
+                          <FixButton fixKey={item.fix} onFixed={onChanged} />
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {matchCheck && recent.length > 0 && (
+                <h5 className="pt-2 text-xs font-semibold uppercase tracking-wider text-gray-400">
+                  {intl.formatMessage(messages.nightlyCheck)}
+                </h5>
+              )}
+              {(check.group === 'services' || matchCheck) && check.detail && (
+                <p
+                  className={`py-1 text-sm ${
+                    check.reachable || check.group !== 'services'
+                      ? 'text-gray-400'
+                      : 'text-red-300'
+                  }`}
+                >
+                  {check.detail}
+                </p>
+              )}
               <ul className={pageLoading ? 'opacity-60' : undefined}>
                 {items.map((item, index) => (
                   <li
                     key={keys[index]}
-                    // Stacked: the title on its line, the detail wrapping
-                    // beneath. Side by side, a long detail squeezed the
-                    // title to a couple of letters on a phone.
+                    // Stacked, so a long detail can't squeeze the title to a few letters on
+                    // a phone.
                     className="py-1.5 text-sm"
                   >
-                    {item.href ? (
-                      <Link
-                        href={item.href}
-                        className="line-clamp-2 break-words text-gray-100 hover:text-white hover:underline"
-                      >
-                        {item.title}
-                      </Link>
-                    ) : (
-                      <span className="line-clamp-3 break-words text-gray-100">
-                        {item.title}
-                      </span>
-                    )}
-                    {item.detail && (
-                      <span className="mt-0.5 block break-words text-xs text-gray-400">
-                        {item.detail}
-                      </span>
-                    )}
+                    <ItemText item={item} />
                     {item.searchable && (
                       <SearchButton
                         mediaId={item.searchable.mediaId}
                         is4k={item.searchable.is4k}
-                        isMovie={item.searchable.mediaType === 'movie'}
+                        mediaType={item.searchable.mediaType}
+                      />
+                    )}
+                    {item.fix && (
+                      <FixButton
+                        fixKey={item.fix}
+                        onFixed={() => {
+                          void refreshPage();
+                          onChanged();
+                        }}
                       />
                     )}
                   </li>
@@ -437,7 +829,7 @@ const CheckRow = ({
                 >
                   <button
                     type="button"
-                    className="py-1 pr-3 text-indigo-400 hover:text-indigo-300 disabled:text-gray-600"
+                    className="py-1 pr-3 text-indigo-400 hover:text-indigo-300 disabled:text-gray-600 light:text-accent-text light:hover:text-accent-text"
                     disabled={page === 1}
                     onClick={() => setPage(page - 1)}
                   >
@@ -448,7 +840,7 @@ const CheckRow = ({
                   </span>
                   <button
                     type="button"
-                    className="py-1 pl-3 text-indigo-400 hover:text-indigo-300 disabled:text-gray-600"
+                    className="py-1 pl-3 text-indigo-400 hover:text-indigo-300 disabled:text-gray-600 light:text-accent-text light:hover:text-accent-text"
                     disabled={page >= pages}
                     onClick={() => setPage(page + 1)}
                   >
@@ -489,6 +881,61 @@ const CheckRow = ({
   );
 };
 
+/** What Download Check and the admin agent did this week, in a line each. */
+const WeekActivity = ({ activity }: { activity: HealthActivity }) => {
+  const intl = useIntl();
+  const lines: string[] = [];
+  const check = activity.downloadCheck;
+  if (check) {
+    const done =
+      check.mode === 'report'
+        ? intl.formatMessage(messages.weekDownloadCheckReport, {
+            count: check.wouldHave,
+          })
+        : intl.formatMessage(messages.weekDownloadCheck, {
+            rejected: check.rejected,
+            imported: check.imported,
+            cleared: check.cleared,
+          });
+    lines.push(
+      check.failed
+        ? `${done}, ${intl.formatMessage(messages.weekFailed, {
+            count: check.failed,
+          })}`
+        : done
+    );
+  }
+  const agent = activity.agent;
+  if (agent) {
+    const did = intl.formatMessage(messages.weekAgent, {
+      conversations: agent.conversations,
+      downloads: agent.downloads,
+      imported: agent.imported,
+      failed: agent.failed,
+    });
+    lines.push(
+      agent.changes
+        ? `${did}, ${intl.formatMessage(messages.weekAgentChanges, {
+            count: agent.changes,
+          })}`
+        : did
+    );
+  }
+  if (!lines.length) return null;
+  return (
+    <div className="mt-3 rounded-md border border-gray-700 bg-gray-800 px-4 py-3 text-sm shadow">
+      <div className="mb-1 font-medium text-strong">
+        {intl.formatMessage(messages.thisWeek)}
+      </div>
+      {lines.map((line) => (
+        <p key={line} className="text-gray-400">
+          {line}
+        </p>
+      ))}
+    </div>
+  );
+};
+
 const GROUPS: { id: HealthCheck['group']; label: keyof typeof messages }[] = [
   { id: 'services', label: 'services' },
   { id: 'backfill', label: 'backfill' },
@@ -498,9 +945,8 @@ const GROUPS: { id: HealthCheck['group']; label: keyof typeof messages }[] = [
 ];
 
 /**
- * One screen for what is quietly wrong. Checked when opened and on demand,
- * not in the background: service checks make real calls, and a page nobody
- * is looking at should not be making them.
+ * One screen for what is quietly wrong. Checked on open and on demand, not in
+ * the background: service checks make real calls.
  */
 const SettingsHealth = () => {
   const intl = useIntl();
@@ -546,7 +992,7 @@ const SettingsHealth = () => {
 
       {!data && !error && <LoadingSpinner />}
       {error && !data && (
-        <p className="text-sm text-red-300">
+        <p className="text-sm text-red-300 light:text-danger-text">
           {error?.response?.data?.message ?? error.message}
         </p>
       )}
@@ -563,7 +1009,7 @@ const SettingsHealth = () => {
                     : 'ok'
               }
             />
-            <span className="text-lg font-semibold text-white">
+            <span className="text-lg font-semibold text-strong">
               {problems === 0
                 ? intl.formatMessage(messages.allClear)
                 : intl.formatMessage(messages.problems, { count: problems })}
@@ -578,10 +1024,7 @@ const SettingsHealth = () => {
             </span>
           </div>
 
-          {/*
-            One column on a phone; on a wide screen the groups sit side by
-            side instead of leaving most of it empty.
-          */}
+          {/* One column on a phone; groups side by side on wide screens. */}
           <div className="space-y-8 xl:grid xl:grid-cols-2 xl:items-start xl:gap-x-6 xl:gap-y-8 xl:space-y-0">
             {GROUPS.map((group) => {
               const checks = data.checks.filter((c) => c.group === group.id);
@@ -612,6 +1055,9 @@ const SettingsHealth = () => {
                         />
                       ))}
                     </ul>
+                  )}
+                  {group.id === 'backfill' && data.activity && (
+                    <WeekActivity activity={data.activity} />
                   )}
                 </div>
               );

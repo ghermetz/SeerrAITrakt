@@ -4,12 +4,14 @@ import { getRepository } from '@server/datasource';
 import { User } from '@server/entity/User';
 import { getIntl } from '@server/i18n';
 import globalMessages from '@server/i18n/globalMessages';
+import { declineReasonOf } from '@server/lib/notifications/declineReason';
 import { eventText } from '@server/lib/notifications/eventTitles';
+import notificationHttp from '@server/lib/notifications/http';
+import { mediaPagePath } from '@server/lib/notifications/mediaPage';
 import type { NotificationAgentTelegram } from '@server/lib/settings';
 import { NotificationAgentKey, getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import type { AvailableLocale } from '@server/types/languages';
-import axios from 'axios';
 import {
   Notification,
   hasNotificationType,
@@ -34,6 +36,9 @@ interface TelegramPhotoPayload {
   message_thread_id: string;
   disable_notification: boolean;
 }
+
+/** Telegram's photo caption length limit. */
+const CAPTION_LIMIT = 1024;
 
 class TelegramAgent
   extends BaseAgent<NotificationAgentTelegram>
@@ -62,9 +67,9 @@ class TelegramAgent
   }
 
   /**
-   * Escapes text for Telegram's MarkdownV2, which refuses a whole message
-   * over any of these characters left bare. The backslash is escaped in the
-   * same single pass as the rest, so text is never escaped twice.
+   * Escapes for MarkdownV2, which rejects the whole message over any bare
+   * special character. Backslash is in the same pass, so nothing is
+   * double-escaped.
    */
   private escapeText(text: string | undefined): string {
     return text
@@ -72,7 +77,7 @@ class TelegramAgent
       : '';
   }
 
-  /** A link's address only needs its closing bracket and backslash escaped. */
+  /** Link URLs only need `)` and backslash escaped. */
   private escapeUrl(url: string): string {
     return url.replace(/[)\\]/g, (x) => '\\' + x);
   }
@@ -124,6 +129,7 @@ class TelegramAgent
           status = intl.formatMessage(globalMessages.declined);
           break;
         case Notification.MEDIA_FAILED:
+        case Notification.REQUEST_FAILED:
           status = intl.formatMessage(globalMessages.failed);
           break;
       }
@@ -132,6 +138,13 @@ class TelegramAgent
         message += `\n\*${this.escapeText(
           intl.formatMessage(globalMessages.requestStatus)
         )}:\* ${this.escapeText(status)}`;
+      }
+
+      const declineReason = declineReasonOf(type, payload);
+      if (declineReason) {
+        message += `\n\*${this.escapeText(
+          intl.formatMessage(globalMessages.declineReason)
+        )}:\* ${this.escapeText(declineReason)}`;
       }
     } else if (payload.comment) {
       message += `\n\n\*${this.escapeText(
@@ -167,7 +180,7 @@ class TelegramAgent
         : payload.issue
           ? `${applicationUrl}/issues/${payload.issue.id}`
           : payload.media
-            ? `${applicationUrl}/${payload.media.mediaType}/${payload.media.tmdbId}`
+            ? `${applicationUrl}${mediaPagePath(payload.media, payload.request)}`
             : undefined
       : undefined;
 
@@ -185,7 +198,9 @@ class TelegramAgent
     }
     /* eslint-enable */
 
-    return embedPoster && payload.image
+    // Captions allow 1,024 characters, text 4,096. The escaped length is never
+    // below Telegram's count, so a possibly too-long caption goes as text.
+    return embedPoster && payload.image && message.length <= CAPTION_LIMIT
       ? {
           photo: payload.image,
           caption: message,
@@ -202,9 +217,12 @@ class TelegramAgent
     payload: NotificationPayload
   ): Promise<boolean> {
     const settings = this.getSettings();
-    const endpoint = `${this.baseUrl}bot${settings.options.botAPI}/${
-      settings.embedPoster && payload.image ? 'sendPhoto' : 'sendMessage'
-    }`;
+    const endpoint = (
+      built: Partial<TelegramMessagePayload | TelegramPhotoPayload>
+    ) =>
+      `${this.baseUrl}bot${settings.options.botAPI}/${
+        'photo' in built ? 'sendPhoto' : 'sendMessage'
+      }`;
 
     // Send system notification
     if (
@@ -221,7 +239,7 @@ class TelegramAgent
       try {
         const notificationPayload = this.getNotificationPayload(type, payload);
 
-        await axios.post(endpoint, {
+        await notificationHttp.post(endpoint(notificationPayload), {
           ...notificationPayload,
           chat_id: settings.options.chatId,
           message_thread_id: settings.options.messageThreadId,
@@ -240,8 +258,7 @@ class TelegramAgent
       }
     }
 
-    // Held while a burst to this person is gathered into one (see the
-    // notification manager): only the admin and channel copies go now.
+    // holdUser: the user's copy goes out later in a digest.
     if (payload.notifyUser && !payload.holdUser) {
       if (
         payload.notifyUser.settings?.hasNotificationType(
@@ -265,7 +282,7 @@ class TelegramAgent
             payload.notifyUser.settings?.locale as AvailableLocale
           );
 
-          await axios.post(endpoint, {
+          await notificationHttp.post(endpoint(notificationPayload), {
             ...notificationPayload,
             chat_id: payload.notifyUser.settings.telegramChatId,
             message_thread_id:
@@ -320,7 +337,7 @@ class TelegramAgent
                   user.settings?.locale as AvailableLocale
                 );
 
-                await axios.post(endpoint, {
+                await notificationHttp.post(endpoint(notificationPayload), {
                   ...notificationPayload,
                   chat_id: user.settings.telegramChatId,
                   message_thread_id: user.settings.telegramMessageThreadId,

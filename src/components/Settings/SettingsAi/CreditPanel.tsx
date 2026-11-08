@@ -1,5 +1,6 @@
 import Alert from '@app/components/Common/Alert';
 import Button from '@app/components/Common/Button';
+import SaveBar from '@app/components/Common/SaveBar';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
 import { aiErrorMessage } from '@app/hooks/useAi';
 import useToasts from '@app/hooks/useToasts';
@@ -20,9 +21,9 @@ import useSWR from 'swr';
 const messages = defineMessages('components.Settings.SettingsAi.CreditPanel', {
   credit: 'Credit',
   description:
-    'Neither OpenAI nor Anthropic lets Seerr AI read your balance, so it is worked out: the balance you enter below, less what has been spent since.',
+    'Providers don’t share your balance, so it’s your entered balance minus spending since.',
   outOfCredit:
-    'The account ran out of credit on {date}. AI features fail until more is added; this clears by itself on the next answer.',
+    'The account ran out of credit on {date}. AI features fail until it’s topped up.',
   addCredit: 'Add credit',
   spentThisMonth: 'Spent this month',
   spentSince: 'Spent since {date}',
@@ -31,19 +32,19 @@ const messages = defineMessages('components.Settings.SettingsAi.CreditPanel', {
   fromProvider:
     "From {provider}'s own spending report: everything the account spent, counted in whole days (UTC).",
   estimated:
-    "Estimated from Seerr AI's own requests at the prices below. Anything else using this account is not counted.",
+    'Estimated from Seerr AI’s own requests at the prices below. Other use of this account isn’t counted.',
   unpriced: 'Not counted, as there is no price for it: {models}.',
   providerProblem:
     "{provider}'s spending report could not be read, so this is Seerr AI's own estimate: {reason}",
   balance: 'Balance Now',
   balanceTip:
-    'In US dollars, as the billing page shows it. Saved as of the moment you save; spending from then on is taken off.',
+    'In US dollars, from the billing page. Spending after you save is taken off.',
   balanceSet: 'Last entered: {amount} on {date}.',
   adminKey: 'Admin Key',
   adminKeyOpenAi:
-    "Optional. An admin key (sk-admin…) lets Seerr AI read OpenAI's own spending report, which counts everything the account spends. Only the organization owner can make one, and it can manage the organization, so it is never shown again once saved.",
+    'Optional admin key (sk-admin…) to read OpenAI’s spending report. It can manage the organization, so it’s hidden once saved.',
   adminKeyAnthropic:
-    "Optional. An Admin API key (sk-ant-admin…) lets Seerr AI read Anthropic's own cost report, which counts everything the account spends. Anthropic only gives these to organization accounts. Never shown again once saved.",
+    'Optional Admin API key (sk-ant-admin…) to read Anthropic’s cost report. Organization accounts only. Hidden once saved.',
   keySaved: 'Admin key saved',
   keyRemoving: 'Will be removed when you save',
   replace: 'Replace',
@@ -53,7 +54,7 @@ const messages = defineMessages('components.Settings.SettingsAi.CreditPanel', {
   pasteKey: 'Paste the admin key',
   prices: 'Prices',
   pricesTip:
-    'US dollars per million tokens, from the pricing page. Used to estimate what Seerr AI spends when no admin key is saved; thinking counts as output.',
+    'US dollars per million tokens. Used for estimates without an admin key; thinking counts as output.',
   pricing: 'Pricing page',
   input: 'Input',
   output: 'Output',
@@ -212,7 +213,7 @@ const CreditPanel = () => {
               href={links.billing}
               target="_blank"
               rel="noreferrer"
-              className="inline-flex items-center gap-1 font-semibold text-white underline"
+              className="inline-flex items-center gap-1 font-semibold text-strong underline"
             >
               {intl.formatMessage(messages.addCredit)}
               <ArrowTopRightOnSquareIcon className="h-4 w-4" />
@@ -239,7 +240,7 @@ const CreditPanel = () => {
               <div className="text-sm text-gray-400">{tile.label}</div>
               <div
                 className={`mt-1 font-semibold ${
-                  tile.muted ? 'text-sm text-gray-400' : 'text-2xl text-white'
+                  tile.muted ? 'text-sm text-gray-400' : 'text-2xl text-strong'
                 }`}
               >
                 {tile.value}
@@ -315,16 +316,16 @@ const CreditPanel = () => {
                 <div className="flex flex-wrap items-center gap-2">
                   <div
                     id="aiAdminKey"
-                    className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-500 bg-gray-700 px-3 py-2 text-sm text-white"
+                    className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-field-border bg-field px-3 py-2 text-sm text-strong"
                   >
                     {removeAdminKey ? (
                       <>
-                        <TrashIcon className="h-5 w-5 flex-none text-red-400" />
+                        <TrashIcon className="h-5 w-5 flex-none text-red-400 light:text-danger-text" />
                         <span>{intl.formatMessage(messages.keyRemoving)}</span>
                       </>
                     ) : (
                       <>
-                        <CheckCircleIcon className="h-5 w-5 flex-none text-green-400" />
+                        <CheckCircleIcon className="h-5 w-5 flex-none text-success-text" />
                         <span>{intl.formatMessage(messages.keySaved)}</span>
                       </>
                     )}
@@ -373,7 +374,7 @@ const CreditPanel = () => {
                   {replacing && (
                     <button
                       type="button"
-                      className="mt-2 text-sm text-gray-400 hover:text-white"
+                      className="mt-2 text-sm text-gray-400 hover:text-strong"
                       onClick={() => {
                         setReplacing(false);
                         setAdminKey('');
@@ -397,7 +398,7 @@ const CreditPanel = () => {
                     href={links.pricing}
                     target="_blank"
                     rel="noreferrer"
-                    className="inline-flex items-center gap-1 underline hover:text-white"
+                    className="inline-flex items-center gap-1 underline hover:text-strong"
                   >
                     {intl.formatMessage(messages.pricing)}
                     <ArrowTopRightOnSquareIcon className="h-3.5 w-3.5" />
@@ -456,7 +457,7 @@ const CreditPanel = () => {
             </div>
           )}
 
-          <div className="actions">
+          <SaveBar>
             <div className="flex justify-end">
               <span className="ml-3 inline-flex rounded-md shadow-sm">
                 <Button buttonType="primary" type="submit" disabled={busy}>
@@ -469,7 +470,7 @@ const CreditPanel = () => {
                 </Button>
               </span>
             </div>
-          </div>
+          </SaveBar>
         </form>
       </div>
     </div>

@@ -1,7 +1,7 @@
 import {
   MediaRequestStatus,
   MediaStatus,
-  type MediaType,
+  type VideoMediaType,
 } from '@server/constants/media';
 import dataSource from '@server/datasource';
 import Media from '@server/entity/Media';
@@ -30,7 +30,7 @@ export class Blocklist implements BlocklistItem {
   public id: number;
 
   @Column({ type: 'varchar' })
-  public mediaType: MediaType;
+  public mediaType: VideoMediaType;
 
   @Column({ nullable: true, type: 'varchar' })
   title?: string;
@@ -54,7 +54,7 @@ export class Blocklist implements BlocklistItem {
   @Column({ nullable: true, type: 'varchar' })
   public blocklistedTags?: string;
 
-  /** Why it was blocklisted, in the words of whoever did it. Optional. */
+  /** The blocklister's reason, if given. */
   @Column({ nullable: true, type: 'varchar' })
   public reason?: string | null;
 
@@ -66,13 +66,13 @@ export class Blocklist implements BlocklistItem {
   }
 
   /**
-   * Declines every request for a title that is still pending or approved,
-   * now it is blocklisted and can no longer be fulfilled. Left as they were,
-   * one could still be approved and sent to Radarr or Sonarr.
+   * Declines a now-blocklisted title's pending and approved requests, which can
+   * no longer be fulfilled; otherwise one could still be approved and sent to
+   * Radarr or Sonarr.
    *
-   * A plain update, so nobody is sent a "declined" notification for what was
-   * an admin's decision about the title, and no request hooks run. Returns
-   * how many were declined.
+   * A plain update, so no "declined" notifications go out for an admin's
+   * decision about the title and no request hooks run. Returns how many were
+   * declined.
    */
   public static async declineOpenRequests(
     mediaId: number,
@@ -96,7 +96,7 @@ export class Blocklist implements BlocklistItem {
       blocklistRequest,
     }: {
       blocklistRequest: {
-        mediaType: MediaType;
+        mediaType: VideoMediaType;
         title?: ZodOptional<ZodString>['_output'];
         tmdbId: ZodNumber['_output'];
         blocklistedTags?: string;

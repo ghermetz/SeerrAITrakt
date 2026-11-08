@@ -20,7 +20,7 @@ import { after, afterEach, beforeEach, describe, it, mock } from 'node:test';
 
 setupTestDb();
 
-/* The agent's routes, behind the real validator and the admin check. */
+/* Agent routes behind the real validator and the admin check. */
 
 let app: Server | undefined;
 let port = 0;
@@ -98,8 +98,8 @@ describe('the admin agent’s routes', () => {
       new AgentRun({
         trigger: 'ask',
         status: 'done',
-        ask: 'Find Casper',
-        title: 'Casper the Friendly Ghost',
+        ask: 'Find Wendle',
+        title: 'Wendle the Gentle Lantern',
         summary: 'Grabbed two.',
         steps: [
           { at: '2026-10-07T20:00:00.000Z', kind: 'say', text: 'Looking.' },
@@ -116,7 +116,7 @@ describe('the admin agent’s routes', () => {
         r.steps,
       ]),
       [
-        ['Casper the Friendly Ghost', 1],
+        ['Wendle the Gentle Lantern', 1],
         ['Old', 0],
       ]
     );
@@ -125,7 +125,35 @@ describe('the admin agent’s routes', () => {
     assert.deepEqual(detail.body.steps, [
       { at: '2026-10-07T20:00:00.000Z', kind: 'say', text: 'Looking.' },
     ]);
+    assert.equal(detail.body.titlePage, null, 'its title is not known yet');
     assert.equal((await call('GET', '/api/v1/agent/9999')).status, 404);
+  });
+
+  it('link a run to its title’s page here, once its title is known', async () => {
+    await getRepository(BackfillSeries).save(
+      new BackfillSeries({
+        kind: 'series',
+        serverId: 0,
+        arrId: 77,
+        tmdbId: 4242,
+        title: 'Wendle the Gentle Lantern',
+        status: 'stuck',
+      })
+    );
+    const run = await getRepository(AgentRun).save(
+      new AgentRun({
+        trigger: 'auto',
+        status: 'done',
+        kind: 'series',
+        serverId: 0,
+        arrId: 77,
+        title: 'Wendle the Gentle Lantern',
+        steps: [],
+        actions: [],
+      })
+    );
+    const detail = await call('GET', `/api/v1/agent/${run.id}`);
+    assert.equal(detail.body.titlePage, '/tv/4242');
   });
 
   it('take a request only when the agent can run', async () => {
@@ -134,7 +162,7 @@ describe('the admin agent’s routes', () => {
       400
     );
     const refused = await call('POST', '/api/v1/agent/ask', {
-      text: 'Find Casper',
+      text: 'Find Wendle',
     });
     assert.equal(refused.status, 409);
     assert.match(refused.body.message, /Admin Agent/);
@@ -153,11 +181,11 @@ describe('the admin agent’s routes', () => {
       );
     });
     const ok = await call('POST', '/api/v1/agent/ask', {
-      text: '  Find Casper  ',
+      text: '  Find Wendle  ',
     });
     assert.equal(ok.status, 202);
     assert.equal(ok.body.status, 'queued');
-    assert.deepEqual(asked, ['Find Casper']);
+    assert.deepEqual(asked, ['Find Wendle']);
   });
 
   it('take a reply to a conversation that is not busy', async () => {
@@ -203,7 +231,7 @@ describe('the admin agent’s routes', () => {
       'getSeriesDetail',
       async (id: number) => {
         if (id !== 1284) throw new Error('Not found');
-        return { id, title: 'Food Wars!' };
+        return { id, title: 'Kitchen Clash!' };
       }
     );
     const asked: [string, unknown][] = [];
@@ -235,7 +263,7 @@ describe('the admin agent’s routes', () => {
         'Get whatever is missing.',
         {
           title: { kind: 'series', serverId: 0, arrId: 1284 },
-          name: 'Food Wars!',
+          name: 'Kitchen Clash!',
         },
       ],
     ]);
@@ -243,13 +271,13 @@ describe('the admin agent’s routes', () => {
       title: { ...title, arrId: 9 },
     });
     assert.equal(unknown.status, 400);
-    assert.match(unknown.body.message, /not in Sonarr or Radarr/);
+    assert.match(unknown.body.message, /not in Sonarr, Radarr or Lidarr/);
 
     await getRepository(AgentRun).save(
       new AgentRun({
         trigger: 'ask',
         status: 'done',
-        ask: 'Find Casper',
+        ask: 'Find Wendle',
         kind: 'series',
         serverId: 0,
         arrId: 1283,
@@ -264,7 +292,7 @@ describe('the admin agent’s routes', () => {
     assert.equal(mine.status, 200);
     assert.deepEqual(
       mine.body.runs.map((r: { title: string }) => r.title),
-      ['Food Wars!']
+      ['Kitchen Clash!']
     );
     assert.equal((await call('GET', '/api/v1/agent')).body.total, 2);
   });
@@ -275,7 +303,7 @@ describe('the admin agent’s routes', () => {
         kind: 'series',
         serverId: 0,
         arrId: 5,
-        title: 'Casper',
+        title: 'Wendle',
         status: 'downloading',
       })
     );
@@ -309,7 +337,7 @@ describe('the admin agent’s routes', () => {
           {
             at: new Date().toISOString(),
             type: 'grab',
-            title: 'Casper',
+            title: 'Wendle',
             detail: 'x',
             jobId,
           },
@@ -356,7 +384,7 @@ describe('the admin agent’s routes', () => {
     );
     assert.equal(await runs.count({ where: { id: done.id } }), 0);
 
-    // Counted across every page, so Clear finished is offered from any.
+    // Counted across all pages, so Clear finished is offered on any.
     const later = await call('GET', '/api/v1/agent?page=1');
     assert.deepEqual([later.body.runs.length, later.body.finished], [0, 1]);
 

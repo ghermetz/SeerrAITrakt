@@ -3,9 +3,17 @@ import {
   DEFAULT_IMAGE_CACHE_MAX_MB,
   MIN_IMAGE_CACHE_MAX_MB,
 } from '@server/constants/images';
+import type { MusicImageSource } from '@server/lib/music/imageSources';
+import {
+  MUSIC_IMAGE_KEPT_S,
+  MUSIC_IMAGE_MISSING_MS,
+  MUSIC_IMAGE_ORIGINS,
+  MUSIC_IMAGE_REDIRECT_HOSTS,
+} from '@server/lib/music/imageSources';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { proxyRequestInterceptor } from '@server/utils/customProxyAgent';
+import { publicRedirectGuard } from '@server/utils/publicHost';
 import { userAgentRequestInterceptor } from '@server/utils/userAgent';
 import axios, { type AxiosInstance } from 'axios';
 import rateLimit, { type rateLimitOptions } from 'axios-rate-limit';
@@ -22,13 +30,13 @@ type ImageResponse = {
     isStale: boolean;
     etag: string;
     extension: string | null;
-    /** The media type to serve it as: image/jpeg, image/svg+xml... */
+    /** Media type to serve: image/jpeg, image/svg+xml... */
     contentType: string;
     cacheKey: string;
     cacheMiss: boolean;
-    /** When it was fetched, or last confirmed unchanged upstream (ms). */
+    /** When fetched or last confirmed unchanged upstream (ms). */
     storedAt: number;
-    /** Its file in the cache entry's directory. */
+    /** File name within the cache entry's directory. */
     fileName: string;
   };
   imageBuffer: Buffer;
@@ -38,67 +46,83 @@ type ImageResponse = {
 export type ImageVariant = { format: ImageFormat; width?: ImageWidth };
 
 /**
- * What getVariant found: the converted image, or why the original has to be
- * sent instead. 'pending' passes; 'unavailable' does not (the image cannot
- * be converted, or conversion cannot run here).
+ * getVariant's result: the converted image, or why to send the original.
+ * 'pending' is temporary; 'unavailable' is not (unconvertible image, or no
+ * converter here).
  */
 export type VariantResult =
   | { status: 'ready'; image: ImageResponse }
   | { status: 'pending' | 'unavailable' };
 
-/**
- * How long to wait for an upstream image. Without it a fetch that never
- * answers keeps the browser waiting on that poster for good.
- */
+/** Upstream fetch timeout; otherwise a hung fetch blocks the poster forever. */
 const UPSTREAM_TIMEOUT_MS = 15000;
 
-/** Kept this long when the upstream does not say. */
+/** Cache lifetime when the upstream doesn't give one. */
 const DEFAULT_MAX_AGE_S = 86400;
 
-/** An image the upstream says does not exist is not asked for again for this long. */
+/**
+ * How long an upstream-missing image isn't re-requested, unless overridden (see
+ * missingForMs).
+ */
 const MISSING_FOR_MS = 10 * 60 * 1000;
 const MISSING_LIMIT = 5000;
 
 /**
- * A cached file's modification time is when it was last served, so the size
- * limit can remove the least recently used first. Touched at most this often
- * per file, so serving a poster does not mean a disk write every time.
+ * A cached file's mtime is when it was last served, so the size limit evicts
+ * least recently used first. Touched at most this often per file, to avoid a
+ * disk write per serve.
  */
 const TOUCH_EVERY_MS = 6 * 60 * 60 * 1000;
 const TOUCH_LIMIT = 50000;
 
-/** How long an expired image not served since is kept before cleanup. */
+/** How long an expired, unserved image is kept before cleanup. */
 const EXPIRED_KEPT_MS = 30 * 24 * 60 * 60 * 1000;
 
-/** Over the limit, the cache is trimmed to this share of it. */
+/** Over the limit, trim the cache to this share of it. */
 const TRIM_TO = 0.9;
 
-/** Pictures converted at once; each takes a core while it runs. */
+/** Concurrent conversions; each uses a core. */
 const CONVERSIONS_AT_ONCE = 2;
-/** Conversions waiting beyond this are not queued; the original is sent. */
+/**
+ * Beyond this many waiting, conversions aren't queued; the original is sent.
+ */
 const CONVERSIONS_QUEUED_LIMIT = 100;
 /**
- * Warming converts only while fewer than this are waiting, so the posters a
- * browser is asking for never queue behind ones it may never show.
+ * Warming converts only below this queue length, so requested posters never
+ * wait behind speculative ones.
  */
 const WARM_CONVERSIONS_QUEUED_LIMIT = 10;
 /**
- * How long a request waits for its picture to be converted. Past this the
- * original is sent (not to be kept), and the conversion finishes for next
- * time.
+ * Original bytes held by queued conversions at most; beyond it the original
+ * is sent.
+ */
+const CONVERSIONS_QUEUED_BYTES = 256 * 1024 * 1024;
+/**
+ * Largest image decoded for conversion, in pixels; a bigger one is sent as
+ * it is. Far above any poster, backdrop or cover.
+ */
+const CONVERT_MAX_PIXELS = 50_000_000;
+/** A conversion running longer is stopped and the original sent. */
+const CONVERT_TIMEOUT_S = 20;
+/** How long a failed conversion isn't tried again. */
+const CONVERT_FAILED_FOR_MS = 10 * 60 * 1000;
+const CONVERT_FAILED_LIMIT = 2000;
+
+/**
+ * How long a request waits for conversion. After that the original is sent
+ * (uncached) and the conversion finishes for next time.
  */
 const CONVERSION_WAIT_MS = 3000;
 
 /**
- * Encoder settings. AVIF at effort 2 encoded about seven times faster than
- * sharp's default (4) for a few percent in size. In testing on backdrops
- * and posters, AVIF came out at a fifth to a quarter of the JPEG's size and
- * WebP at a third to a half.
+ * Encoder settings. AVIF effort 2 is about 7x faster than sharp's default
+ * (4) for a few percent in size. On backdrops and posters, AVIF is 1/5 to 1/4
+ * of the JPEG's size, WebP 1/3 to 1/2.
  */
 const AVIF_OPTIONS = { quality: 50, effort: 2 };
 const WEBP_OPTIONS = { quality: 80, effort: 4 };
 
-/** The image cache's size limit, in bytes, from the settings. */
+/** The image cache's size limit in bytes, from settings. */
 const sizeLimitBytes = () => {
   const mb = Number(getSettings().main.imageCacheMaxMb);
   return (
@@ -115,8 +139,8 @@ type Sharp = typeof sharpType;
 let sharpModule: Promise<Sharp | null> | undefined;
 
 /**
- * The image library, loaded on first use. Null when it cannot load here (a
- * build without its native part): pictures are then served as they come.
+ * sharp, loaded on first use. Null when it can't load (no native build):
+ * images are then served unconverted.
  */
 const loadSharp = () =>
   (sharpModule ??= import('sharp')
@@ -129,10 +153,10 @@ const loadSharp = () =>
       return null;
     }));
 
-/** Whether pictures can be converted on this server. */
+/** Whether images can be converted on this server. */
 export const imageConversionAvailable = async () => !!(await loadSharp());
 
-/** Runs at most a few jobs at once; the rest wait their turn. */
+/** Runs at most `max` jobs at once; the rest queue. */
 class Limiter {
   private running = 0;
   private waiting: (() => void)[] = [];
@@ -158,15 +182,18 @@ class Limiter {
 }
 
 const conversions = new Limiter(CONVERSIONS_AT_ONCE);
+/** Bytes of the originals queued conversions hold. */
+let queuedBytes = 0;
+/** Conversions that failed, by variant key and source, until when. */
+const failedConversions = new Map<string, number>();
 
-/** A short fingerprint of an image's bytes. */
+/** Short hash of an image's bytes. */
 const fingerprint = (buffer: Buffer) =>
   createHash('sha1').update(buffer).digest('hex').slice(0, 20);
 
 /**
- * The seconds a response may be kept, from its Cache-Control header, in
- * whatever order its directives come ("public, max-age=N" or
- * "max-age=N, immutable"). Null when it gives none.
+ * max-age seconds from a Cache-Control header, in any directive order; null if
+ * absent.
  */
 export const maxAgeOf = (cacheControl: unknown): number | null => {
   const match = /(?:^|,)\s*max-age\s*=\s*"?(\d+)"?/i.exec(
@@ -175,16 +202,15 @@ export const maxAgeOf = (cacheControl: unknown): number | null => {
   return match ? Number(match[1]) : null;
 };
 
-/** The media type for a stored extension: jpg is image/jpeg, svg image/svg+xml. */
+/** Media type for a stored extension: jpg is image/jpeg, svg image/svg+xml. */
 const contentTypeOf = (extension: string | null) =>
   (extension && mime.getType(extension)) || 'application/octet-stream';
 
 /**
- * Headers asking the host for an image only if it changed since the copy
- * kept. The ETag kept is only what is safe in a file name (quotes and the
- * W/ of a weak one dropped), so it is sent back only when it is plainly a
- * whole strong one: hex, or hex groups joined by hyphens. TMDB sends both
- * kinds (a 32-digit hash, or "67ef93d1-13c28"). If-Modified-Since covers
+ * Conditional request headers for revalidating a cached image. The stored
+ * ETag is file-name safe (quotes and weak W/ dropped), so it is sent back only
+ * when it is clearly a whole strong one: hex, or hyphen-joined hex groups
+ * (TMDB sends a 32-digit hash or "67ef93d1-13c28"). If-Modified-Since covers
  * the rest.
  */
 const conditionalHeaders = (meta: ImageResponse['meta']) => ({
@@ -196,6 +222,68 @@ const conditionalHeaders = (meta: ImageResponse['meta']) => ({
 
 /** The upstream has no such image (404 or 410). */
 export class ImageNotFoundError extends Error {}
+
+/**
+ * Whether a browser's If-None-Match names this ETag. It may list several,
+ * and a compressing CDN weakens it (W/"…"), which still matches.
+ */
+export const etagMatches = (header: unknown, etag: string): boolean => {
+  if (typeof header !== 'string' || !header) {
+    return false;
+  }
+  const bare = (tag: string) => tag.trim().replace(/^W\//, '');
+  return (
+    header.trim() === '*' ||
+    header.split(',').some((tag) => bare(tag) === bare(etag))
+  );
+};
+
+/**
+ * Sent with every image served from Seerr's origin. An image opened directly
+ * is a page of this site and an SVG can carry script; these keep it inert,
+ * whatever the source host put in it.
+ */
+export const PICTURE_HEADERS = {
+  'Content-Security-Policy':
+    "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+  'X-Content-Type-Options': 'nosniff',
+} as const;
+
+/** Largest image fetched from a host; anything bigger is refused. */
+const MAX_IMAGE_BYTES = 30 * 1024 * 1024;
+
+/**
+ * Allowed redirects for a host's images: to the same host or one of its
+ * named others, over https (or the host's own protocol). Anything else is
+ * refused, not followed.
+ */
+export const redirectGuard =
+  (baseUrl: string, otherHosts: readonly string[] = []) =>
+  (options: {
+    protocol?: string | null;
+    hostname?: string | null;
+    port?: string | number | null;
+  }) => {
+    const base = new URL(baseUrl);
+    const host = (options.hostname ?? '').toLowerCase();
+    const portOf = (port: unknown, protocol?: string | null) =>
+      String(port || (protocol === 'https:' ? 443 : 80));
+    const port = portOf(options.port, options.protocol);
+    const allowed =
+      (host === base.hostname &&
+        options.protocol === base.protocol &&
+        port === portOf(base.port, base.protocol)) ||
+      (options.protocol === 'https:' &&
+        port === '443' &&
+        otherHosts.some(
+          (other) => host === other || host.endsWith(`.${other}`)
+        ));
+    if (!allowed) {
+      throw new Error(
+        `Refused to follow an image to ${options.protocol ?? ''}//${host}`
+      );
+    }
+  };
 
 const baseCacheDirectory = process.env.CONFIG_DIRECTORY
   ? `${process.env.CONFIG_DIRECTORY}/cache/images`
@@ -221,8 +309,8 @@ class ImageProxy {
             const expireAt = Number(expireAtSt);
             const now = Date.now();
 
-            // Expired a while and not served since (serving marks it used):
-            // gone. Recently expired ones stay, to be revalidated cheaply.
+            // Long expired and unserved: delete. Recently expired ones stay
+            // for cheap revalidation.
             const { mtimeMs } = await promises
               .stat(path.join(filePath, imageFile))
               .catch(() => ({ mtimeMs: 0 }));
@@ -230,10 +318,13 @@ class ImageProxy {
               now > expireAt + EXPIRED_KEPT_MS &&
               now > mtimeMs + EXPIRED_KEPT_MS
             ) {
+              // Remove the whole entry, unfinished writes included.
               await promises.rm(path.join(filePath), {
                 recursive: true,
+                force: true,
               });
               deletedImages += 1;
+              break;
             }
           }
         }
@@ -267,7 +358,7 @@ class ImageProxy {
     };
   }
 
-  /** The whole image cache's size on disk, every source included. */
+  /** The whole image cache's size on disk, all sources. */
   public static getTotalSize(): Promise<number> {
     return ImageProxy.getDirectorySize(baseCacheDirectory);
   }
@@ -323,15 +414,14 @@ class ImageProxy {
     return 0;
   }
 
-  /** The cache's size on disk as last measured, plus what was written since. */
+  /** Last measured cache size plus writes since. */
   private static knownSize: number | undefined;
   private static trimming: Promise<void> | undefined;
 
   /**
-   * Keeps the whole image cache, every source, under the size limit in the
-   * settings: past it, the least recently served images are removed until
-   * it is back to 90% of the limit. Run by the cleanup job, and as soon as
-   * writes take the cache over the limit.
+   * Keeps the whole image cache under the size limit: past it, removes least
+   * recently served images until at 90%. Run by the cleanup job and when
+   * writes exceed the limit.
    */
   public static trimToLimit(): Promise<void> {
     ImageProxy.trimming ??= ImageProxy.trim().finally(() => {
@@ -411,10 +501,10 @@ class ImageProxy {
     );
   }
 
-  /** Counts a write towards the size limit, trimming once it is passed. */
+  /** Counts a write toward the size limit, trimming once exceeded. */
   private static wrote(bytes: number) {
     if (ImageProxy.knownSize === undefined) {
-      // Not measured since starting: measure (and trim, if over) now.
+      // Not measured since start: measure (and trim if over) now.
       ImageProxy.knownSize = 0;
       ImageProxy.trimToLimit().catch(() => undefined);
       return;
@@ -425,7 +515,7 @@ class ImageProxy {
     }
   }
 
-  /** When each cached file was last marked as used, by this process. */
+  /** When this process last marked each cached file used. */
   private static touched = new Map<string, number>();
 
   /** Marks a cached file as just used, for the size limit. */
@@ -445,6 +535,9 @@ class ImageProxy {
   private axios: AxiosInstance;
   private cacheVersion;
   private key;
+  private keptForS: number | undefined;
+  /** How long an upstream-missing image isn't re-requested. */
+  public readonly missingForMs: number;
 
   constructor(
     key: string,
@@ -453,14 +546,32 @@ class ImageProxy {
       cacheVersion?: number;
       rateLimitOptions?: rateLimitOptions;
       headers?: Record<string, string>;
+      /**
+       * Seconds before revalidating, overriding the host's headers; defaults to
+       * the host's max-age.
+       */
+      keptForS?: number;
+      missingForMs?: number;
+      /**
+       * Other hosts images may redirect to. Without a base URL (avatars,
+       * fetched by full address, some from the admin's own servers) a
+       * redirect stays on the host asked or goes to a public address.
+       */
+      redirectHosts?: readonly string[];
     } = {}
   ) {
     this.cacheVersion = options.cacheVersion ?? 1;
     this.key = key;
+    this.keptForS = options.keptForS;
+    this.missingForMs = options.missingForMs ?? MISSING_FOR_MS;
     this.axios = axios.create({
       baseURL: baseUrl,
       headers: options.headers,
       timeout: UPSTREAM_TIMEOUT_MS,
+      maxContentLength: MAX_IMAGE_BYTES,
+      beforeRedirect: baseUrl
+        ? redirectGuard(baseUrl, options.redirectHosts)
+        : publicRedirectGuard,
     });
     this.axios.interceptors.request.use(proxyRequestInterceptor);
     this.axios.interceptors.request.use(userAgentRequestInterceptor);
@@ -500,8 +611,8 @@ class ImageProxy {
   }
 
   /**
-   * The cached copy, if there is one, without fetching anything new. A stale
-   * copy is still returned, and refreshed in the background.
+   * The cached copy, if any, without fetching; a stale copy is returned and
+   * refreshed in the background.
    */
   public async peek(path: string): Promise<ImageResponse | null> {
     return this.cached(path, this.getCacheKey(path));
@@ -520,7 +631,7 @@ class ImageProxy {
     return imageResponse;
   }
 
-  /** Images the upstream said do not exist, until when. */
+  /** Upstream-missing images, with when to retry. */
   private static missing = new Map<string, number>();
 
   private static isMissing(cacheKey: string) {
@@ -536,7 +647,6 @@ class ImageProxy {
   }
 
   public async clearCachedImage(path: string) {
-    // find cacheKey
     const cacheKey = this.getCacheKey(path);
     const directory = join(this.getCacheDirectory(), cacheKey);
 
@@ -582,9 +692,8 @@ class ImageProxy {
       const files = await promises.readdir(directory);
       const now = Date.now();
 
-      // Only complete entries: a partially written file still carries its
-      // temporary name, and serving one would produce a broken image. Names
-      // are "maxAge.expireAt.etag.extension", so anything else is skipped.
+      // Only complete entries named "maxAge.expireAt.etag.extension"; a
+      // partial write keeps its temporary name and would be a broken image.
       const usable = files
         .filter(
           (file) => !file.endsWith('.tmp') && file.split('.').length === 4
@@ -607,8 +716,8 @@ class ImageProxy {
         const filePath = join(directory, file);
         const buffer = await promises.readFile(filePath);
 
-        // A zero-length file means the write did not finish; ignore it and
-        // let the caller fetch again rather than serving nothing.
+        // Zero length means an unfinished write; refetch instead of serving
+        // nothing.
         if (!buffer.length) {
           continue;
         }
@@ -632,16 +741,15 @@ class ImageProxy {
         };
       }
     } catch {
-      // No files. Treat as empty cache.
+      // No files: empty cache.
     }
 
     return null;
   }
 
   /**
-   * Fetches in flight, keyed by cache key. Several parts of a page can ask
-   * for the same poster at once; without this they race each other writing
-   * the same file and some of them fail.
+   * Fetches in flight by cache key, so concurrent requests for one poster
+   * share a fetch instead of racing to write the same file.
    */
   private static inFlight = new Map<string, Promise<ImageResponse | null>>();
 
@@ -658,9 +766,8 @@ class ImageProxy {
 
     const request = this.fetchAndStore(path, cacheKey, previous)
       .catch((e) => {
-        // A rejected entry must not be handed to later callers, and must not
-        // become an unhandled rejection when this came from a background
-        // revalidation that nobody awaited.
+        // Don't hand a rejection to later callers, or leave it unhandled from
+        // an unawaited background revalidation.
         logger.debug('Image fetch failed', {
           label: 'Image Cache',
           path,
@@ -687,8 +794,7 @@ class ImageProxy {
       const directory = join(this.getCacheDirectory(), cacheKey);
       const response = await this.axios.get(path, {
         responseType: 'arraybuffer',
-        // A stale copy is checked rather than fetched again: unchanged, the
-        // host answers 304 with no body.
+        // Revalidate a stale copy; if unchanged the host sends 304, no body.
         ...(previous
           ? {
               headers: conditionalHeaders(previous.meta),
@@ -706,8 +812,8 @@ class ImageProxy {
 
       const contentType = String(response.headers['content-type'] || '');
 
-      // Only images are kept and served as images: an error page answered
-      // with a 200 would otherwise be cached and handed out as a poster.
+      // Only cache images: otherwise a 200 error page would be served as a
+      // poster.
       if (!/^image\//i.test(contentType) || !buffer.length) {
         throw new Error(`Not an image (${contentType || 'no type'})`);
       }
@@ -718,7 +824,8 @@ class ImageProxy {
       );
 
       const maxAge =
-        maxAgeOf(response.headers['cache-control']) || DEFAULT_MAX_AGE_S;
+        this.keptForS ??
+        (maxAgeOf(response.headers['cache-control']) || DEFAULT_MAX_AGE_S);
       const expireAt = Date.now() + maxAge * 1000;
       const etag = (response.headers.etag ?? '').replace(/[^\w-]/g, '');
 
@@ -749,12 +856,11 @@ class ImageProxy {
     } catch (e) {
       const status = (e as { response?: { status?: number } }).response?.status;
       if (status === 404 || status === 410) {
-        // Not there upstream: remembered for a while rather than asked for
-        // on every page that shows it.
+        // Missing upstream: remember for a while instead of asking per page.
         if (ImageProxy.missing.size >= MISSING_LIMIT) {
           ImageProxy.missing.clear();
         }
-        ImageProxy.missing.set(cacheKey, Date.now() + MISSING_FOR_MS);
+        ImageProxy.missing.set(cacheKey, Date.now() + this.missingForMs);
         logger.debug('Image not found upstream', {
           label: 'Image Cache',
           path,
@@ -770,17 +876,15 @@ class ImageProxy {
     }
   }
 
-  /**
-   * A stale copy the host says is unchanged: kept, good for as long again,
-   * under its new expiry.
-   */
+  /** Re-stores a stale copy the host confirmed unchanged, with a new expiry. */
   private async renew(
     directory: string,
     previous: ImageResponse,
     headers: Record<string, unknown>
   ): Promise<ImageResponse> {
     const maxAge =
-      maxAgeOf(headers['cache-control']) || previous.meta.curRevalidate;
+      this.keptForS ??
+      (maxAgeOf(headers['cache-control']) || previous.meta.curRevalidate);
     const expireAt = Date.now() + maxAge * 1000;
     const { etag, extension } = previous.meta;
     const fileName = `${maxAge}.${expireAt}.${etag}.${extension}`;
@@ -804,10 +908,10 @@ class ImageProxy {
   }
 
   /**
-   * The image in a smaller size or better format, from the cached original
-   * (which the caller has already got). Converted once and kept; a request
-   * waits a few seconds at most for that, and is otherwise told 'pending'.
-   * With convert false, only an already converted copy is used.
+   * The image resized or re-encoded, from the cached original the caller
+   * already has. Converted once and kept; a request waits a few seconds at
+   * most, else gets 'pending'. With convert false, only an existing copy is
+   * used.
    */
   public async getVariant(
     path: string,
@@ -821,7 +925,7 @@ class ImageProxy {
     const source = fingerprint(original.imageBuffer);
     const kept = await this.get(cacheKey);
 
-    // Made from this very original: still good, whatever its expiry says.
+    // Made from this original: valid whatever its expiry says.
     if (kept && kept.meta.etag.startsWith(source)) {
       return { status: 'ready', image: kept };
     }
@@ -832,13 +936,31 @@ class ImageProxy {
       return { status: (await loadSharp()) ? 'pending' : 'unavailable' };
     }
 
+    const failedKey = `${this.key}:${cacheKey}:${source}`;
+    if ((failedConversions.get(failedKey) ?? 0) > Date.now()) {
+      return { status: 'unavailable' };
+    }
+
     let conversion = ImageProxy.inFlight.get(cacheKey);
     if (!conversion) {
-      if (conversions.queued >= CONVERSIONS_QUEUED_LIMIT) {
+      const bytes = original.imageBuffer.length;
+      if (
+        conversions.queued >= CONVERSIONS_QUEUED_LIMIT ||
+        queuedBytes + bytes > CONVERSIONS_QUEUED_BYTES
+      ) {
         return { status: 'pending' };
       }
+      queuedBytes += bytes;
+      let waiting = true;
+      const started = () => {
+        if (waiting) queuedBytes -= bytes;
+        waiting = false;
+      };
       conversion = conversions
-        .run(() => this.convert(cacheKey, variant, original, source))
+        .run(() => {
+          started();
+          return this.convert(cacheKey, variant, original, source);
+        })
         .catch((e) => {
           logger.warn('Could not convert an image', {
             label: 'Image Cache',
@@ -846,9 +968,16 @@ class ImageProxy {
             variant,
             errorMessage: e instanceof Error ? e.message : String(e),
           });
+          if (failedConversions.size >= CONVERT_FAILED_LIMIT) {
+            failedConversions.clear();
+          }
+          failedConversions.set(failedKey, Date.now() + CONVERT_FAILED_FOR_MS);
           return null;
         })
-        .finally(() => ImageProxy.inFlight.delete(cacheKey));
+        .finally(() => {
+          started();
+          ImageProxy.inFlight.delete(cacheKey);
+        });
       ImageProxy.inFlight.set(cacheKey, conversion);
     }
 
@@ -875,7 +1004,10 @@ class ImageProxy {
     source: string
   ): Promise<ImageResponse> {
     const sharp = (await loadSharp()) as Sharp;
-    let image = sharp(original.imageBuffer, { failOn: 'none' });
+    let image = sharp(original.imageBuffer, {
+      failOn: 'none',
+      limitInputPixels: CONVERT_MAX_PIXELS,
+    }).timeout({ seconds: CONVERT_TIMEOUT_S });
     if (variant.width) {
       image = image.resize({ width: variant.width, withoutEnlargement: true });
     }
@@ -885,8 +1017,8 @@ class ImageProxy {
         : await image.webp(WEBP_OPTIONS).toBuffer();
     let extension: string = variant.format;
 
-    // Converting a small, already well-compressed picture can make it
-    // bigger; then the original is the better copy, at its own size.
+    // Converting a small, well-compressed image can enlarge it; then the
+    // original is better.
     if (!variant.width && buffer.length >= original.imageBuffer.length) {
       buffer = original.imageBuffer;
       extension = original.meta.extension ?? 'jpg';
@@ -934,16 +1066,15 @@ class ImageProxy {
 
     await promises.mkdir(dir, { recursive: true });
 
-    // Write to a temporary name and rename it into place. Clearing the
-    // directory first left a window where a concurrent request for the same
-    // image found nothing — or had the file it just wrote deleted underneath
-    // it — which surfaced as a poster that would not load.
+    // Write to a temporary name and rename into place. Clearing the directory
+    // first would let a concurrent request find nothing, or delete the file it
+    // just wrote, leaving a poster that won't load.
     const temp = `${filename}.${process.pid}.${Date.now()}.tmp`;
 
     await promises.writeFile(temp, buffer);
     await promises.rename(temp, filename);
 
-    // Drop any superseded entries now that the new one is safely in place.
+    // The new entry is in place; drop superseded ones.
     try {
       const files = await promises.readdir(dir);
 
@@ -952,13 +1083,12 @@ class ImageProxy {
           .filter((file) => file !== name)
           .map((file) =>
             promises.rm(join(dir, file), { force: true }).catch(() => {
-              // a concurrent writer may have removed it already
+              // A concurrent writer may have removed it already.
             })
           )
       );
     } catch {
-      // Listing failed; the current image is still readable, which is what
-      // matters.
+      // Listing failed; the current image is still readable.
     }
 
     ImageProxy.wrote(buffer.length);
@@ -987,10 +1117,10 @@ class ImageProxy {
   }
 }
 
-// Made on first use, once any outgoing proxy is configured.
+// Created on first use, after any outgoing proxy is configured.
 let tmdbProxy: ImageProxy | undefined;
 
-/** The one TMDB image cache, shared by the route and anything warming it. */
+/** The shared TMDB image cache, for the route and warming. */
 export const tmdbImageProxy = () =>
   (tmdbProxy ??= new ImageProxy('tmdb', 'https://image.tmdb.org', {
     rateLimitOptions: {
@@ -999,20 +1129,45 @@ export const tmdbImageProxy = () =>
     },
   }));
 
+const musicProxies: Partial<Record<MusicImageSource, ImageProxy>> = {};
+
 /**
- * Starts fetching posters into the image cache before the browser asks for
- * them, so they are there, or on their way, when it does. A browser asking
- * while one is still being fetched shares that fetch. Never waited on, and
- * a poster that fails is simply fetched again when asked for.
+ * Music image caches, one per source: covers from the Cover Art Archive,
+ * artist images from fanart.tv and TheAudioDB. Each kept as long as its
+ * host's URLs allow (see MUSIC_IMAGE_KEPT_S); a missing cover is remembered
+ * for hours, as many albums have none.
  */
-export const warmTmdbImages = (paths: string[]) => {
-  const proxy = tmdbImageProxy();
+export const musicImageProxy = (source: MusicImageSource) =>
+  (musicProxies[source] ??= new ImageProxy(
+    source,
+    MUSIC_IMAGE_ORIGINS[source],
+    {
+      rateLimitOptions: { maxRequests: 10, maxRPS: 20 },
+      keptForS: MUSIC_IMAGE_KEPT_S[source],
+      missingForMs: MUSIC_IMAGE_MISSING_MS,
+      redirectHosts: MUSIC_IMAGE_REDIRECT_HOSTS[source],
+    }
+  ));
+
+/** Every image cache by folder name, for cleanup. */
+export const IMAGE_CACHES = [
+  'tmdb',
+  'tvdb',
+  'avatar',
+  ...(Object.keys(MUSIC_IMAGE_ORIGINS) as MusicImageSource[]),
+] as const;
+
+/**
+ * Prefetches images into a cache before the browser asks; a browser request
+ * mid-fetch shares it. Never awaited; a failure is refetched on request.
+ */
+const warmImages = (proxy: ImageProxy, paths: string[]) => {
   for (const path of paths) {
     proxy
       .getImage(path)
       .then((original) =>
-        // The AVIF copy too, which current browsers ask for, while the
-        // converter has room: what a browser is waiting on comes first.
+        // Also the AVIF copy current browsers request, while the converter
+        // has room; actual requests come first.
         conversions.queued < WARM_CONVERSIONS_QUEUED_LIMIT
           ? proxy.getVariant(path, { format: 'avif' }, original, {
               convert: true,
@@ -1022,5 +1177,13 @@ export const warmTmdbImages = (paths: string[]) => {
       .catch(() => undefined);
   }
 };
+
+/** Prefetches a page of titles' posters into the TMDB cache. */
+export const warmTmdbImages = (paths: string[]) =>
+  warmImages(tmdbImageProxy(), paths);
+
+/** Prefetches a page of album covers into the cover cache. */
+export const warmCovers = (paths: string[]) =>
+  warmImages(musicImageProxy('caa'), paths);
 
 export default ImageProxy;

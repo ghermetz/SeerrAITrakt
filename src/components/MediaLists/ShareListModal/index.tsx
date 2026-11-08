@@ -1,5 +1,6 @@
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import Modal from '@app/components/Common/Modal';
+import useAi from '@app/hooks/useAi';
 import useDebouncedState from '@app/hooks/useDebouncedState';
 import defineMessages from '@app/utils/defineMessages';
 import { Transition } from '@headlessui/react';
@@ -10,17 +11,18 @@ import useSWR from 'swr';
 
 const messages = defineMessages('components.MediaLists.ShareListModal', {
   title: 'Share "{name}"',
-  description:
-    'Choose who can see this list. Only you and the people you pick will see it. You can change this later.',
+  description: 'Only you and the people you pick can see this list.',
   save: 'Share',
   skip: 'Keep Private',
   nousers: 'There are no other users to share with.',
+  picker:
+    'People who accept can include you in Pick for the Room, which reads your recent watching. Turn Pick for the Room off in your settings to be left out.',
   search: 'Search users',
   nomatch: 'No one matches "{query}".',
   searchformore: 'Not everyone is shown. Search to find someone else.',
 });
 
-/** People shown at once; anyone else is found by searching. */
+/** People shown at once; others are found by searching. */
 const PAGE_SIZE = 50;
 
 interface Person {
@@ -31,7 +33,7 @@ interface Person {
 interface ShareListModalProps {
   listId: number;
   listName: string;
-  /** Members already on the list, so the modal reflects current state. */
+  /** Current members. */
   initialMembers?: Person[];
   ownerId?: number;
   onComplete: () => void;
@@ -45,11 +47,11 @@ const ShareListModal = ({
   onComplete,
 }: ShareListModalProps) => {
   const intl = useIntl();
-  // Who is ticked, with their names, so someone chosen from one search
-  // stays shown (and ticked) after the search changes.
+  const { on } = useAi();
+  // Ticked people with names, so a pick stays shown after the search changes.
   const [selected, setSelected] = useState<Person[]>(initialMembers);
-  // Who was on the list when this opened, kept as it was even if the list
-  // page reloads behind the dialog, so a change since is noticed on save.
+  // Members at open, fixed even if the page reloads, so the save can detect
+  // changes since.
   const [startedFrom] = useState(() => initialMembers.map((p) => p.id));
   const [isSaving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -67,8 +69,7 @@ const ShareListModal = ({
 
   const isSelected = (id: number) => selected.some((p) => p.id === id);
 
-  // Those already chosen come first, then everyone else the page or search
-  // turned up.
+  // Chosen people first, then the rest of the page or search results.
   const candidates = [
     ...selected,
     ...(users?.results ?? []).filter(
@@ -84,8 +85,8 @@ const ShareListModal = ({
         : [...current, { id: person.id, displayName: person.displayName }]
     );
 
-  // "Keep private" still stores the watch-sync choice — it is a property of
-  // the list, not of who it is shared with.
+  // "Keep private" still saves the watch-sync choice: it belongs to the list,
+  // not its members.
   const saveWithoutMembers = async () => {
     setSaving(true);
     setError(null);
@@ -112,13 +113,12 @@ const ShareListModal = ({
     try {
       await axios.put(`/api/v1/list/${listId}`, {
         memberIds: selected.map((p) => p.id),
-        // Who was on the list when this opened. If someone has left since,
-        // the save is refused rather than quietly put them back.
+        // If someone left since opening, the server refuses the save rather
+        // than re-adding them.
         previousMemberIds: startedFrom,
       });
       onComplete();
     } catch (e) {
-      // Without this the dialog just reappeared with no explanation.
       setError(
         (axios.isAxiosError(e) && e.response?.data?.message) ||
           (e instanceof Error ? e.message : String(e))
@@ -130,7 +130,7 @@ const ShareListModal = ({
 
   return (
     // Modal renders a <Transition.Child>, which throws without a parent
-    // <Transition>. Every other modal in the app is wrapped the same way.
+    // <Transition>.
     <Transition
       as="div"
       enter="transition-opacity duration-300"
@@ -162,6 +162,11 @@ const ShareListModal = ({
         <p className="mb-3 text-sm text-gray-300">
           {intl.formatMessage(messages.description)}
         </p>
+        {on('aiPicker') && (
+          <p className="mb-3 text-sm text-gray-400">
+            {intl.formatMessage(messages.picker)}
+          </p>
+        )}
 
         <input
           aria-label={intl.formatMessage(messages.search)}

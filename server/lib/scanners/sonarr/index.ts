@@ -9,6 +9,7 @@ import type {
 import { MediaStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { detectAnime } from '@server/lib/animeDecision';
 import type {
   ProcessableSeason,
   RunnableScanner,
@@ -17,7 +18,6 @@ import type {
 import BaseScanner from '@server/lib/scanners/baseScanner';
 import type { SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
-import { isAnime } from '@server/utils/isAnime';
 import { uniqWith } from 'lodash';
 
 type SyncStatus = StatusBase & {
@@ -35,9 +35,20 @@ class SonarrScanner
   private sonarrApi: SonarrAPI;
   private scannedTvdbIds: Set<number> = new Set();
   private scanned4kTvdbIds: Set<number> = new Set();
-  // Keyed on tmdbId: media.tvdbId can be null. Excludes unmonitored titles.
-  private processingTmdbIds: Set<number> = new Set();
-  private processing4kTmdbIds: Set<number> = new Set();
+  // Keyed by TMDB id: after TheTVDB merges or renumbers a series, Sonarr's
+  // TVDB id differs from the one Seerr stored.
+  private scannedTmdbIds: Set<number> = new Set();
+  private scanned4kTmdbIds: Set<number> = new Set();
+  // Season numbers keyed on tmdbId, as media.tvdbId can be null. Excludes unmonitored seasons.
+  private processingTmdbIds: Map<number, Set<number>> = new Map();
+  private processing4kTmdbIds: Map<number, Set<number>> = new Map();
+  // Series Sonarr lists no seasons for, so it can't say they were abandoned.
+  private unlistedTmdbIds: Set<number> = new Set();
+  private unlisted4kTmdbIds: Set<number> = new Set();
+  // A lookup can fail before its tmdbId is known, so failures are matched via other servers' lookups.
+  private failedTvdbIds: Set<number> = new Set();
+  private failed4kTvdbIds: Set<number> = new Set();
+  private tmdbIdsByTvdbId: Map<number, number> = new Map();
   private didScanStandard = false;
   private didScan4k = false;
   private serverReturnedEmpty = false;
@@ -62,8 +73,15 @@ class SonarrScanner
     const sessionId = this.startRun();
     this.scannedTvdbIds.clear();
     this.scanned4kTvdbIds.clear();
+    this.scannedTmdbIds.clear();
+    this.scanned4kTmdbIds.clear();
     this.processingTmdbIds.clear();
     this.processing4kTmdbIds.clear();
+    this.unlistedTmdbIds.clear();
+    this.unlisted4kTmdbIds.clear();
+    this.failedTvdbIds.clear();
+    this.failed4kTvdbIds.clear();
+    this.tmdbIdsByTvdbId.clear();
     this.didScanStandard = false;
     this.didScan4k = false;
     this.serverReturnedEmpty = false;
@@ -118,10 +136,9 @@ class SonarrScanner
         }
       }
 
-      // Only run cleanup if all servers of this profile type have sync enabled.
-      // If any server is skipped, we can't distinguish truly orphaned media from
-      // media that exists on an unscanned server (e.g. separate instances for
-      // anime, regional content, or different languages).
+      // Clean up only if every server of this type syncs; otherwise orphaned
+      // media can't be told from media on an unscanned server (e.g. separate
+      // instances for anime, regional content or languages).
       const allStandardScanned = this.servers
         .filter((s) => !this.enable4kShow || !s.is4k)
         .every((s) => s.syncEnabled);
@@ -143,13 +160,24 @@ class SonarrScanner
         this.didScan4k = false;
       }
 
-      await this.resolveStatusResets((media, is4k) => {
+      await this.resolveStatusResets((media, is4k, seasonNumber) => {
         const scanComplete = is4k ? this.didScan4k : this.didScanStandard;
+        const failedToScan = [
+          ...(is4k ? this.failed4kTvdbIds : this.failedTvdbIds),
+        ].some((tvdbId) => this.tmdbIdsByTvdbId.get(tvdbId) === media.tmdbId);
         const processingIds = is4k
           ? this.processing4kTmdbIds
           : this.processingTmdbIds;
+        const unlisted = is4k ? this.unlisted4kTmdbIds : this.unlistedTmdbIds;
 
-        return scanComplete && !processingIds.has(media.tmdbId);
+        return (
+          scanComplete &&
+          !failedToScan &&
+          !unlisted.has(media.tmdbId) &&
+          (seasonNumber === undefined
+            ? !processingIds.has(media.tmdbId)
+            : !processingIds.get(media.tmdbId)?.has(seasonNumber))
+        );
       });
 
       await this.cleanupOrphanedShows();
@@ -187,7 +215,9 @@ class SonarrScanner
       }
 
       const tmdbId = tvShow.id;
-      const metadataProvider = isAnime(tvShow)
+      (server4k ? this.scanned4kTmdbIds : this.scannedTmdbIds).add(tmdbId);
+      this.tmdbIdsByTvdbId.set(sonarrSeries.tvdbId, tmdbId);
+      const metadataProvider = detectAnime(tvShow)
         ? await getMetadataProvider('anime')
         : await getMetadataProvider('tv');
 
@@ -197,9 +227,9 @@ class SonarrScanner
 
       const settings = getSettings();
 
-      // A series just added to Sonarr can have no seasons yet, until Sonarr
-      // hears of them from TheTVDB. Its seasons are on their way if the series
-      // is monitored; read as unmonitored, its request would be declined.
+      // A series just added to Sonarr may have no seasons until TheTVDB
+      // supplies them. If monitored, treat them as coming; reading them as
+      // unmonitored would decline its request.
       const seasonsNotListedYet =
         sonarrSeries.seasons.length === 0 && sonarrSeries.monitored;
 
@@ -239,16 +269,24 @@ class SonarrScanner
         });
       }
 
-      // With no seasons listed at all, Sonarr cannot say the series was given
-      // up on, so its request is never declined for it.
-      if (
-        processableSeasons.some((season) => season.processing) ||
-        sonarrSeries.seasons.length === 0
-      ) {
-        if (server4k) {
-          this.processing4kTmdbIds.add(tmdbId);
-        } else {
-          this.processingTmdbIds.add(tmdbId);
+      const processing = server4k
+        ? this.processing4kTmdbIds
+        : this.processingTmdbIds;
+
+      // With no seasons listed, Sonarr can't say the series was abandoned, so
+      // its request is never declined for that.
+      if (sonarrSeries.seasons.length === 0) {
+        (server4k ? this.unlisted4kTmdbIds : this.unlistedTmdbIds).add(tmdbId);
+      }
+
+      for (const season of processableSeasons) {
+        if (season.processing) {
+          processing.set(
+            tmdbId,
+            (processing.get(tmdbId) ?? new Set<number>()).add(
+              season.seasonNumber
+            )
+          );
         }
       }
 
@@ -260,6 +298,9 @@ class SonarrScanner
         is4k: server4k,
       });
     } catch (e) {
+      (server4k ? this.failed4kTvdbIds : this.failedTvdbIds).add(
+        sonarrSeries.tvdbId
+      );
       const message = String(e.message ?? '');
       const notInTmdb =
         message.includes('No show returned from API') ||
@@ -321,7 +362,11 @@ class SonarrScanner
       });
 
       for (const media of processingShows) {
-        if (media.tvdbId && !this.scannedTvdbIds.has(media.tvdbId)) {
+        if (
+          media.tvdbId &&
+          !this.scannedTvdbIds.has(media.tvdbId) &&
+          !this.scannedTmdbIds.has(media.tmdbId)
+        ) {
           if (await this.existsInAnyServer(media.tvdbId, false)) {
             continue;
           }
@@ -354,7 +399,11 @@ class SonarrScanner
       });
 
       for (const media of processing4kShows) {
-        if (media.tvdbId && !this.scanned4kTvdbIds.has(media.tvdbId)) {
+        if (
+          media.tvdbId &&
+          !this.scanned4kTvdbIds.has(media.tvdbId) &&
+          !this.scanned4kTmdbIds.has(media.tmdbId)
+        ) {
           if (await this.existsInAnyServer(media.tvdbId, true)) {
             continue;
           }

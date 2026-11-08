@@ -7,6 +7,7 @@ import type {
 import {
   CLIENT_TIMEOUT_MS,
   clientBaseUrl,
+  confirmListed,
   isTorrentHash,
 } from '@server/api/downloadclients/types';
 import type { DownloadClientSettings } from '@server/lib/settings';
@@ -15,21 +16,19 @@ import axios, { isAxiosError } from 'axios';
 import { parseStringPromise } from 'xml2js';
 
 /*
- * The part of rTorrent's XML-RPC Seerr reads: every torrent in its main
- * view, of which the ones Radarr and Sonarr sent are kept, by hash, which is
- * how they record a torrent as its download id. rTorrent is reached through
- * whatever web server exposes its XML-RPC (ruTorrent's, usually at "RPC2"),
- * with that server's basic auth when it has one.
+ * Reads every torrent in rTorrent's main view and keeps those Radarr and
+ * Sonarr sent, by hash (their download id). XML-RPC is reached through
+ * whatever web server exposes it (ruTorrent's, usually "RPC2"), with its
+ * basic auth if any.
  *
- * For Backfill it also adds, picks the files of, and removes torrents.
- * Backfill's category is the label ruTorrent shows (custom1). rTorrent's
- * RPC cannot delete a torrent's files; they are deleted through its
- * "execute" command, one known file at a time, as ruTorrent's own
- * "erase data" does. rTorrent cannot stop a magnet link once its file list
- * is in; Backfill watches it closely until it is.
+ * For Backfill it also adds torrents, picks their files and removes them.
+ * Backfill's category is ruTorrent's label (custom1). The RPC cannot delete
+ * files, so they are deleted via "execute", one known file at a time, as
+ * ruTorrent's "erase data" does. rTorrent cannot stop a magnet once its file
+ * list is in; Backfill polls it closely until then.
  */
 
-/** One torrent, in the order FIELDS asks for them. */
+/** One torrent, fields in FIELDS order. */
 export interface RtorrentTorrent {
   hash: string;
   /** 0 stopped, 1 started. */
@@ -44,6 +43,9 @@ export interface RtorrentTorrent {
   downRate: number;
   isHashChecking: number;
   peersConnected: number;
+  chunkSize: number;
+  /** Chunks of wanted files still to come (once opened). */
+  wantedChunks: number;
 }
 
 const FIELDS = [
@@ -57,13 +59,45 @@ const FIELDS = [
   'd.down.rate=',
   'd.is_hash_checking=',
   'd.peers_connected=',
+  'd.chunk_size=',
+  'd.wanted_chunks=',
 ];
 
+/**
+ * Wanted and remaining size of a torrent. rTorrent's sizes include skipped
+ * files and it calls a torrent complete only once every file is in, so a
+ * torrent with skipped files is measured by its wanted chunks still to come.
+ * Before first open every chunk counts as wanted, which is harmless: nothing
+ * is in yet.
+ */
+export const rtorrentWanted = (torrent: {
+  sizeBytes: number;
+  completedBytes: number;
+  complete: number;
+  isOpen: number;
+  chunkSize: number;
+  wantedChunks: number;
+}): { size: number; left: number; done: boolean } => {
+  const all = Math.max(0, Number(torrent.sizeBytes) || 0);
+  const have = Math.min(all, Math.max(0, Number(torrent.completedBytes) || 0));
+  const chunks = Number(torrent.wantedChunks);
+  const measured = Number.isFinite(chunks) && chunks >= 0 && !!torrent.isOpen;
+  const left = measured
+    ? Math.min(all - have, chunks * Math.max(0, Number(torrent.chunkSize) || 0))
+    : all - have;
+  const done = !!torrent.complete || (all > 0 && measured && chunks === 0);
+  return { size: done ? have : have + left, left: done ? 0 : left, done };
+};
+
 export const rtorrentDownload = (torrent: RtorrentTorrent): LiveDownload => {
-  const size = Math.max(0, Number(torrent.sizeBytes) || 0);
-  const sizeLeft = Math.max(0, Number(torrent.leftBytes) || 0);
-  const base = { size, sizeLeft };
-  const done = !!torrent.complete || (size > 0 && sizeLeft === 0);
+  const all = Math.max(0, Number(torrent.sizeBytes) || 0);
+  const wanted = rtorrentWanted({
+    ...torrent,
+    completedBytes: all - Math.max(0, Number(torrent.leftBytes) || 0),
+  });
+  const sizeLeft = wanted.left;
+  const base = { size: wanted.size, sizeLeft };
+  const done = wanted.done || (all > 0 && sizeLeft === 0);
 
   if (torrent.isHashChecking) {
     return done
@@ -130,7 +164,7 @@ const toValue = (param: XmlParam): string => {
     .join('')}</struct>`;
 };
 
-/** An XML-RPC call. */
+/** Builds an XML-RPC call body. */
 export const xmlRpcCall = (method: string, params: XmlParam[]): string =>
   `<?xml version="1.0"?><methodCall><methodName>${escape(method)}</methodName><params>${params
     .map((p) => `<param><value>${toValue(p)}</value></param>`)
@@ -138,7 +172,7 @@ export const xmlRpcCall = (method: string, params: XmlParam[]): string =>
 
 type Node = Record<string, unknown[]> | string;
 
-/** One parsed <value>, as xml2js gives it (every child in an array). */
+/** Decodes one <value> as xml2js parses it (every child in an array). */
 const fromValue = (value: Node): XmlValue => {
   if (typeof value === 'string') return value; // untyped means string
   const [type, inner] = Object.entries(value).find(([key]) => key !== '$') ?? [
@@ -174,7 +208,7 @@ const fromValue = (value: Node): XmlValue => {
   }
 };
 
-/** The result of an XML-RPC answer, or the fault it reports. */
+/** An XML-RPC response's result; throws its fault. */
 export const xmlRpcResult = async (xml: string): Promise<XmlValue> => {
   const doc = await parseStringPromise(xml);
   const response = doc?.methodResponse;
@@ -193,7 +227,7 @@ export const xmlRpcResult = async (xml: string): Promise<XmlValue> => {
   return fromValue(response.params?.[0]?.param?.[0]?.value?.[0] ?? '');
 };
 
-/** What Backfill reads of each torrent, in the order the values come. */
+/** Fields Backfill reads per torrent, in response order. */
 const INFO_FIELDS = [
   'd.hash=',
   'd.name=',
@@ -210,6 +244,8 @@ const INFO_FIELDS = [
   'd.is_multi_file=',
   'd.custom1=',
   'd.custom=seerr_added',
+  'd.chunk_size=',
+  'd.wanted_chunks=',
 ];
 
 export interface RtorrentInfo {
@@ -224,12 +260,16 @@ export interface RtorrentInfo {
   downRate: number;
   isHashChecking: number;
   message: string;
-  /** A multi-file torrent's own folder; a single file's parent folder. */
+  /** A multi-file torrent's own folder; a single file's parent. */
   directory: string;
   isMultiFile: number;
+  /** As stored: ruTorrent URL-encodes it. */
   label: string;
-  /** When Seerr added it, in seconds; empty for another's. */
+  /** When Seerr added it, in seconds; empty if Seerr didn't. */
   addedBySeerr: string;
+  chunkSize: number;
+  /** Chunks of wanted files still to come (once opened). */
+  wantedChunks: number;
 }
 
 const infoOf = (row: XmlValue[]): RtorrentInfo => {
@@ -249,6 +289,8 @@ const infoOf = (row: XmlValue[]): RtorrentInfo => {
     isMultiFile,
     label,
     addedBySeerr,
+    chunkSize,
+    wantedChunks,
   ] = row;
   return {
     hash: String(hash ?? ''),
@@ -264,30 +306,82 @@ const infoOf = (row: XmlValue[]): RtorrentInfo => {
     message: String(message ?? ''),
     directory: String(directory ?? ''),
     isMultiFile: Number(isMultiFile),
-    label: decodeLabel(String(label ?? '')),
+    label: String(label ?? ''),
     addedBySeerr: String(addedBySeerr ?? ''),
+    chunkSize: Number(chunkSize),
+    wantedChunks: Number(wantedChunks),
   };
 };
 
-/** ruTorrent keeps labels URL-encoded. */
-const decodeLabel = (label: string) => {
-  try {
-    return decodeURIComponent(label);
-  } catch {
-    return label;
-  }
-};
-
-/** A magnet link's stand-in until its file list is in: "<HASH>.meta". */
+/** A magnet's placeholder name until its file list is in: "<HASH>.meta". */
 const isMeta = (name: string) => /^[0-9a-f]{40}\.meta$/i.test(name);
+
+/** One slash between parts, none at the end. */
+const tidyPath = (path: string) =>
+  path.replace(/\/{2,}/g, '/').replace(/(?<=.)\/$/, '');
 
 const parentOf = (path: string) => path.replace(/\/+[^/]*\/*$/, '') || '/';
 const lastPart = (path: string) =>
   path.replace(/\/+$/, '').split('/').pop() ?? '';
 
+/**
+ * Paths to delete for a torrent's data: each file, then a multi-file
+ * torrent's folders, deepest first. A name that escapes the torrent's folder
+ * (a ".." part or an absolute path) is refused, as is every name when
+ * rTorrent gives no folder.
+ */
+export const rtorrentRemovals = (
+  info: Pick<RtorrentInfo, 'directory' | 'isMultiFile'>,
+  names: string[]
+): { files: string[]; folders: string[]; refused: string[] } => {
+  const base = info.isMultiFile ? parentOf(info.directory) : info.directory;
+  const inside = (name: string) =>
+    base.length > 1 && !name.startsWith('/') && !name.split('/').includes('..');
+  const files = names.filter(inside).map((name) => `${base}/${name}`);
+  const folders = new Set<string>();
+  if (info.isMultiFile) {
+    for (const file of files) {
+      let dir = parentOf(file);
+      while (dir.length > base.length) {
+        folders.add(dir);
+        dir = parentOf(dir);
+      }
+    }
+  }
+  return {
+    files,
+    folders: [...folders].sort((a, b) => b.length - a.length),
+    refused: names.filter((name) => !inside(name)),
+  };
+};
+
+/**
+ * Where each torrent's data is: a multi-file torrent's folder, a single
+ * file's path. Magnets still fetching their file list have none yet.
+ */
+const rtorrentDataRoots = (
+  torrents: Pick<RtorrentInfo, 'name' | 'directory' | 'isMultiFile'>[]
+): string[] =>
+  torrents
+    .filter((t) => !isMeta(t.name) && t.directory)
+    .map((t) =>
+      tidyPath(t.isMultiFile ? t.directory : `${t.directory}/${t.name}`)
+    )
+    .filter((root) => root.length > 1);
+
+/** True when a path is, holds or is inside one of these data roots. */
+const inDataOf = (roots: string[], path: string): boolean => {
+  const tidy = tidyPath(path);
+  return roots.some(
+    (root) =>
+      tidy === root ||
+      tidy.startsWith(`${root}/`) ||
+      root.startsWith(`${tidy}/`)
+  );
+};
+
 export const rtorrentTorrent = (info: RtorrentInfo): ClientTorrent => {
-  const size = Math.max(0, info.sizeBytes || 0);
-  const left = Math.max(0, size - (info.completedBytes || 0));
+  const { size, left, done } = rtorrentWanted(info);
   const speed = Math.max(0, info.downRate || 0);
   const added = Number(info.addedBySeerr);
   const base = {
@@ -296,15 +390,14 @@ export const rtorrentTorrent = (info: RtorrentInfo): ClientTorrent => {
     progress: size ? (size - left) / size : 0,
     speed,
     secondsLeft: speed > 0 && left > 0 ? Math.round(left / speed) : undefined,
-    // Files are named with a multi-file torrent's folder in front, so they
-    // sit under the folder that holds it.
+    // Multi-file names start with the torrent's folder, so use its parent.
     savePath: info.isMultiFile ? parentOf(info.directory) : info.directory,
     addedAt: added > 0 ? added * 1000 : undefined,
   };
   if (isMeta(info.name)) return { ...base, state: 'metadata' };
   if (info.isHashChecking) return { ...base, state: 'checking' };
-  if (info.complete) return { ...base, state: 'done' };
-  // rTorrent closes a torrent it hits an error with, and says why.
+  if (done) return { ...base, state: 'done' };
+  // rTorrent closes a torrent on error and sets its message.
   if (!info.state && info.message && !/tracker/i.test(info.message)) {
     return { ...base, state: 'error', error: info.message };
   }
@@ -354,7 +447,7 @@ class RtorrentAPI implements TorrentClient {
     }
   }
 
-  /** Several calls in one; throws on the first that fails. */
+  /** Batches calls; throws on the first that fails. */
   private async multicall(
     calls: { method: string; params: XmlParam[] }[]
   ): Promise<XmlValue[]> {
@@ -385,6 +478,7 @@ class RtorrentAPI implements TorrentClient {
   public async addTorrent(options: {
     torrent?: Buffer;
     magnet?: string;
+    hash: string;
     category: string;
     metadataOnly?: boolean;
   }): Promise<void> {
@@ -401,9 +495,10 @@ class RtorrentAPI implements TorrentClient {
     } else {
       throw new Error('A torrent file or magnet link is needed.');
     }
+    await confirmListed(this, options.hash);
   }
 
-  /** A label needs no setting up. */
+  /** Labels need no setup. */
   public async ensureCategory(): Promise<void> {
     return;
   }
@@ -414,8 +509,10 @@ class RtorrentAPI implements TorrentClient {
   }
 
   public async listCategory(category: string): Promise<ClientTorrent[]> {
+    // ruTorrent keeps labels URL-encoded; compared as stored.
+    const label = encodeURIComponent(category);
     return (await this.torrents())
-      .filter((t) => t.label === category)
+      .filter((t) => t.label === label)
       .map(rtorrentTorrent);
   }
 
@@ -474,40 +571,35 @@ class RtorrentAPI implements TorrentClient {
   }
 
   /**
-   * Removes the torrent, then deletes its files one by one, and the folders
-   * of a multi-file torrent that are left empty: never anything else.
+   * Removes the torrent, then deletes its files one by one and a multi-file
+   * torrent's emptied folders; never anything else, nor anything another
+   * torrent's data is in (a cross-seed of the same files).
    */
   public async deleteTorrent(hash: string): Promise<void> {
-    const info = await this.info(hash);
+    const all = await this.torrents();
+    const info = all.find((t) => t.hash.toLowerCase() === hash.toLowerCase());
     if (!info) return;
     const files = isMeta(info.name) ? [] : await this.getFiles(info.hash);
+    const othersData = rtorrentDataRoots(all.filter((t) => t !== info));
+    const shared = (path: string) => inDataOf(othersData, path);
     await this.call('d.erase', [info.hash]);
-    const base = info.isMultiFile ? parentOf(info.directory) : info.directory;
-    const failed: string[] = [];
-    for (const file of files) {
-      await this.call('execute.throw', [
-        '',
-        'rm',
-        '-f',
-        '--',
-        `${base}/${file.name}`,
-      ]).catch((e) => failed.push((e as Error).message));
+    const removals = rtorrentRemovals(
+      info,
+      files.map((file) => file.name)
+    );
+    const failed = removals.refused.map(
+      (name) => `${name} is not inside the torrent's folder`
+    );
+    for (const path of removals.files.filter((p) => !shared(p))) {
+      await this.call('execute.throw', ['', 'rm', '-f', '--', path]).catch(
+        (e) => failed.push((e as Error).message)
+      );
     }
-    if (info.isMultiFile) {
-      const folders = new Set<string>();
-      for (const file of files) {
-        let dir = parentOf(`${base}/${file.name}`);
-        while (dir.length > base.length) {
-          folders.add(dir);
-          dir = parentOf(dir);
-        }
-      }
-      // Deepest first; rmdir leaves a folder alone unless it is empty.
-      for (const dir of [...folders].sort((a, b) => b.length - a.length)) {
-        await this.call('execute.throw', ['', 'rmdir', '--', dir]).catch(
-          () => undefined
-        );
-      }
+    // rmdir only removes empty folders.
+    for (const dir of removals.folders.filter((d) => !shared(d))) {
+      await this.call('execute.throw', ['', 'rmdir', '--', dir]).catch(
+        () => undefined
+      );
     }
     if (failed.length) {
       throw new Error(
@@ -539,7 +631,7 @@ class RtorrentAPI implements TorrentClient {
     if (!mine.size) {
       return found;
     }
-    // rTorrent has no "these hashes only": the whole view is read, once.
+    // rTorrent can't filter by hash, so read the whole view once.
     const rows = await this.call('d.multicall2', ['', 'main', ...FIELDS]);
     for (const row of Array.isArray(rows) ? rows : []) {
       if (!Array.isArray(row)) continue;
@@ -556,6 +648,8 @@ class RtorrentAPI implements TorrentClient {
         downRate,
         isHashChecking,
         peersConnected,
+        chunkSize,
+        wantedChunks,
       ] = rest.map(Number);
       found.set(
         id,
@@ -570,6 +664,8 @@ class RtorrentAPI implements TorrentClient {
           downRate,
           isHashChecking,
           peersConnected,
+          chunkSize,
+          wantedChunks,
         })
       );
     }

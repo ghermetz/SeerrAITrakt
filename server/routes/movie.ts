@@ -6,6 +6,7 @@ import { MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { Watchlist } from '@server/entity/Watchlist';
+import { limitToLibraries } from '@server/lib/libraryVisibility';
 import mediaForViewer from '@server/lib/mediaForViewer';
 import logger from '@server/logger';
 import { mapMovieDetails } from '@server/models/Movie';
@@ -24,6 +25,7 @@ movieRoutes.get('/:id', async (req, res, next) => {
     });
 
     const media = await Media.getMedia(tmdbMovie.id, MediaType.MOVIE);
+    await limitToLibraries([media], req.user);
 
     const onUserWatchlist = await getRepository(Watchlist).exist({
       where: {
@@ -41,7 +43,8 @@ movieRoutes.get('/:id', async (req, res, next) => {
       onUserWatchlist
     );
 
-    // TMDB issue where it doesnt fallback to English when no overview is available in requested locale.
+    // TMDB doesn't fall back to English when the requested locale has no
+    // overview.
     if (!data.overview) {
       const tvEnglish = await tmdb.getMovie({ movieId: Number(req.params.id) });
       data.overview = tvEnglish.overview;
@@ -153,9 +156,7 @@ movieRoutes.get('/:id/similar', async (req, res, next) => {
   }
 });
 
-/**
- * Endpoint backed by RottenTomatoes
- */
+/** Rotten Tomatoes ratings. */
 movieRoutes.get('/:id/ratings', async (req, res, next) => {
   const tmdb = new TheMovieDb();
   const rtapi = new RottenTomatoes();
@@ -192,8 +193,8 @@ movieRoutes.get('/:id/ratings', async (req, res, next) => {
 });
 
 /**
- * Rotten Tomatoes and IMDb together. Either source can be down or not know
- * the film; the other is still returned.
+ * Rotten Tomatoes and IMDb together. If either source is down or lacks the
+ * film, the other is still returned.
  */
 movieRoutes.get('/:id/ratingscombined', async (req, res, next) => {
   const tmdb = new TheMovieDb();

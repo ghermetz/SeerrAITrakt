@@ -12,7 +12,7 @@ import type { SeriesType } from '@server/constants/seriesType';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import type { AnimeDecidedBy } from '@server/lib/animeDecision';
-import { decideAnime } from '@server/lib/animeDecision';
+import { decideAnime, requestSeriesType } from '@server/lib/animeDecision';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
@@ -21,15 +21,10 @@ import path from 'node:path';
 import { In } from 'typeorm';
 
 /*
- * Anime Check: which series in Sonarr sit in the wrong root folder or have
- * the wrong series type, and which movies in Radarr sit in the wrong root
- * folder or on the wrong quality profile, for what Seerr says they are.
- * Report only: nothing in Sonarr or Radarr is changed, moved or retyped.
- *
- * What a title should be is Seerr's own decision, the same as when it is
- * requested (lib/animeDecision): anime or not on its request (ticked by its
- * requester, or set by an override rule), then the title's own setting, set
- * on its page, then anime detection (utils/isAnime).
+ * Anime Check: reports Sonarr series with the wrong root folder or series
+ * type, and Radarr movies with the wrong root folder or quality profile,
+ * against Seerr's anime decision (lib/animeDecision). Report only: changes
+ * nothing in Sonarr or Radarr.
  */
 
 export interface AnimeCheckProblem {
@@ -57,7 +52,7 @@ export interface AnimeCheckServer {
   /** Folders are only checked once an anime folder of its own is set. */
   foldersChecked: boolean;
   seriesChecked: number;
-  /** Series TMDB has no match for, so nothing can be said about them. */
+  /** Series with no TMDB match. */
   unmatched: number;
   problems: AnimeCheckProblem[];
   error?: string;
@@ -91,7 +86,7 @@ export interface AnimeCheckMovieServer {
   /** Profiles likewise, once an anime profile of its own is set. */
   profilesChecked: boolean;
   moviesChecked: number;
-  /** Movies TMDB has no match for, so nothing can be said about them. */
+  /** Movies with no TMDB match. */
   unmatched: number;
   problems: AnimeCheckMovieProblem[];
   error?: string;
@@ -102,7 +97,7 @@ export interface AnimeCheckReport {
   running: boolean;
   /** Sonarr servers. */
   servers: AnimeCheckServer[];
-  /** Radarr servers; missing from reports kept before movies were checked. */
+  /** Radarr servers; absent from older saved reports. */
   movieServers?: AnimeCheckMovieServer[];
 }
 
@@ -110,7 +105,7 @@ const REPORT_PATH = process.env.CONFIG_DIRECTORY
   ? `${process.env.CONFIG_DIRECTORY}/anime-check.json`
   : path.join(__dirname, '../../config/anime-check.json');
 
-/** TMDB lookups at once. */
+/** Concurrent TMDB lookups. */
 const CONCURRENCY = 4;
 
 const folderOf = (value: string) =>
@@ -123,47 +118,63 @@ export const inFolder = (seriesPath: string, root: string) => {
   return series === folder || series.startsWith(`${folder}/`);
 };
 
-/** What is wrong with one series, if anything. */
-export const judgeSeries = (
-  series: Pick<SonarrSeries, 'path' | 'seriesType'>,
-  anime: boolean,
-  server: Pick<SonarrSettings, 'activeDirectory' | 'activeAnimeDirectory'>
-) => {
-  const animeFolder = server.activeAnimeDirectory;
-  const foldersChecked =
-    !!animeFolder && folderOf(animeFolder) !== folderOf(server.activeDirectory);
-  const wrongType = anime
-    ? series.seriesType !== 'anime'
-    : series.seriesType === 'anime';
+type Folders = Pick<SonarrSettings, 'activeDirectory' | 'activeAnimeDirectory'>;
+type Profiles = Pick<
+  RadarrSettings | SonarrSettings,
+  'activeProfileId' | 'activeAnimeProfileId'
+>;
+
+/** Whether a server keeps anime in a folder of its own. */
+export const hasAnimeFolder = (server: Folders) =>
+  !!server.activeAnimeDirectory &&
+  folderOf(server.activeAnimeDirectory) !== folderOf(server.activeDirectory);
+
+/** Whether a server adds anime with a quality profile of its own. */
+export const hasAnimeProfile = (server: Profiles) =>
+  !!server.activeAnimeProfileId &&
+  server.activeAnimeProfileId !== server.activeProfileId;
+
+/**
+ * Whether a title is in the wrong root folder, and the one it belongs in.
+ * Only when the server has its own anime folder.
+ */
+const folderVerdict = (path: string, anime: boolean, server: Folders) => {
   const wrongFolder =
-    foldersChecked && anime !== inFolder(series.path, animeFolder as string);
+    hasAnimeFolder(server) &&
+    anime !== inFolder(path, server.activeAnimeDirectory as string);
   return {
-    wrongType,
     wrongFolder,
     expectedFolder: wrongFolder
       ? anime
-        ? (animeFolder as string)
+        ? (server.activeAnimeDirectory as string)
         : server.activeDirectory
       : null,
   };
 };
 
-/** Whether a server keeps anime in a folder of its own. */
-export const hasAnimeFolder = (
-  server: Pick<SonarrSettings, 'activeDirectory' | 'activeAnimeDirectory'>
+/**
+ * Whether a title is on the wrong profile: anime belongs on the anime profile,
+ * the rest on any other.
+ */
+export const onWrongProfile = (
+  qualityProfileId: number,
+  anime: boolean,
+  server: Profiles
 ) =>
-  !!server.activeAnimeDirectory &&
-  folderOf(server.activeAnimeDirectory) !== folderOf(server.activeDirectory);
+  hasAnimeProfile(server) &&
+  anime !== (qualityProfileId === server.activeAnimeProfileId);
 
-/** Whether a server adds anime with a quality profile of its own. */
-export const hasAnimeProfile = (
-  server: Pick<
-    RadarrSettings | SonarrSettings,
-    'activeProfileId' | 'activeAnimeProfileId'
-  >
-) =>
-  !!server.activeAnimeProfileId &&
-  server.activeAnimeProfileId !== server.activeProfileId;
+/** What is wrong with one series, if anything. */
+export const judgeSeries = (
+  series: Pick<SonarrSeries, 'path' | 'seriesType'>,
+  anime: boolean,
+  server: Folders
+) => {
+  const wrongType = anime
+    ? series.seriesType !== 'anime'
+    : series.seriesType === 'anime';
+  return { wrongType, ...folderVerdict(series.path, anime, server) };
+};
 
 /** What is wrong with one movie, if anything. */
 export const judgeMovie = (
@@ -179,20 +190,9 @@ export const judgeMovie = (
     | 'activeAnimeProfileName'
   >
 ) => {
-  const wrongFolder =
-    hasAnimeFolder(server) &&
-    anime !== inFolder(movie.path, server.activeAnimeDirectory as string);
-  // Other movies may sit on any profile but the anime one.
-  const wrongProfile =
-    hasAnimeProfile(server) &&
-    anime !== (movie.qualityProfileId === server.activeAnimeProfileId);
+  const wrongProfile = onWrongProfile(movie.qualityProfileId, anime, server);
   return {
-    wrongFolder,
-    expectedFolder: wrongFolder
-      ? anime
-        ? (server.activeAnimeDirectory as string)
-        : server.activeDirectory
-      : null,
+    ...folderVerdict(movie.path, anime, server),
     wrongProfile,
     expectedProfile: wrongProfile
       ? anime
@@ -203,8 +203,8 @@ export const judgeMovie = (
 };
 
 /**
- * What Seerr was told about each title: its own anime setting, and the
- * series type chosen on its newest request that has one.
+ * Each title's own anime setting and newest request series type, where either
+ * is set.
  */
 const choices = async (
   tmdbIds: number[],
@@ -223,10 +223,7 @@ const choices = async (
     relations: { requests: true },
   });
   for (const item of media) {
-    const seriesType =
-      (item.requests ?? [])
-        .filter((r) => r.is4k === is4k && r.seriesType)
-        .sort((a, b) => b.id - a.id)[0]?.seriesType ?? null;
+    const seriesType = requestSeriesType(item.requests ?? [], is4k);
     const animeSetting = item.animeSetting ?? null;
     if (seriesType || animeSetting !== null) {
       chosen.set(item.tmdbId, { animeSetting, seriesType });
@@ -248,7 +245,7 @@ class AnimeCheck {
     this.cancelled = true;
   }
 
-  /** The last report, from memory or from the file it was kept in. */
+  /** The last report, from memory or its file. */
   public async lastReport(): Promise<AnimeCheckReport> {
     if (!this.report) {
       try {
@@ -264,15 +261,12 @@ class AnimeCheck {
     server: SonarrSettings,
     tmdb: TheMovieDb
   ): Promise<AnimeCheckServer> {
-    const animeFolder = server.activeAnimeDirectory ?? null;
     const result: AnimeCheckServer = {
       id: server.id,
       name: server.name,
       is4k: server.is4k,
-      animeFolder,
-      foldersChecked:
-        !!animeFolder &&
-        folderOf(animeFolder) !== folderOf(server.activeDirectory),
+      animeFolder: server.activeAnimeDirectory ?? null,
+      foldersChecked: hasAnimeFolder(server),
       seriesChecked: 0,
       unmatched: 0,
       problems: [],
@@ -348,7 +342,7 @@ class AnimeCheck {
       unmatched: 0,
       problems: [],
     };
-    // With nothing of its own for anime, there is nothing to get wrong.
+    // No separate anime folder or profile: nothing to check.
     if (!result.foldersChecked && !result.profilesChecked) {
       return result;
     }

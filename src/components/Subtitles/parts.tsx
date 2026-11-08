@@ -1,9 +1,9 @@
 import useSettings from '@app/hooks/useSettings';
 import type { SubtitlesKind } from '@app/hooks/useSubtitles';
 import defineMessages from '@app/utils/defineMessages';
+import { SERVER_NAMES } from '@app/utils/mediaServerAccounts';
 import { formatOf, formatSize, providerName } from '@app/utils/subtitles';
 import { ArrowPathIcon, TrashIcon } from '@heroicons/react/24/outline';
-import { MediaServerType } from '@server/constants/server';
 import type {
   SubtitleError,
   SubtitleTrack,
@@ -14,8 +14,8 @@ import type { IntlShape } from 'react-intl';
 import { useIntl } from 'react-intl';
 
 /*
- * The pieces the Subtitles card and an episode's subtitle panel share, so a
- * movie, a series and one episode look and read the same.
+ * Shared by the Subtitles card and the episode panel, so movies, series and
+ * episodes look the same.
  */
 
 export const messages = defineMessages('components.Subtitles', {
@@ -50,29 +50,30 @@ export const messages = defineMessages('components.Subtitles', {
     'Bazarr paused WhisperAI after an error ({error}), and tries again {retry}. Whisper may be busy with another job.',
   reasonNoWhisper: 'Bazarr offered no Whisper transcription for it.',
   reasonBazarrFailed: 'Bazarr did not answer.',
+  reasonBazarrStuck: 'Bazarr hadn’t finished it after a day.',
+  reasonNoSubtitleSaved: 'Bazarr finished without saving a subtitle.',
   reasonNotInPlex: 'This is not in Plex.',
   reasonPlexFailed: 'Plex did not answer.',
   reasonNotOffered: 'Plex did not offer that.',
   reasonNoPlexSignIn: 'There is no Plex sign-in to use for you.',
 });
 
-/** The media server's name, for wording that is not Plex's alone. */
+/**
+ * The connected media servers' names ("Plex", "Plex and Jellyfin"): each
+ * picks up a subtitle file beside the title.
+ */
 export const useMediaServerName = (): string => {
+  const intl = useIntl();
   const { currentSettings } = useSettings();
-  switch (currentSettings.mediaServerType) {
-    case MediaServerType.EMBY:
-      return 'Emby';
-    case MediaServerType.PLEX:
-      return 'Plex';
-    default:
-      return 'Jellyfin';
-  }
+  return intl.formatList(
+    currentSettings.mediaServers.map((server) => SERVER_NAMES[server.kind]),
+    { type: 'conjunction' }
+  );
 };
 
 /**
- * Why something to do with a title's subtitles did not work, in the
- * viewer's language. The server answers with a code for that; anything
- * without one (no answer at all) reads as Bazarr not answering.
+ * Localized reasons for subtitle failures, from the server's error code; no
+ * code (no answer) reads as Bazarr not answering.
  */
 export const useSubtitleReasons = (kind: SubtitlesKind) => {
   const intl = useIntl();
@@ -111,13 +112,17 @@ export const useSubtitleReasons = (kind: SubtitlesKind) => {
         return intl.formatMessage(messages.reasonNotOffered);
       case 'noPlexSignIn':
         return intl.formatMessage(messages.reasonNoPlexSignIn);
+      case 'bazarrStuck':
+        return intl.formatMessage(messages.reasonBazarrStuck);
+      case 'noSubtitleSaved':
+        return intl.formatMessage(messages.reasonNoSubtitleSaved);
       default:
         return intl.formatMessage(messages.reasonBazarrFailed);
     }
   };
   return {
     describe,
-    /** The reason in a failed request's answer. */
+    /** The reason from a failed request's response. */
     reasonOf: (e: unknown) =>
       describe(
         isAxiosError(e)
@@ -138,9 +143,9 @@ export const Tag = ({
   <span
     className={
       tone === 'ai'
-        ? 'rounded border border-indigo-500 px-1 text-[10px] font-bold leading-4 tracking-wide text-indigo-200'
+        ? 'rounded border border-indigo-500 px-1 text-[10px] font-bold leading-4 tracking-wide text-indigo-200 light:text-accent-text'
         : tone === 'missing'
-          ? 'rounded border border-yellow-600 px-1 text-[10px] font-bold leading-4 tracking-wide text-yellow-200'
+          ? 'rounded border border-yellow-600 px-1 text-[10px] font-bold leading-4 tracking-wide text-yellow-200 light:text-warning-text'
           : 'rounded border border-gray-500 px-1 text-[10px] font-bold leading-4 tracking-wide text-gray-200'
     }
   >
@@ -158,7 +163,7 @@ export const Pill = ({
   <span
     className={
       tone === 'default'
-        ? 'rounded-full bg-indigo-600 px-2 text-[11px] font-semibold leading-4 text-indigo-50'
+        ? 'rounded-full bg-accent px-2 text-[11px] font-semibold leading-4 text-indigo-50'
         : 'rounded-full bg-gray-700 px-2 text-[11px] font-semibold leading-4 text-gray-300'
     }
   >
@@ -166,7 +171,7 @@ export const Pill = ({
   </span>
 );
 
-/** "ON DISK", "MISSING": what the rows under it are. */
+/** A heading for the rows below: "ON DISK", "MISSING". */
 export const GroupLabel = ({ children }: { children: ReactNode }) => (
   <div className="px-4 pb-0.5 pt-2.5 text-[11px] font-bold uppercase tracking-wider text-gray-400">
     {children}
@@ -190,9 +195,8 @@ export const TrackTags = ({ track }: { track: SubtitleTrack }) => {
 };
 
 /**
- * Where a subtitle file came from, as Bazarr recorded it: transcribed by
- * Whisper, downloaded from a provider, uploaded, translated; or, with no
- * record, simply the file beside the video.
+ * A subtitle's origin from Bazarr's history (Whisper, a provider, upload,
+ * translation); with no record, the file beside the video.
  */
 export const originOf = (
   intl: IntlShape,
@@ -235,12 +239,11 @@ export const iconButtonClass =
   'inline-flex h-10 w-10 flex-none items-center justify-center rounded-md border border-gray-600 bg-gray-700 text-gray-200 transition hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50';
 
 export const deleteButtonClass =
-  'inline-flex h-10 w-10 flex-none items-center justify-center rounded-md border border-gray-600 bg-gray-700 text-red-300 transition hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50';
+  'inline-flex h-10 w-10 flex-none items-center justify-center rounded-md border border-gray-600 bg-gray-700 text-red-300 light:text-danger-text transition hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50';
 
 /**
- * One subtitle on disk, with Replace and Delete when allowed. A track
- * inside the video has no Delete: replacing it adds a file that plays
- * instead.
+ * One subtitle, with Replace and Delete when allowed. Embedded tracks have
+ * no Delete: replacing adds a file that plays instead.
  */
 export const TrackRow = ({
   track,
@@ -266,7 +269,7 @@ export const TrackRow = ({
     <li className="flex items-center gap-2.5 border-b border-gray-700 px-4 py-2.5">
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="font-semibold text-white">{track.name}</span>
+          <span className="font-semibold text-strong">{track.name}</span>
           <TrackTags track={track} />
           {isDefault && (
             <Pill tone="default">

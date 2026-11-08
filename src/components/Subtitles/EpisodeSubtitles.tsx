@@ -35,10 +35,9 @@ import { useState } from 'react';
 import { useIntl } from 'react-intl';
 
 /*
- * Subtitles in a series' season list: a count on each season, a tag on
- * each episode, and the episode's own panel under it when the tag is
- * tapped. All of them read the one copy of the series' subtitles the
- * Subtitles card loads.
+ * Subtitles in a series' season list: a count per season, a tag per episode,
+ * and an episode panel when the tag is tapped. All read the series' subtitles
+ * the Subtitles card loads.
  */
 
 const messages = defineMessages('components.Subtitles.EpisodeSubtitles', {
@@ -60,7 +59,7 @@ const messages = defineMessages('components.Subtitles.EpisodeSubtitles', {
   searchingMissing:
     'Bazarr is searching for the missing subtitles. They show here as they arrive.',
   searchingThenTranscribe:
-    'Bazarr is searching for the missing subtitles. They show here as they arrive, and whatever no provider has is then transcribed from the audio.',
+    'Bazarr is searching for the missing subtitles; any it can’t find are then transcribed.',
   transcribeStarted:
     'Transcribing. It shows here when Whisper is done, which can take a while.',
   couldNot: 'That did not work: {reason}',
@@ -110,12 +109,12 @@ export const SeasonSubtitleBadge = ({
   );
 };
 
-/** One tag per language, saying what kind of subtitle it has, or MISSING. */
+/** One tag per language: its best subtitle kind, or MISSING. */
 const tagsOf = (episode: EpisodeSubtitles) => {
   const byLanguage = new Map<string, SubtitleTrack>();
   for (const track of episode.tracks) {
     const kept = byLanguage.get(track.language);
-    // A file over a track in the video; a real subtitle over a transcript.
+    // Prefer a file to an embedded track, and a real subtitle to a transcript.
     const better =
       !kept ||
       (kept.kind === 'embedded' && track.kind === 'file') ||
@@ -169,8 +168,8 @@ export const EpisodeSubtitleTag = ({
       })}
       className={
         open
-          ? 'inline-flex min-h-[28px] items-center gap-1.5 self-start rounded-md border border-indigo-500 bg-gray-800 px-2 text-xs font-semibold text-white ring-2 ring-indigo-500 xl:self-auto'
-          : 'inline-flex min-h-[28px] items-center gap-1.5 self-start rounded-md border border-gray-600 bg-gray-800 px-2 text-xs font-semibold text-white hover:border-gray-400 xl:self-auto'
+          ? 'inline-flex min-h-[28px] items-center gap-1.5 self-start rounded-md border border-indigo-500 bg-surface px-2 text-xs font-semibold text-strong ring-2 ring-indigo-500 xl:self-auto'
+          : 'inline-flex min-h-[28px] items-center gap-1.5 self-start rounded-md border border-strong bg-surface px-2 text-xs font-semibold text-strong hover:border-gray-400 xl:self-auto'
       }
     >
       {present.map((track) => (
@@ -195,7 +194,7 @@ export const EpisodeSubtitleTag = ({
   );
 };
 
-/** At the top of an open season: how many episodes lack a subtitle. */
+/** Top of an open season: how many episodes lack a subtitle. */
 export const SeasonMissingBar = ({
   tvId,
   seasonNumber,
@@ -230,7 +229,7 @@ export const SeasonMissingBar = ({
         ),
         { appearance: 'success', autoDismiss: true }
       );
-      // The Subtitles card follows the search, and shows what it found.
+      // The Subtitles card tracks the search and shows its results.
       void transcription.mutate(started, { revalidate: false });
     } catch {
       addToast(intl.formatMessage(messages.failed), {
@@ -241,14 +240,14 @@ export const SeasonMissingBar = ({
   };
   return (
     <div className="flex flex-col items-start justify-between gap-2 py-3 sm:flex-row sm:items-center">
-      <p className="text-sm text-gray-400">
+      <p className="text-sm text-muted">
         {intl.formatMessage(messages.missingHere, { count })}
       </p>
       <button
         type="button"
         onClick={search}
         disabled={searching}
-        className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md bg-indigo-600 px-3 text-sm font-semibold text-white hover:bg-indigo-500 disabled:opacity-50"
+        className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md bg-accent px-3 text-sm font-semibold text-on-accent hover:bg-accent-hover disabled:opacity-50"
       >
         <MagnifyingGlassIcon className="h-4 w-4" />
         {intl.formatMessage(messages.searchMissing)}
@@ -257,7 +256,7 @@ export const SeasonMissingBar = ({
   );
 };
 
-/** An episode's subtitles, under the episode, with what can be done. */
+/** An episode's subtitles and actions, under the episode. */
 export const EpisodeSubtitlePanel = ({
   tvId,
   seasonNumber,
@@ -344,7 +343,7 @@ export const EpisodeSubtitlePanel = ({
   });
 
   return (
-    <div className="mt-4 w-full overflow-hidden rounded-lg border border-gray-700 bg-gray-900 text-sm text-gray-300">
+    <div className="mt-4 w-full overflow-hidden rounded-lg border border-subtle bg-page text-sm text-default">
       <GroupLabel>{intl.formatMessage(messages.onDisk)}</GroupLabel>
       <ul>
         {episode.tracks.map((track) => (
@@ -370,16 +369,18 @@ export const EpisodeSubtitlePanel = ({
         {episode.missing.map((missing) => (
           <li
             key={`${missing.language}-${missing.hi}-${missing.forced}`}
-            className="flex items-center gap-2.5 border-b border-gray-700 px-4 py-2.5"
+            className="flex items-center gap-2.5 border-b border-subtle px-4 py-2.5"
           >
             <div className="flex min-w-0 flex-1 flex-col gap-0.5">
               <div className="flex flex-wrap items-center gap-1.5">
-                <span className="font-semibold text-white">{missing.name}</span>
+                <span className="font-semibold text-strong">
+                  {missing.name}
+                </span>
                 <Tag tone="missing">
                   {intl.formatMessage(partMessages.missingTag)}
                 </Tag>
               </div>
-              <span className="text-xs text-gray-400">
+              <span className="text-xs text-muted">
                 {intl.formatMessage(messages.missingWanted)}
               </span>
             </div>
@@ -403,7 +404,7 @@ export const EpisodeSubtitlePanel = ({
                   language: episode.missing[0]?.language ?? wanted[0],
                 })
               }
-              className="inline-flex min-h-[40px] items-center justify-center gap-2 rounded-md bg-indigo-600 px-3 text-sm font-semibold text-white hover:bg-indigo-500"
+              className="inline-flex min-h-[40px] items-center justify-center gap-2 rounded-md bg-accent px-3 text-sm font-semibold text-on-accent hover:bg-accent-hover"
             >
               <MagnifyingGlassIcon className="h-4 w-4" />
               {intl.formatMessage(messages.search)}
@@ -413,7 +414,7 @@ export const EpisodeSubtitlePanel = ({
                 type="button"
                 onClick={transcribe}
                 disabled={!!thisOneRunning}
-                className="inline-flex min-h-[40px] items-center justify-center gap-2 rounded-md border border-indigo-500 bg-indigo-500/10 px-3 text-sm font-semibold text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-50"
+                className="inline-flex min-h-[40px] items-center justify-center gap-2 rounded-md border border-indigo-500 bg-indigo-500/10 px-3 text-sm font-semibold text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-50 light:text-accent-text"
               >
                 <SpeakerWaveIcon className="h-4 w-4" />
                 {intl.formatMessage(messages.transcribe)}
@@ -421,7 +422,7 @@ export const EpisodeSubtitlePanel = ({
             )}
           </div>
           {thisOneRunning && (
-            <span className="text-xs text-indigo-200">
+            <span className="text-xs text-indigo-200 light:text-accent-text">
               {intl.formatMessage(messages.transcribing)}
             </span>
           )}

@@ -1,9 +1,10 @@
 import { IssueStatus, IssueType } from '@server/constants/issue';
-import { MediaStatus } from '@server/constants/media';
+import { MediaStatus, MediaType } from '@server/constants/media';
+import { declineReasonOf } from '@server/lib/notifications/declineReason';
+import notificationHttp from '@server/lib/notifications/http';
 import type { NotificationAgentWebhook } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
-import axios from 'axios';
 import { get } from 'lodash';
 import { Notification, hasNotificationType } from '..';
 import type { NotificationAgent, NotificationPayload } from './agent';
@@ -14,7 +15,11 @@ type KeyMapFunction = (
   type: Notification
 ) => string;
 
-const KeyMap: Record<string, string | KeyMapFunction> = {
+/**
+ * Webhook template variables. The Jellyfin ones fall back to Emby ids, which
+ * they carried before Emby had its own; the Emby ones are Emby-only.
+ */
+export const KeyMap: Record<string, string | KeyMapFunction> = {
   notification_type: (_payload, type) => Notification[type],
   event: 'event',
   subject: 'subject',
@@ -29,8 +34,33 @@ const KeyMap: Record<string, string | KeyMapFunction> = {
   media_tmdbid: 'media.tmdbId',
   media_tvdbid: 'media.tvdbId',
   media_type: 'media.mediaType',
+  /** Music only (TMDB id is 0): the artist's MusicBrainz id. */
+  media_mbid: (payload) =>
+    payload.media?.mediaType === MediaType.MUSIC
+      ? (payload.media.foreignId ?? '')
+      : '',
+  /** Music only: requested album titles, one per line. */
+  music_albums: (payload) =>
+    payload.media?.mediaType === MediaType.MUSIC
+      ? (payload.request?.albums ?? []).map((album) => album.title).join('\n')
+      : '',
+  /** Music only: requested songs, one per line, as "Song (radio edit)". */
+  music_songs: (payload) =>
+    payload.media?.mediaType === MediaType.MUSIC
+      ? (payload.request?.songs ?? [])
+          .map((song) =>
+            song.version ? `${song.title} (${song.version})` : song.title
+          )
+          .join('\n')
+      : '',
   media_jellyfinMediaId: (payload) =>
-    payload.media?.jellyfinMediaId ?? payload.media?.jellyfinMediaId4k ?? '',
+    payload.media?.jellyfinMediaId ??
+    payload.media?.jellyfinMediaId4k ??
+    payload.media?.embyMediaId ??
+    payload.media?.embyMediaId4k ??
+    '',
+  media_embyMediaId: (payload) =>
+    payload.media?.embyMediaId ?? payload.media?.embyMediaId4k ?? '',
   media_status: (payload) =>
     payload.media ? MediaStatus[payload.media.status] : '',
   media_status4k: (payload) =>
@@ -38,13 +68,19 @@ const KeyMap: Record<string, string | KeyMapFunction> = {
   media_plexRatingKey: (payload) => payload.media?.ratingKey ?? '',
   media_plexRatingKey4k: (payload) => payload.media?.ratingKey4k ?? '',
   request_id: 'request.id',
-  requestedBy_jellyfinUserId: 'request.requestedBy.jellyfinUserId',
+  requestedBy_jellyfinUserId: (payload) =>
+    payload.request?.requestedBy?.jellyfinUserId ??
+    payload.request?.requestedBy?.embyUserId ??
+    '',
+  requestedBy_embyUserId: (payload) =>
+    payload.request?.requestedBy?.embyUserId ?? '',
   requestedBy_username: 'request.requestedBy.displayName',
   requestedBy_email: 'request.requestedBy.email',
   requestedBy_avatar: 'request.requestedBy.avatar',
   requestedBy_settings_discordIds: 'request.requestedBy.settings.discordIds',
   requestedBy_settings_telegramChatId:
     'request.requestedBy.settings.telegramChatId',
+  decline_reason: (payload, type) => declineReasonOf(type, payload) ?? '',
   issue_id: 'issue.id',
   issue_type: (payload) =>
     payload.issue ? IssueType[payload.issue.issueType] : '',
@@ -62,6 +98,35 @@ const KeyMap: Record<string, string | KeyMapFunction> = {
   commentedBy_settings_discordIds: 'comment.user.settings.discordIds',
   commentedBy_settings_telegramChatId: 'comment.user.settings.telegramChatId',
 };
+
+/** A template variable such as {{subject}}. */
+const VARIABLE = /\{\{(\w+)\}\}/g;
+
+/** A variable's value as text; '' when unset. */
+const variableValue = (
+  key: string,
+  payload: NotificationPayload,
+  type: Notification
+): string => {
+  const keymapValue = KeyMap[key];
+  const value =
+    typeof keymapValue === 'function'
+      ? keymapValue(payload, type)
+      : get(payload, keymapValue);
+  return value == null ? '' : String(value);
+};
+
+/**
+ * Fills variables in one pass, inserting values verbatim: a "$" or a typed
+ * "{{…}}" in a value is never read as template. Unknown braces are left as is.
+ */
+const fillVariables = (
+  template: string,
+  valueOf: (key: string) => string
+): string =>
+  template.replace(VARIABLE, (variable, key: string) =>
+    Object.hasOwn(KeyMap, key) ? valueOf(key) : variable
+  );
 
 class WebhookAgent
   extends BaseAgent<NotificationAgentWebhook>
@@ -122,15 +187,9 @@ class WebhookAgent
       }
 
       if (typeof finalPayload[key] === 'string') {
-        Object.keys(KeyMap).forEach((keymapKey) => {
-          const keymapValue = KeyMap[keymapKey as keyof typeof KeyMap];
-          finalPayload[key] = (finalPayload[key] as string).replace(
-            `{{${keymapKey}}}`,
-            typeof keymapValue === 'function'
-              ? keymapValue(payload, type)
-              : (get(payload, keymapValue) ?? '')
-          );
-        });
+        finalPayload[key] = fillVariables(finalPayload[key] as string, (k) =>
+          variableValue(k, payload, type)
+        );
       } else if (finalPayload[key] && typeof finalPayload[key] === 'object') {
         finalPayload[key] = this.parseKeys(
           finalPayload[key] as Record<string, unknown>,
@@ -185,20 +244,26 @@ class WebhookAgent
 
     let webhookUrl = settings.options.webhookUrl;
 
+    // A test notification has no data, so every variable becomes "test".
     if (settings.options.supportVariables) {
-      Object.keys(KeyMap).forEach((keymapKey) => {
-        const keymapValue = KeyMap[keymapKey as keyof typeof KeyMap];
-        const variableValue =
+      webhookUrl = fillVariables(webhookUrl, (key) =>
+        encodeURIComponent(
           type === Notification.TEST_NOTIFICATION
             ? 'test'
-            : typeof keymapValue === 'function'
-              ? keymapValue(payload, type)
-              : get(payload, keymapValue) || 'test';
-        webhookUrl = webhookUrl.replace(
-          new RegExp(`{{${keymapKey}}}`, 'g'),
-          encodeURIComponent(variableValue)
-        );
+            : variableValue(key, payload, type)
+        )
+      );
+    }
+
+    // Escaped or not, "." and ".." path segments move up the path, so a
+    // value must not make one.
+    if (dotSegments(webhookUrl) > dotSegments(settings.options.webhookUrl)) {
+      logger.warn('Webhook not sent: a value would change its address path', {
+        label: 'Notifications',
+        type: Notification[type],
+        subject: payload.subject,
       });
+      return false;
     }
 
     try {
@@ -217,7 +282,7 @@ class WebhookAgent
           const value = header.value?.trim();
 
           if (key && value) {
-            // Don't override Authorization header if it's already set via authHeader
+            // authHeader wins over a custom Authorization header.
             if (
               key.toLowerCase() !== 'authorization' ||
               !settings.options.authHeader
@@ -228,7 +293,7 @@ class WebhookAgent
         });
       }
 
-      await axios.post(
+      await notificationHttp.post(
         webhookUrl,
         this.buildPayload(type, payload),
         Object.keys(headers).length > 0 ? { headers } : undefined
@@ -248,5 +313,12 @@ class WebhookAgent
     }
   }
 }
+
+/** How many "." or ".." segments (or escaped forms) an address's path has. */
+const dotSegments = (url: string): number =>
+  url
+    .split(/[?#]/)[0]
+    .split('/')
+    .filter((part) => /^(\.|%2e){1,2}$/i.test(part)).length;
 
 export default WebhookAgent;

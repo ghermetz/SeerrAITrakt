@@ -10,18 +10,65 @@ merged back in.
 there, or to cherry-pick a fix worth having. Nothing is expected to merge
 cleanly, and nothing has to.
 
-Upstream `develop` has been read through `8f2eceea` (10 October 2026).
+Upstream `develop` has been read through `b185621e` (2 November 2026).
 Its two security advisories there are covered: GHSA-xc6j-6p6h-p799 (other
 people's details and issues in a title's media info) by `mediaForViewer`,
 done here before upstream's fix; GHSA-8j73-j6rc-q8xh (notification
 credentials in every embedded user) by `User.toJSON`. Start the next read
 from that commit.
 
+From `c0759ce07` to `b185621e`: #3579 is taken (abandoned seasons settled
+at the end of a Sonarr run). It keeps the fork's own rules: a series Sonarr
+has under another TVDB id still counts as there, and one Sonarr lists no
+seasons for never has its request declined. Its tests went into
+`baseScanner.statusReset.test.ts`, where upstream's scanner tests live here.
+Not taken: a new Indonesian server translation (the fork has no Indonesian).
+
+From `84eae6727` to `c0759ce07`: dependency updates only. Taken: axios
+1.21.0, express-rate-limit 8.7.1, nodemailer 10.2.1 and Cypress 16.2.0
+(Next.js was already 16.4.2). Cypress pins a vulnerable systeminformation
+and supertest an old qs, so both are overridden past their advisories.
+sqlite3 v6 (#3662) is taken: it comes as a ready-built binary for Alpine
+on x64 and arm64, and builds with node-gyp 12 where it doesn't, so the old
+node-gyp 8 and its @tootallnate/once override are gone. Not taken yet: the
+slimmer Docker image (#3615), whose Dockerfile and next.config differ here.
+
+From `62ed636b0` to `84eae6727`: #3652 is taken, reworked for several
+media servers: the owner signing in with Plex before any media server is
+set up makes Plex the primary one (`connectAsPrimary`) and starts the jobs,
+and the owner's email counts for that first Plex sign-in while none is set
+up. `startJobs` replaces the jobs it already scheduled rather than adding
+them again, which also fixes Jellyfin or Emby set up over an existing
+database scheduling every job twice. #3573 (a series edit or request that
+leaves no season to ask for answers 202), #3538 (rules matched against the
+server the request goes to) and #3608 (Trending's filters kept in the
+address) were already here. Beyond #3538, the request window's rule
+preview now matches as the request will be sent: against the default
+server for one that isn't among them, and as anime or not as ticked. The
+rest was CI, Cypress, docs and devenv.
+
+From `31b100dde` to `62ed636b0`: #3639 (Node.js 22.23.4) was done here
+as 2.0.1, with the same image digest; #3425 is taken (the watchlist POST
+body and its 201 answer in the API spec). The rest was CI, the Helm chart
+and contributor docs.
+
+From `8f2eceea` to `31b100dde`, #3630 is taken: when a title arrives,
+the requests it completes are saved one at a time, because saved together
+their save hooks ran at once on one Postgres transaction and their
+savepoints undid each other, failing the whole save. Beyond upstream,
+`withNestedTransaction` makes nested transactions on one connection take
+turns by itself, so no other caller can trip over this again. The rest of
+that range was already here (#3593, #3533, the fork's Radarr fix covering
+all three ways a film is added) or was translations.
+
 Unmerged upstream pull requests taken: #3571 (choosing the networks in the
 Networks row), reworked: each person chooses their own (kept in their user
 settings, saved with the rows they hide) where upstream has one list an
 admin sets; the page carries no validation library; the editor loads only
-while customizing.
+while customizing. #3600 (no blur behind the top bar), reworked: the blur
+is dropped only where the bar is solid (light mode or solid panels, and
+the phone's tab bar with solid panels), where it showed nothing but cost
+scrolling; see-through bars keep it.
 
 ## Building
 
@@ -37,6 +84,28 @@ that automatic.
 
 Then recreate the container. The image is `seerr-custom:latest`; in Compose,
 use `pull_policy: never` so it isn't looked for in a registry.
+
+### Before every build: quality presets
+
+`build.sh` runs `./quality-check.sh` first. It compares Seerr AI's own
+quality presets (`server/lib/quality/presets.ts`) with TRaSH Guides as it
+is now, against the TRaSH Guides commit they were last reviewed with
+(`server/lib/quality/trash-reviewed.json`), and says:
+
+- **Must fix**: a TRaSH Guides profile or format Seerr AI relies on is gone
+  or renamed (`TRASH_PROFILES` in `trashData.ts`, `TRASH_EQUIVALENTS` in
+  `presets.ts`), so TRaSH Guides presets would stop working.
+- **Changed since the last review**: new or removed profiles and qualities,
+  formats TRaSH Guides now refuses, formats Seerr AI mirrors that match
+  differently, and size changes.
+- What TRaSH Guides never takes that Seerr AI's own presets have nothing
+  like.
+
+It is a report and never stops the build. When it lists something, decide
+what Seerr AI's presets should take from it, change them (with tests), and
+record the review with `QUALITY_CHECK_HERE=1 ./quality-check.sh --accept`.
+The app itself checks TRaSH Guides once every 24 hours, so servers on
+TRaSH Guides presets don't wait for a build.
 
 ### Applying patches
 
@@ -87,6 +156,14 @@ any failing test exits with 1.
 (`node bin/check-i18n.js`), a build, and the whole suite on SQLite. On
 pushes it also runs the suite on Postgres, one file at a time, which takes
 about an hour. A red cross on a commit links to the log of what failed.
+
+`real-clients.yml` runs alongside it: the download client code against the
+real clients, not stand-ins (Deluge, qBittorrent, Transmission, SABnzbd and
+NZBGet in their latest linuxserver.io images, rTorrent behind nginx), each
+given a torrent or Usenet job to add, stop, finish and delete
+(`server/api/downloadclients/realClients.test.ts`, skipped unless
+`REAL_CLIENTS` is set). To run it by hand against clients of your own, see
+the variables at the top of that file.
 
 ### Against Postgres
 
@@ -186,13 +263,68 @@ Each of these came from a bug that reached a running server.
 
 ## What's new
 
-[CHANGELOG.md](../CHANGELOG.md) is written for the people running Seerr AI,
-not for developers. A change they would notice adds a few friendly
-sentences under **Coming next**: what they can now do, where to find it, and
-anything they have to switch on. No code names, file names or jargon.
-Changes nobody would notice (tests, refactors, the build) are left out. A
-release renames **Coming next** to its version and date, and starts a new,
-empty one.
+[CHANGELOG.md](https://github.com/corruptmods/SeerrAI/blob/main/CHANGELOG.md)
+is for the people running Seerr AI, not developers. A change they would
+notice gets one short line under **Coming next** (added at the top when
+the first unreleased change lands), in plain words, in
+**New**, **Changed** or **Fixed**; details go in the guide (docs/seerr-ai),
+linked once where useful. No code names, file names or jargon. Changes
+nobody would notice (tests, refactors, the build) are left out.
+
+A release renames **Coming next** to its version, `## 1.2.3 (date)`;
+`release.yml` uses that section as the release notes. No empty section is
+left behind: the changelog lists only what has been released, and **Coming
+next** comes back with the next change. A pre-release does the same with
+its own version, such as `## 2.0.0-beta.2 (date)`, listing what changed
+since the last one; the first starts with one line saying what it
+previews. The release after its betas has one section covering
+everything since the last release, in place of the betas' sections, as
+that is what people updating from it read.
+
+A release that fixes a security problem says so under **Security**, as
+upstream does: each fix with its CVE ID (or GHSA ID when it has no CVE),
+linked to the advisory, and one short line on what it was and whether
+Seerr AI could be reached through it.
+
+## Security pins
+
+`package.json` can't hold comments, so each override that holds a package
+past an advisory is recorded here. Raise a pin when a newer advisory
+covers the version it allows; drop it once nothing in the tree resolves
+below it on its own (`pnpm why <package>`).
+
+| Override | Keeps out | Notes |
+|---|---|---|
+| `handlebars >=4.7.10` | [CVE-2026-106446](https://github.com/advisories/GHSA-8r5x-fm3f-whwj), [CVE-2026-106445](https://github.com/advisories/GHSA-p8wg-vrv2-v86f), [CVE-2026-106444](https://github.com/advisories/GHSA-xw65-4hp5-5hc7), and the 4.7.8 advisories ([GHSA-2w6w-674q-4c4q](https://github.com/advisories/GHSA-2w6w-674q-4c4q) and others) | Only through eslint-plugin-formatjs (ts-jest), a development tool; nothing in the image uses it |
+| `follow-redirects >=1.16.2` | [GHSA-mrwp-f3q8-3g9p](https://github.com/advisories/GHSA-mrwp-f3q8-3g9p), and before it [CVE-2026-111756](https://github.com/advisories/GHSA-q3jh-wrc6-jgq8), [CVE-2026-111755](https://github.com/advisories/GHSA-8r9p-f939-6h3c) | Through axios: credential headers sent on after a cross-origin redirect |
+| `typeorm>glob`, `cacache>glob` `>=14.0.2 <15` | [GHSA-3g3m-2fjr-6pw4](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4), and through glob 14 its minimatch 11 past [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249) | typeorm finds entity and migration files with it (`glob.sync`, still in 14); cacache is node-gyp's, while sqlite3 is built |
+| `source-map-js >=1.2.2` | [CVE-2026-93749](https://github.com/advisories/GHSA-68fv-2mgg-jv7q) | Through Next's PostCSS; build only |
+| `tar >=7.5.21` | [GHSA-23hp-3jrh-7fpw](https://github.com/advisories/GHSA-23hp-3jrh-7fpw), [GHSA-r292-9mhp-454m](https://github.com/advisories/GHSA-r292-9mhp-454m) | Through sqlite3's build; denial of service on unpacking |
+| `nodemailer 10.1.4` | [GHSA-8c8m-p3m8-cjg8](https://github.com/advisories/GHSA-8c8m-p3m8-cjg8), [GHSA-m943-m63m-w62w](https://github.com/advisories/GHSA-m943-m63m-w62w), [GHSA-85x2-q946-cp5h](https://github.com/advisories/GHSA-85x2-q946-cp5h), and before them [GHSA-v53p-9fqp-m79j](https://github.com/advisories/GHSA-v53p-9fqp-m79j), [GHSA-6vj9-mwq6-2f5v](https://github.com/advisories/GHSA-6vj9-mwq6-2f5v), [GHSA-8vvx-rff5-p5rq](https://github.com/advisories/GHSA-8vvx-rff5-p5rq) and the 9.x advisories | Sends every email |
+| `body-parser >=2.4.0` | [GHSA-27r3-jxmh-p828](https://github.com/advisories/GHSA-27r3-jxmh-p828) | Through Express: reads every request body |
+| `multer >=2.5.0` | [GHSA-q7qp-rjg7-q26m](https://github.com/advisories/GHSA-q7qp-rjg7-q26m) | Through express-openapi-validator, for uploads |
+| `fast-uri >=3.1.9 <4` | [GHSA-w74x-v6f9-j3xg](https://github.com/advisories/GHSA-w74x-v6f9-j3xg), [GHSA-wjr9-j795-jxcr](https://github.com/advisories/GHSA-wjr9-j795-jxcr), [GHSA-xhq7-xmqj-769h](https://github.com/advisories/GHSA-xhq7-xmqj-769h), [GHSA-333x-w4r6-6crp](https://github.com/advisories/GHSA-333x-w4r6-6crp) | Through express-openapi-validator's ajv, which checks addresses in API requests; ajv wants 3.x |
+| `cheerio>undici >=6.29.1 <7` | [GHSA-xjj6-f33q-929c](https://github.com/advisories/GHSA-xjj6-f33q-929c), [GHSA-4qv8-2p9j-2685](https://github.com/advisories/GHSA-4qv8-2p9j-2685) | Through email-templates' juice, which inlines email styles; Seerr AI's own undici is a direct dependency, at 8.12.3 |
+| `ip-address >=10.7.3` | The ip-address advisories up to 10.7.0 (subnet checks across address families, leading-zero octets) | Only through node-gyp's proxy support, while sqlite3 is built |
+
+`compression` is a direct dependency, held at 1.8.2 for
+[CVE-2026-87776](https://github.com/advisories/GHSA-vc2v-76pw-4v95). One advisory is knowingly
+left: [CVE-2026-93748](https://github.com/advisories/GHSA-ch52-4w7c-c8xp) (http-cache-semantics, no
+fixed version), inside node-gyp, which only runs if sqlite3 has to be
+built. And [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249)
+(minimatch, fixed only in 11) is left in minimatch 3 under
+email-templates' @ladjs/i18n: its multimatch is only called by that
+package's Koa redirect middleware, which nothing here uses, and minimatch
+11 can't stand in for 3 (no default export).
+
+deepmerge has no fixed release for
+[CVE-2026-93753](https://github.com/advisories/GHSA-gcqx-w48m-w2h4) (a `__proto__` key in what is
+merged sets the result's prototype). Seerr AI patches it instead
+(`patches/`, applied by pnpm on install): 4.3.1, which email templates use
+through html-to-text, and 2.2.1, which Formik uses, both skip that key. The
+audit can't see a patch, so the advisory is listed in `auditConfig` as
+handled. Drop the patch and that line once deepmerge releases a fix. The Node.js version is pinned by digest in the Dockerfiles;
+2.0.1 moved it to 22.23.4 for the October 2026 security release.
 
 ## Layout of the fork's own code
 
@@ -202,12 +334,21 @@ empty one.
 | `server/lib/list*.ts` | access rules, activity notifications, watch sync |
 | `server/lib/notificationReconciler.ts` | dedup and catch-up delivery |
 | `server/lib/requestDispatch.ts` | marking undispatchable requests failed |
+| `server/lib/requestServers.ts` | which Radarr, Sonarr or Lidarr a request goes to, and why it has none (`serverIssue` on a pending or failed request) |
 | `server/constants/lists.ts`, `src/constants/lists.ts` | tuning knobs |
 | `src/components/MediaLists/` | list UI |
 | `src/hooks/useListDetail.ts`, `useMediaMarkers.ts` | list data and poster badges |
 | `public/sw.js` | service worker |
+| `server/lib/mediaServers.ts` | which media servers are connected, their settings, ids and clients |
+| `src/utils/mediaServerAccounts.ts`, `src/utils/playLinks.ts` | people's server accounts, and which play link to offer them |
+| `server/lib/oidc.ts`, `server/routes/oidc.ts` | single sign-on: talking to providers, the correlation cookie, finding or making the account |
 | `server/lib/ai/` | AI: providers, limit and cache, credit, each feature's prompt |
 | `src/components/Ai/`, `src/components/AiChat/` | AI panels and the AI button |
+| `server/api/musicbrainz/`, `server/api/servarr/lidarr.ts` | MusicBrainz (its one shared queue) and Lidarr |
+| `server/lib/music/`, `server/lib/scanners/music/` | music: matching albums, availability, completing requests; the music scans |
+| `src/components/Music/` | music pages, cards, request cards and the artist's manage panel |
+| `server/lib/quality/`, `server/routes/settings/quality.ts` | quality profiles: presets, TRaSH Guides, building and applying them, What it does, step-down |
+| `src/components/Settings/SettingsQuality/` | the Quality settings page, its preview and What it does |
 
 ## Deliberate decisions
 
@@ -221,26 +362,72 @@ Do not undo these without reading why first — each was tried the other way.
   default cache and a provider takes the app out of it.
 - **Roulette and list sections only offer watchable titles.** A partially
   available series counts; something still downloading does not.
+- **Quality profiles are never pushed on their own.** A server is Not
+  managed until an admin turns it on, and nothing is sent until they press
+  Apply after a preview; TRaSH Guides updates wait unless Apply updates
+  automatically is on. Only what Seerr AI created (named `Seerr AI · …`)
+  is changed, apart from the default delay profile, which the preview marks
+  as shared. Titles move onto its profiles only when the admin picks it.
 - **Import never adds without review.** Automatic title matching gets things
   wrong, and silently adding the wrong film is worse than no feature.
 - **Passkeys belong to the Application URL.** With it set (Settings →
   General), passkeys work only at that address and no Host header is trusted;
   a passkey made there cannot be used from a LAN IP. Changing the URL's host
-  strands every passkey, so people sign in with Plex once and add a new one.
-- **One GitHub Actions workflow: images.** `release.yml` builds and
-  publishes the image (amd64 and arm64) for an `ai-v*` tag, and `:develop`
-  when run by hand from `dev` (pushes to `dev` publish nothing), so Seerr AI
-  can be installed like Seerr, on its own. The `ai-` prefix keeps releases
-  apart from Seerr's own `v1.0.0`…`v3.x` tags, which arrive whenever Seerr is
-  fetched as `upstream`; never `git push --tags`, which would send those
-  too. A build takes about half an hour (arm64 under emulation), so it
-  builds only when asked, and it doesn't run the tests. Run the tests
-  locally (see Tests) before pushing. Upstream's other workflows (docs,
-  issue triage, Helm) and its Helm chart aren't carried. Anyone can still
-  build their own image with `build.sh`.
+  strands every passkey, so people sign in with a media server (or a
+  password) once and add a new one.
+- **Several media servers, one of each kind.** Plex, Jellyfin and Emby can
+  be connected at once (Settings → Media Servers), at most one of each.
+  `main.mediaServerType` is kept and means the primary server: the one
+  whose links fill `mediaUrl`, `iOSPlexUrl` and `tautulliUrl` exactly as
+  before, for API readers; `playLinks` has every server's. Every other
+  question about servers goes through `server/lib/mediaServers.ts`, not
+  `mediaServerType`. Emby has its own settings and columns rather than
+  sharing Jellyfin's, so both can be connected. Accounts are matched only
+  by each server's own id, never by email across servers: an email match
+  let a Plex account take over the owner's account on a Jellyfin-first
+  install. A new account whose email or name is taken is refused, not
+  merged. Plex is reached through the owner's Plex token, so the owner
+  links Plex to connect it. Episodes are counted per server, so a season
+  split across two servers shows as partly available; that is a known
+  limitation, told to admins in the guide.
+- **Pages pick a play link for the viewer.** A title's page shows Play on
+  each server; badges, request cards and issues show one, on a server the
+  viewer has an account on (the primary one first), else the first that
+  has it (`pickPlayLink` in `src/utils/playLinks.ts`). Notifications link
+  to Seerr's own page, which is the same for everyone.
+- **GitHub Actions: checks and images.** `ci.yml` and `real-clients.yml`
+  check every push and pull request to `dev` and `main` (see Tests).
+  `release.yml` builds and publishes the image for an `ai-v*` tag,
+  `:preview-<name>` for a `preview-<name>` tag, and `:develop` when run by
+  hand from `dev` (pushes to `dev` publish nothing; run by hand from any
+  other branch it builds `:preview-<branch>`), so Seerr AI can be installed
+  like Seerr, on its own. It builds the way upstream does: amd64 and arm64
+  (the platforms upstream ships) each on their own runner, arm64 on
+  GitHub's arm64 runner rather than under emulation, pushed by digest and
+  joined into one multi-arch image; to GHCR, and to Docker Hub only when
+  the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets are set (as
+  `<username>/seerr-ai`, or the `DOCKERHUB_IMAGE` repository variable);
+  signed with cosign (keyless) with a CycloneDX SBOM attestation from
+  Trivy, both verified before a release is published. Unlike upstream,
+  every image is signed, not only releases, and the version comes from the
+  tag (written into `package.json` for the build), not a release commit.
+  The `ai-` prefix keeps releases apart from Seerr's own `v1.0.0`…`v3.x`
+  tags, which arrive whenever Seerr is fetched as `upstream`; never
+  `git push --tags`, which would send those too. It builds only when asked,
+  and doesn't run the tests itself: they are `ci.yml`'s. An `ai-v*` tag is
+  built only once its commit is on `main` and has a passing `ci.yml` run
+  (the gate job waits for one still going); previews and runs by hand
+  aren't held to that. For a release, that check runs in the `release`
+  environment, so the owner can require one approval there before anything
+  is built or published.
+  Upstream's other workflows (docs, issue triage, Helm, its weekly Trivy
+  scan to code scanning, Discord notices, `create-tag`) and its Helm chart
+  aren't carried. Anyone can still build their own image with `build.sh`.
 - **Update checks are against this repository.** `server/constants/project.ts`
   names it; Settings → About and the update check read its releases and
-  commits. Change it if the repository is renamed.
+  commits. Change it if the repository is renamed. Both pick the latest
+  release with `server/utils/releases.ts`: never a draft, a pre-release
+  only for an install running one, matched to the version by its tag.
 - **Two branches: `dev` and `main`.** Work and patches go onto `dev`, which
   a self-built server runs. `main` only moves for a release, fast-forwarded
   to `dev`, then tagged `ai-v…`. A release build checks for newer releases;
@@ -290,6 +477,105 @@ Do not undo these without reading why first — each was tried the other way.
   opens a window the person confirms, with every title shown and each one
   able to be left out; requests then follow the usual rules, one at a time.
   A model that gets something wrong can only mislead, never change anything.
+- **Music is kept by artist, with albums as its parts.** An artist is a
+  `Media` row (`mediaType` music, `tmdbId` 0, the MusicBrainz id in
+  `foreignId`, the name in `foreignTitle`); each album is a `MusicAlbum`,
+  as a season is a `Season`; a request is a `MediaRequest` holding
+  `AlbumRequest`s. Lidarr keeps folders, profiles and tags on the artist,
+  so one request for a whole discography is one approval and one set of
+  choices; one row per album (as SeerrNG does) made a discography a pile
+  of approvals fighting over the same artist. Requests, approvals, quotas,
+  watchers and notifications came for free. Albums are completed and
+  announced by the music scans (`lib/music/completion`), not the save
+  hooks: they change through `update()`, which the hooks never see, and an
+  artist's status says nothing about which albums one request asked for.
+  For the same reason an artist becoming available never approves a
+  pending music request. Lidarr is only ever told to monitor and search:
+  `albumsToMonitor` unmonitors everything else, so it is used only for an
+  artist being added, and an artist Lidarr has keeps its own settings.
+- **Film and series code only ever sees films and series.** Everything that
+  goes through titles in bulk (availability sync, Health, catch-up,
+  watch history, Recently Added, the AI) is scoped with `VIDEO_MEDIA_TYPES`,
+  and `server/lib/musicScope.test.ts` fails if a music row reaches any of
+  it. Music's `tmdbId` of 0 never goes into a table keyed by `tmdbId`
+  (Blocklist, MediaDeletion, Watchlist, list items): an artist's history
+  is kept by `foreignId`, and clearing an artist records no deletion.
+- **Permissions are a bigint.** Auto-Approve Music is 2^31, past what an
+  integer column holds and past JavaScript's 32-bit `&`. `user.permissions`
+  is a bigint read back as a number, and `hasPermission` uses arithmetic,
+  not bitwise operators. Bit 0 and 2^29 were the only free ones below.
+- **One MusicBrainz line for the whole server.** MusicBrainz allows one
+  request a second from an address, and limits per instance of the client
+  (upstream's way) let several run at once. Every request goes through one
+  queue, people on a page ahead of scans; someone who would wait too long
+  is told it is busy instead. Answers are kept in the database too, so a
+  restart asks nothing again. Health judges MusicBrainz from how that
+  queue has fared rather than spending a request on a check. A mirror
+  (Settings → Music) is not limited.
+- **Single sign-on finds people by provider account only.** A provider
+  (Settings → Users → Single Sign-On) signs someone in only through a
+  link of the provider's id and its own id for them (`sub`, in
+  `oidc_link`), made at the issuer the provider still has (a `sub` only
+  means someone at the issuer that gave it, so changing the issuer URL
+  leaves old links unusable; links from before issuers were recorded take
+  the current one when used, or the old one when it changes), never by
+  email: some providers let anyone put any email
+  on an account, and an email match is how a Plex account could once take
+  over the owner's. A new person is refused, unless the provider lets new
+  people sign up; then they get an account, with the provider's email
+  only when it is verified and nobody here has it, else a stand-in that
+  isn't an email. An email someone here already has is refused with the
+  usual "sign in and link it" message. A provider's id is made from its
+  name once and never reused, even after it is removed, so its old links
+  can never start matching another provider's people. Starting and
+  finishing are pages the browser goes to, not calls: the callback is a
+  link from the provider's site, so the state, PKCE verifier, nonce and
+  return path ride in a signed, httpOnly, SameSite=Lax cookie (Strict
+  would not come back), cleared on use. The callback answers with a page
+  that moves on rather than a redirect, so CSRF protection's Strict
+  cookies are sent with the page it lands on. Everything is built
+  from the Application URL, never the request's Host. A provider sign-in
+  is proof enough on its own (no `maySignIn`), and signing out ends only
+  Seerr's session. A provider's rules for who may sign in
+  (`requiredClaims`, upstream's idea, kept as `{ claim, value? }` and read
+  from upstream's space-separated string too) are checked in the callback
+  before anything else happens, so signing in, a new account and linking
+  are all refused alike; they fail closed: a rule that can't be read, or
+  userinfo that can't be, lets nobody in. Failed callbacks count toward
+  the sign-in limit only with a genuine correlation cookie for that
+  provider, so made-up callbacks can't lock out an address.
+- **Enable Proxy Support trusts only known proxies.** With it on, Express
+  takes `req.ip` through a connecting hop on loopback, link-local, private
+  or `100.64.0.0/10` (Tailscale) addresses (`LOCAL_PROXIES` in
+  `server/utils/trustedProxies.ts`), further hops only on loopback, plus
+  Cloudflare's published ranges with **Trust Cloudflare** and any listed
+  under **Also Trust These Proxies** at any hop (`proxyTrust`); never every
+  hop: with every hop trusted the address is whatever the sender wrote
+  first in X-Forwarded-For, and the sign-in limits count by address. A
+  local address a proxy passes on is a visitor's, not another proxy's.
+- **Network settings apply when saved.** `applyNetworkSettings`
+  (`server/lib/networkSettings.ts`) runs at startup and after each save:
+  proxy trust is swapped behind Express's `trust proxy` function
+  (`liveProxyTrust`), the DNS cache is started, stopped or restarted with
+  Node's own lookups put back, and the outbound proxy's agents are replaced,
+  the old ones finishing their requests. CSRF protection (`csrfWhileOn`) and
+  the *arr API timeout read the setting on each request. A page opened
+  before CSRF protection came on is refused its next change once; the
+  client fetches a token and sends it again (`src/utils/csrfRetry.ts`).
+- **Sign-in limits count an attempt when it starts.** `SignInLimiter.take`
+  checks and counts in one step before anything is awaited; outcomes that
+  aren't failures are given back (`refund`, or `clear` on success). Password, Jellyfin/Emby and
+  reset-email limits also cap one account from all addresses together
+  (50 in 15 minutes, `capAccount`). Expired counts are pruned oldest first,
+  and the counts kept are capped.
+- **Personal API keys act as their owner, and only through the header.**
+  Keys (`sai_…`, `server/lib/personalApiKeys.ts`) are stored as hashes,
+  checked against the owner's current permissions on every request (and
+  their right to sign in every few minutes), and never take `X-API-User`. A request with an
+  `X-Api-Key` header never uses the session cookie, so a wrong key is a
+  401 even from a signed-in browser, and CSRF protection skips such
+  requests (`server/middleware/csrf.ts`): another site can't make a
+  browser send that header. A key can't make keys.
 - **Admins can remove someone's passkeys, not add or rename them.** For a
   lost device. The owner's and other admins' passkeys are the owner's to
   manage, as with passwords.

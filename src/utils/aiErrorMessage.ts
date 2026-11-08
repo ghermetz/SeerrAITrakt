@@ -1,26 +1,26 @@
-// Kept apart from the hook, with nothing that needs the page around it, so
-// it can be tested on its own.
+// Kept free of page dependencies so it can be tested alone.
 import { isAxiosError } from 'axios';
 import type { IntlShape } from 'react-intl';
 import defineMessages from './defineMessages';
 
-/** The AI features' refusals, by the code the server sends with them. */
+/** AI refusal messages, keyed by the server's code. */
 const messages = defineMessages('utils.aiErrorMessage', {
   off: 'This AI feature is turned off.',
   limit:
     'You have used all {limit} of today’s AI answers. More are available tomorrow.',
   empty: 'The model gave an empty answer. Try again.',
   unreadable:
-    'The model did not answer in a form Seerr could read. Try again, or choose a stronger model.',
+    'The model’s answer couldn’t be read. Try again, or choose a stronger model.',
   picture: 'That picture could not be read.',
   pictureTooBig: 'That picture is too big.',
   askSomething: 'Ask something, or send a picture.',
   noPictures:
-    'The AI model in use cannot read pictures. An admin can choose one that can in the AI settings.',
+    'This AI model can’t read pictures. An admin can choose one that can in AI settings.',
   outOfCredit:
     'The AI account is out of credit. AI features work again once more is added.',
   busy: 'The AI service is busy right now. Try again shortly.',
   timeout: 'The AI service took too long to answer. Try again.',
+  unreachable: 'The AI service couldn’t be reached. Try again shortly.',
   noHistory: 'There is no watch history to explain these by.',
   nobodyHistory: 'Nobody chosen has any watch history to pick from yet.',
   nothingInLibrary:
@@ -35,9 +35,8 @@ const isCode = (code: unknown): code is keyof typeof messages =>
   typeof code === 'string' && Object.hasOwn(messages, code);
 
 /**
- * The server's reason, which is always written to be shown: in the
- * person's language when it comes with a code this page knows (and `intl`
- * is given), otherwise the server's English. `failed` is the fallback's.
+ * The server's user-facing reason: localised for known codes (when `intl` is
+ * given), else the server's English. `failed` is the fallback.
  */
 export const aiErrorMessage = (
   e: unknown,

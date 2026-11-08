@@ -1,10 +1,13 @@
 #!/bin/bash
+# Pipeline de SECOURS : reconstruit l'image patchée Trakt côté serveur, sans Komodo.
+# Mode nominal = procédure Komodo planifiée (synchro git amont + Build Komodo), voir README.
+#
 # Re-tire SeerrAI (fork github.com/corruptmods/SeerrAI), vérifie que les fichiers
 # patchés n'ont pas changé en amont, reconstruit l'image patchée Trakt, puis la
 # publie sur le registre local (192.168.1.35:5555) pour que Komodo puisse la
 # sonder et la déployer automatiquement (stack "seerr", auto-update).
 #
-# Sources & doc : https://github.com/ghermetz/SeerIAtrakt
+# Sources & doc : https://github.com/ghermetz/SeerrAITrakt (patch-trakt/README.md)
 set -e
 cd "$(dirname "$0")"
 podman pull ghcr.io/corruptmods/seerr-ai:latest

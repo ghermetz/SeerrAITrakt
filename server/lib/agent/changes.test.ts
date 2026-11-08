@@ -2,9 +2,15 @@ import type { ProposedChange } from '@server/lib/agent/changes';
 import {
   ChangeError,
   applyChange,
+  applySeasonChange,
   describeChange,
+  describeSeasonReplace,
 } from '@server/lib/agent/changes';
-import type { ArrEpisode, ArrHistoryRecord } from '@server/lib/autofix/arr';
+import type {
+  ArrEpisode,
+  ArrHistoryRecord,
+  ArrRelease,
+} from '@server/lib/autofix/arr';
 import { FixRadarr, FixSonarr } from '@server/lib/autofix/arr';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
@@ -12,9 +18,9 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 
 /*
- * The changes the admin agent proposes: what an admin is shown, and what
- * is done once they approve, checked again against Radarr and Sonarr as
- * they are by then. Both are stand-ins that record what was asked of them.
+ * Admin-agent proposals: what an admin is shown, and what runs on approval,
+ * rechecked against Radarr and Sonarr as they are by then. Both are stubs
+ * that record what was asked of them.
  */
 
 const GB = 1024 ** 3;
@@ -33,6 +39,9 @@ let queue: {
 }[] = [];
 let history: ArrHistoryRecord[] = [];
 let episodes: ArrEpisode[] = [];
+/** Sonarr's season search, and each episode's own search. */
+let seasonReleases: ArrRelease[] = [];
+let episodeReleases: Record<number, ArrRelease[]> = {};
 
 const profiles = [
   { id: 6, name: 'HD-1080p' },
@@ -58,7 +67,7 @@ const radarr = {
   history: async () => history,
   movieDetail: async () => ({
     id: MOVIE.arrId,
-    title: 'The Odyssey',
+    title: 'The Driftwood',
     monitored: true,
     qualityProfileId: 6,
     hasFile: movieFileId !== null,
@@ -67,7 +76,7 @@ const radarr = {
         ? undefined
         : {
             id: movieFileId,
-            relativePath: 'The Odyssey (2026) [WEBDL-1080p].mkv',
+            relativePath: 'The Driftwood (2026) [WEBDL-1080p].mkv',
             size: 5.1 * GB,
           },
   }),
@@ -109,6 +118,17 @@ const sonarr = {
   searchEpisodes: async (ids: number[]) => {
     calls.push(`search ${ids.join(',')}`);
   },
+  seriesFacts: async () => ({
+    title: 'Static Garden',
+    originalLanguage: 'English',
+  }),
+  seasonHistory: async () => [],
+  seasonReleases: async () => seasonReleases,
+  releases: async (episodeId: number) => episodeReleases[episodeId] ?? [],
+  grab: async (release: ArrRelease) => {
+    calls.push(`grab ${release.guid} ${release.indexerId}`);
+  },
+  monitorEpisodes: async () => undefined,
 };
 
 const episode = (
@@ -133,6 +153,8 @@ beforeEach(() => {
   movieFileId = 10894;
   queue = [];
   history = [];
+  seasonReleases = [];
+  episodeReleases = {};
   episodes = [
     episode(1, 1, 1, 100),
     // One file holding two episodes.
@@ -158,13 +180,13 @@ describe('deleting files', () => {
     const change = await describeChange({
       kind: 'deleteFiles',
       title: MOVIE,
-      name: 'The Odyssey',
+      name: 'The Driftwood',
       reason: 'It is a fake.',
     });
-    assert.equal(change.headline, 'Delete the file of The Odyssey');
+    assert.equal(change.headline, 'Delete the file of The Driftwood');
     assert.match(
       text(change),
-      /"The Odyssey \(2026\) \[WEBDL-1080p\]\.mkv" \(5\.1 GB\)/
+      /"The Driftwood \(2026\) \[WEBDL-1080p\]\.mkv" \(5\.1 GB\)/
     );
     assert.match(
       text(change),
@@ -176,7 +198,7 @@ describe('deleting files', () => {
     );
     assert.match(text(change), /Why: It is a fake\./);
 
-    // A new file arrived since it was proposed: that one is not deleted.
+    // A file that arrived after the proposal is not deleted.
     movieFileId = 10900;
     await assert.rejects(applyChange(change), ChangeError);
     assert.deepEqual(calls, []);
@@ -184,7 +206,7 @@ describe('deleting files', () => {
     movieFileId = 10894;
     assert.match(
       await applyChange(change),
-      /^Deleted the file of The Odyssey\.$/
+      /^Deleted the file of The Driftwood\.$/
     );
     assert.deepEqual(calls, ['delete movie file 10894']);
   });
@@ -260,7 +282,7 @@ describe('marking a download failed', () => {
     queue = [
       {
         id: 55,
-        title: 'The.Odyssey.2026.Celdra',
+        title: 'The.Driftwood.2026.Vandra',
         downloadClient: 'qBittorrent',
         movieId: MOVIE.arrId,
       },
@@ -269,12 +291,12 @@ describe('marking a download failed', () => {
     const queued = await describeChange({
       kind: 'markFailed',
       title: MOVIE,
-      name: 'The Odyssey',
+      name: 'The Driftwood',
       reason: 'A fake.',
     });
     assert.match(
       text(queued),
-      /Removes "The\.Odyssey\.2026\.Celdra" from qBittorrent/
+      /Removes "The\.Driftwood\.2026\.Vandra" from qBittorrent/
     );
     assert.deepEqual(queued.params.queueIds, [55]);
 
@@ -282,7 +304,7 @@ describe('marking a download failed', () => {
       {
         id: 32776,
         eventType: 'grabbed',
-        sourceTitle: 'The Odyssey #turkseed',
+        sourceTitle: 'The Driftwood #lynxseed',
         date: '2026-10-12T00:13:53Z',
       },
       {
@@ -303,13 +325,34 @@ describe('marking a download failed', () => {
     const grabbed = await describeChange({
       kind: 'markFailed',
       title: MOVIE,
-      name: 'The Odyssey',
+      name: 'The Driftwood',
       reason: 'A fake.',
     });
-    assert.match(text(grabbed), /Blocklists "The Odyssey #turkseed"/);
+    assert.match(text(grabbed), /Blocklists "The Driftwood #lynxseed"/);
     assert.match(text(grabbed), /The file on disk stays/);
     await applyChange(grabbed);
     assert.deepEqual(calls, ['failed 32776']);
+  });
+
+  it('removes only the title’s own downloads, whatever the queue holds by then', async () => {
+    queue = [{ id: 61, title: 'Static.Garden.S01E01', seriesId: SERIES.arrId }];
+    const proposed = await describeChange({
+      kind: 'markFailed',
+      title: SERIES,
+      name: 'Static Garden',
+      reason: 'A fake.',
+    });
+    assert.deepEqual(proposed.params.queueIds, [61]);
+    // By approval, the same queue id belongs to another series.
+    queue = [{ id: 61, title: 'Harbour.Lights.S02E04', seriesId: 78 }];
+    assert.match(
+      await applyChange(proposed),
+      /^Nothing was marked: it had already left the queue/
+    );
+    assert.deepEqual(calls, []);
+    queue = [{ id: 61, title: 'Static.Garden.S01E01', seriesId: SERIES.arrId }];
+    await applyChange(proposed);
+    assert.deepEqual(calls, ['remove 61']);
   });
 
   it('turns it down for a series with nothing downloading', async () => {
@@ -330,12 +373,12 @@ describe('changing the quality profile', () => {
     const change = await describeChange({
       kind: 'changeProfile',
       title: MOVIE,
-      name: 'The Odyssey',
+      name: 'The Driftwood',
       profile: 'ultra-hd',
       search: true,
       reason: 'They want 4K.',
     });
-    assert.equal(change.headline, 'Move The Odyssey to the Ultra-HD profile');
+    assert.equal(change.headline, 'Move The Driftwood to the Ultra-HD profile');
     assert.match(text(change), /from HD-1080p to Ultra-HD/);
     assert.match(
       await applyChange(change),
@@ -374,11 +417,11 @@ describe('changing the quality profile', () => {
       describeChange({
         kind: 'changeProfile',
         title: MOVIE,
-        name: 'The Odyssey',
+        name: 'The Driftwood',
         profile: 'HD-1080p',
         reason: 'x',
       }),
-      /The Odyssey already uses HD-1080p/
+      /The Driftwood already uses HD-1080p/
     );
   });
 });
@@ -387,10 +430,10 @@ describe('release groups', () => {
   it('turns down blocking a group twice, or unblocking one that is not', async () => {
     getSettings().backfill = {
       ...getSettings().backfill,
-      blockedGroups: ['rothebehap'],
+      blockedGroups: ['quillowsap'],
     };
     await assert.rejects(
-      describeChange({ kind: 'blockGroup', group: 'ROTHEBEHAP', reason: 'x' }),
+      describeChange({ kind: 'blockGroup', group: 'QUILLOWSAP', reason: 'x' }),
       /already blocked/
     );
     await assert.rejects(
@@ -403,7 +446,7 @@ describe('release groups', () => {
     );
     const change = await describeChange({
       kind: 'blockGroup',
-      group: 'turkseed',
+      group: 'lynxseed',
       reason: 'Fakes.',
     });
     assert.match(text(change), /Radarr and Sonarr reject them too/);
@@ -411,5 +454,126 @@ describe('release groups', () => {
       text(change),
       /replaces the file only once that one has imported/
     );
+  });
+});
+
+describe('replacing a whole season', () => {
+  const offered = (
+    guid: string,
+    indexerId: number,
+    title: string,
+    over: Partial<ArrRelease> = {}
+  ): ArrRelease => ({
+    guid,
+    indexerId,
+    indexer: `Indexer ${indexerId}`,
+    title,
+    downloadAllowed: true,
+    rejected: false,
+    ...over,
+  });
+  const PACK = 'Static.Garden.S01.1080p-NEWGRP';
+  const pack = (guid: string, indexerId: number, title = PACK) =>
+    offered(guid, indexerId, title, { fullSeason: true, seasonNumber: 1 });
+  const single = (guid: string, episodeId: number, n: number) =>
+    offered(guid, 1, `Static.Garden.S01E0${n}.1080p-EPGRP`, {
+      mappedEpisodeInfo: [{ id: episodeId }],
+    });
+  /** The change as stored with the run and read back. */
+  const stored = (change: ProposedChange): ProposedChange =>
+    JSON.parse(JSON.stringify(change));
+
+  it('takes only the season pack shown, never one of the same name from another indexer', async () => {
+    seasonReleases = [pack('g-harbour', 1)];
+    const change = stored(
+      await describeSeasonReplace(SERIES, 1, 'The season is bad.')
+    );
+    assert.match(text(change), new RegExp(`"${PACK}" from Indexer 1`));
+    assert.deepEqual(calls, []);
+
+    seasonReleases = [
+      pack('g-lantern', 2, 'Static Garden S01 1080p NEWGRP'),
+      pack('g-harbour', 1),
+    ];
+    const outcome = await applySeasonChange(change);
+    assert.equal(outcome.ok, true, outcome.message);
+    assert.deepEqual(calls, [
+      'grab g-harbour 1',
+      'delete episode file 100',
+      'delete episode file 101',
+    ]);
+  });
+
+  it('grabs and removes nothing when the season pack shown is no longer offered', async () => {
+    seasonReleases = [pack('g-harbour', 1)];
+    const change = stored(await describeSeasonReplace(SERIES, 1, 'Bad.'));
+
+    for (const now of [
+      [pack('g-lantern', 2, 'Static Garden S01 1080p NEWGRP')],
+      [pack('g-other', 3, 'Static.Garden.S01.2160p-OTHERGRP')],
+      [pack('g-harbour', 4)],
+      [],
+    ]) {
+      seasonReleases = now;
+      const outcome = await applySeasonChange(change);
+      assert.equal(outcome.ok, false);
+      assert.match(outcome.message, /approved release is no longer offered/);
+    }
+    assert.deepEqual(calls, []);
+  });
+
+  it('takes only the per-episode releases shown, even when a season pack turns up', async () => {
+    seasonReleases = [single('g-e1', 1, 1), single('g-e2', 2, 2)];
+    episodeReleases = { 3: [single('g-e3', 3, 3)] };
+    const change = stored(await describeSeasonReplace(SERIES, 1, 'Bad.'));
+    assert.match(text(change), /S01E03: downloads/);
+
+    // A pack now leads the listing, and episode 3 is only found by its own
+    // search.
+    seasonReleases = [
+      pack('g-other', 3, 'Static.Garden.S01.2160p-OTHERGRP'),
+      single('g-e1', 1, 1),
+      single('g-e2', 2, 2),
+    ];
+    const outcome = await applySeasonChange(change);
+    assert.equal(outcome.ok, true, outcome.message);
+    assert.deepEqual(calls, [
+      'grab g-e1 1',
+      'grab g-e2 1',
+      'grab g-e3 1',
+      'delete episode file 100',
+      'delete episode file 101',
+    ]);
+  });
+
+  it('grabs and removes nothing when one of the per-episode releases shown is gone', async () => {
+    seasonReleases = [single('g-e1', 1, 1), single('g-e2', 2, 2)];
+    episodeReleases = { 3: [single('g-e3', 3, 3)] };
+    const change = stored(await describeSeasonReplace(SERIES, 1, 'Bad.'));
+
+    seasonReleases = [
+      pack('g-other', 3, 'Static.Garden.S01.2160p-OTHERGRP'),
+      single('g-e1', 1, 1),
+      single('g-e2', 2, 2),
+    ];
+    episodeReleases = { 3: [single('g-e3-new', 3, 3)] };
+    const outcome = await applySeasonChange(change);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.message, /approved release is no longer offered/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('grabs and removes nothing for an approval that does not name its releases', async () => {
+    seasonReleases = [pack('g-harbour', 1)];
+    const outcome = await applySeasonChange({
+      kind: 'replaceSeason',
+      headline: 'Replace season 1 of Static Garden',
+      details: [],
+      title: SERIES,
+      params: { season: 1, prefer: PACK },
+    });
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.message, /does not name the releases to take/);
+    assert.deepEqual(calls, []);
   });
 });

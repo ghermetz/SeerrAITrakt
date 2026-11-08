@@ -4,22 +4,20 @@ import { backfillEvent } from '@server/lib/notifications/eventTitles';
 import logger from '@server/logger';
 
 /*
- * Backfill and the admin agent tell admins what happened, gathered: a
- * notice waits until things have been quiet for a while (or for at most
- * `longestMs` after the first), and then everything since goes out as one,
- * grouped by title. Ten episodes of one show finishing in a minute are one
- * notification, not ten.
+ * Batches Backfill and admin agent notices to admins: a notice waits until
+ * things are quiet for a while (at most `longestMs` after the first), then
+ * everything since goes out as one, grouped by title. Ten episodes of one
+ * show finishing in a minute are one notification, not ten.
  *
- * Only what needs someone right now goes out at once: a question from the
- * agent.
+ * Only an agent question, which needs someone now, goes out at once.
  */
 
 export type NoticeKind =
   /** A download imported. */
   | 'finished'
-  /** A download failed, and nothing took its place. */
+  /** A download failed and nothing replaced it. */
   | 'failed'
-  /** A download failed, and another pack took its place on its own. */
+  /** A download failed and another pack replaced it automatically. */
   | 'replaced'
   /** A pack waits for an admin's approval. */
   | 'found'
@@ -28,15 +26,15 @@ export type NoticeKind =
 
 export interface Notice {
   kind: NoticeKind;
-  /** Backfill's title row, to group by and link to. */
+  /** Backfill title row, for grouping and links. */
   seriesId: number;
   title: string;
   poster?: string | null;
-  /** "S17E02", "the movie", or a pack's name: what it was about. */
+  /** What it was about: "S17E02", "the movie", or a pack name. */
   what: string;
-  /** Why, for a failure; what it did, for the agent. */
+  /** The failure reason, or the agent's action. */
   detail?: string;
-  /** Where the notice for this one alone would link. */
+  /** Link used when this is the only notice. */
   url: string;
 }
 
@@ -79,7 +77,7 @@ const byKind = (notices: Notice[]) => {
   );
 };
 
-/** What a batch of notices says, as one notification. */
+/** A batch of notices as one notification. */
 export const summarize = (notices: Notice[]): NotificationPayload => {
   const titles = [...new Set(notices.map((n) => n.seriesId))];
   const base = {
@@ -98,14 +96,16 @@ export const summarize = (notices: Notice[]): NotificationPayload => {
       actionUrlTitle: 'Open',
     };
   }
+  const waiting = notices.filter((n) => n.kind === 'found');
+  const kinds = byKind(notices);
   if (titles.length === 1) {
     const [first] = notices;
     return {
       ...base,
-      subject: `${first.title}: ${byKind(notices)
+      subject: `${first.title}: ${kinds
         .map(([kind, list]) => counted(kind, list.length))
         .join(', ')}`,
-      message: byKind(notices)
+      message: kinds
         .map(([kind, list]) => {
           const reasons =
             kind === 'failed'
@@ -120,7 +120,13 @@ export const summarize = (notices: Notice[]): NotificationPayload => {
         })
         .join('\n'),
       image: notices.find((n) => n.poster)?.poster ?? undefined,
-      actionUrl: `/backfill/series/${first.seriesId}`,
+      // One waiting pack links to itself; several to the title's review.
+      actionUrl:
+        waiting.length === 1
+          ? waiting[0].url
+          : waiting.length
+            ? `/backfill/series/${first.seriesId}#review`
+            : `/backfill/series/${first.seriesId}`,
       actionUrlTitle: 'Open',
     };
   }
@@ -132,13 +138,14 @@ export const summarize = (notices: Notice[]): NotificationPayload => {
   });
   return {
     ...base,
-    subject: `Backfill: ${byKind(notices)
+    subject: `Backfill: ${kinds
       .map(([kind, list]) => counted(kind, list.length))
       .join(', ')}`,
     message:
       perTitle.slice(0, 8).join('\n') +
       (perTitle.length > 8 ? `\n…and ${perTitle.length - 8} more titles` : ''),
-    actionUrl: '/backfill',
+    // Waiting packs link to Backfill's awaiting list.
+    actionUrl: waiting.length ? '/backfill#awaiting' : '/backfill',
     actionUrlTitle: 'Open Backfill',
   };
 };
@@ -148,8 +155,8 @@ class BackfillNotices {
   private firstAt = 0;
   private timer?: ReturnType<typeof setTimeout>;
   /**
-   * Sent once nothing new came for `quietMs`, and never later than
-   * `longestMs` after the first held notice.
+   * Sends after `quietMs` with nothing new, at most `longestMs` after the
+   * first held notice.
    */
   public timing = { quietMs: 10 * 60_000, longestMs: 30 * 60_000 };
 
@@ -166,7 +173,7 @@ class BackfillNotices {
     this.timer.unref?.();
   }
 
-  /** Sends what is held now, as when the server stops. */
+  /** Sends what is held now, e.g. on shutdown. */
   public flush(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
@@ -186,7 +193,7 @@ class BackfillNotices {
     }
   }
 
-  /** What is held, for tests. */
+  /** Held notices, for tests. */
   public held(): readonly Notice[] {
     return this.pending;
   }

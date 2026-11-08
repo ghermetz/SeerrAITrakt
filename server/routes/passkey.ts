@@ -10,6 +10,7 @@ import {
   takeChallenge,
 } from '@server/lib/passkeys';
 import { endSessions, maySignIn, startSession } from '@server/lib/signIn';
+import { SignInLimiter } from '@server/lib/signInLimiter';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
 import type {
@@ -25,20 +26,24 @@ import {
 import { Router } from 'express';
 
 /*
- * Signing in with a passkey instead of a Plex account. Anyone signed in can
- * add several (a phone, a computer, a security key), see them, rename them
- * and remove them. A passkey signs in the same person with the same
- * permissions; a Plex account still has to have access to the server.
+ * Passkey sign-in instead of a Plex account. Anyone signed in can add several
+ * (phone, computer, security key), list, rename and remove them. A passkey
+ * signs in the same person with the same permissions; a Plex account must still
+ * have server access.
  */
 
 const passkeyRoutes = Router();
+
+const limiter = new SignInLimiter('passkey', { capAccount: true });
 
 const toBase64Url = (bytes: Uint8Array) =>
   Buffer.from(bytes).toString('base64url');
 const fromBase64Url = (text: string) =>
   new Uint8Array(Buffer.from(text, 'base64url'));
 
-/** Stable per person, and not their email: a device keeps one passkey each. */
+/**
+ * Stable per person and not their email, so a device keeps one passkey each.
+ */
 const userHandle = (user: User) =>
   new Uint8Array(Buffer.from(`seerr-user-${user.id}`, 'utf8'));
 
@@ -72,7 +77,7 @@ passkeyRoutes.post(
         userName: user.email || user.displayName,
         userDisplayName: user.displayName,
         attestationType: 'none',
-        // A device that already has one is not offered a second.
+        // A device that already has one isn't offered a second.
         excludeCredentials: existing.map((passkey) => ({
           id: passkey.credentialId,
           transports: passkey.transports?.split(',').filter(Boolean),
@@ -204,8 +209,7 @@ passkeyRoutes.delete<{ id: string }>(
         userId: req.user?.id,
         passkeyId: Number(req.params.id),
       });
-      // Whoever has the device it was on is signed out with it; this
-      // session stays.
+      // Sign out whoever has the device it was on; this session stays.
       await endSessions(req.user?.id as number, req.sessionID);
       return res.status(204).send();
     } catch (e) {
@@ -217,8 +221,8 @@ passkeyRoutes.delete<{ id: string }>(
 passkeyRoutes.post('/login/options', async (req, res, next) => {
   try {
     const { rpID } = relyingParty(req);
-    // No list of credentials: the device offers whichever of its passkeys
-    // belong to this site, so nobody has to type who they are first.
+    // No credential list: the device offers its passkeys for this site, so
+    // nobody types who they are first.
     const options = await generateAuthenticationOptions({
       rpID,
       userVerification: 'required',
@@ -240,6 +244,10 @@ passkeyRoutes.post('/login', async (req, res, next) => {
       status: 400,
       message: 'Passkey sign-in expired. Try again.',
     });
+  }
+  const credentialId = body.response.id;
+  if (!limiter.take(req, res, credentialId)) {
+    return;
   }
 
   try {
@@ -272,7 +280,7 @@ passkeyRoutes.post('/login', async (req, res, next) => {
       requireUserVerification: true,
     });
 
-    // The device names who it signed in as; it has to be the passkey's owner.
+    // The device names who it signed in as; it must be the passkey's owner.
     const handle = body.response.response.userHandle;
     const handleMatches =
       !handle ||
@@ -307,6 +315,7 @@ passkeyRoutes.post('/login', async (req, res, next) => {
       where: { id: passkey.user.id },
     });
 
+    limiter.clear(req, credentialId);
     await startSession(req, user.id);
 
     logger.info('Signed in with a passkey', {

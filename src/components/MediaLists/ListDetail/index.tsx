@@ -5,6 +5,8 @@ import { PosterGridSkeleton } from '@app/components/Common/PageSkeleton';
 import PageTitle from '@app/components/Common/PageTitle';
 import ImportListModal from '@app/components/MediaLists/ImportListModal';
 import ListItemCard from '@app/components/MediaLists/ListItemCard';
+import PlaylistLinkModal from '@app/components/MediaLists/PlaylistLinkModal';
+import PlaylistSongs from '@app/components/MediaLists/PlaylistSongs';
 import Roulette from '@app/components/MediaLists/Roulette';
 import ShareListModal from '@app/components/MediaLists/ShareListModal';
 import type { ListItem, SeriesProgress } from '@app/hooks/useListDetail';
@@ -28,6 +30,7 @@ import {
   TrashIcon,
   UsersIcon,
 } from '@heroicons/react/24/outline';
+import type { PlaylistSongView } from '@server/lib/playlists/view';
 import axios from 'axios';
 import { useRouter } from 'next/router';
 import { useEffect, useState } from 'react';
@@ -35,6 +38,7 @@ import { useIntl } from 'react-intl';
 import useSWR from 'swr';
 
 const messages = defineMessages('components.MediaLists.ListDetail', {
+  searchingAgain: 'Searching again now',
   empty: 'Nothing here yet. Use Add to List on any movie or series.',
   share: 'Share',
   rename: 'Rename',
@@ -51,6 +55,8 @@ const messages = defineMessages('components.MediaLists.ListDetail', {
   sharedby: 'Shared by {name}',
   leavelist: 'Leave List',
   confirmleave: 'Leave this list? It will no longer appear in your lists.',
+  confirmunlink:
+    'Unlink this playlist? Its songs stay, but songs added to it from now on won’t come in.',
   markwatched: 'Mark as watched',
   unwatch: 'Mark as unwatched',
   towatch: 'To watch',
@@ -64,13 +70,13 @@ const messages = defineMessages('components.MediaLists.ListDetail', {
   'sort-release-asc': 'Oldest release',
   actionfailed: 'That did not work: {detail}',
   acceptprompt:
-    '{name} shared this list with you. If you accept, what you watch can be used to tell when everyone on it has finished a title, and when someone on it uses Pick for the Room. Leave the list to turn it down.',
+    '{name} shared this list with you. If you accept, your watch history is used for its watched sync and Pick for the Room.',
   accept: 'Accept',
   cannotcheck:
-    'Watch sync cannot see what {names} watched (no account on the media server), so it will not suggest removing anything from this list.',
+    'Watch sync can’t see what {names} watched (no media server account), so it won’t suggest removals.',
 });
 
-/** The order you last chose, on this device, for every list. */
+/** The last chosen sort, per device, shared by every list. */
 const SORT_KEY = 'list-sort';
 
 const ListDetail = () => {
@@ -87,11 +93,12 @@ const ListDetail = () => {
     rouletteCandidates,
   } = useListDetail(router.query.listId as string);
 
-  // Each viewer's own position in the series here, from the server's watch
-  // history (Tautulli for Plex, Jellyfin or Emby themselves). Absent
-  // entries simply show nothing, so a slow or missing answer costs nothing.
+  // The viewer's series progress from watch history (Tautulli for Plex,
+  // else Jellyfin or Emby). Missing entries show nothing.
   const { data: progress } = useSWR<Record<number, SeriesProgress>>(
-    router.query.listId ? `/api/v1/list/${router.query.listId}/progress` : null
+    router.query.listId && data?.kind !== 'music'
+      ? `/api/v1/list/${router.query.listId}/progress`
+      : null
   );
 
   const [isSharing, setSharing] = useState(false);
@@ -107,8 +114,8 @@ const ListDetail = () => {
   >(null);
   const [sort, setSort] = useState<ListSort>(DEFAULT_LIST_SORT);
 
-  // Read after mounting: the server renders the default order, and storage
-  // can be unavailable (private browsing), in which case the default stays.
+  // Read after mount: the server renders the default order, and storage can
+  // be unavailable.
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(SORT_KEY);
@@ -125,7 +132,7 @@ const ListDetail = () => {
     try {
       window.localStorage.setItem(SORT_KEY, next);
     } catch {
-      // Still sorted for this visit.
+      // Not saved; still sorted for this visit.
     }
   };
 
@@ -134,7 +141,7 @@ const ListDetail = () => {
   }
 
   if (!data) {
-    // A list that was deleted, or that the viewer was taken off, is a 404.
+    // Deleted, or the viewer was removed from it: a 404.
     return (
       <ErrorPage
         statusCode={
@@ -144,8 +151,7 @@ const ListDetail = () => {
     );
   }
 
-  // Says what went wrong, and reloads the list so the page shows what is
-  // really saved rather than what was tried.
+  // Reports the error and reloads, so the page shows what is saved.
   const showFailure = (e: unknown) => {
     const detail =
       (axios.isAxiosError(e) && e.response?.data?.message) ||
@@ -182,6 +188,51 @@ const ListDetail = () => {
     }
   };
 
+  const isPlaylist = data.kind === 'music';
+
+  const unlinkPlaylist = async () => {
+    if (!window.confirm(intl.formatMessage(messages.confirmunlink))) {
+      return;
+    }
+    try {
+      await axios.delete(`/api/v1/list/${data.id}/link`);
+      mutate();
+    } catch (e) {
+      showFailure(e);
+    }
+  };
+
+  const removeSong = async (song: PlaylistSongView) => {
+    try {
+      await axios.delete(`/api/v1/list/${data.id}/song/${song.id}`);
+      mutate();
+    } catch (e) {
+      showFailure(e);
+    }
+  };
+
+  const searchAgain = async () => {
+    try {
+      await axios.post(`/api/v1/list/${data.id}/search-again`);
+      addToast(intl.formatMessage(messages.searchingAgain), {
+        appearance: 'success',
+        autoDismiss: true,
+      });
+      mutate();
+    } catch (e) {
+      showFailure(e);
+    }
+  };
+
+  const retrySong = async (song: PlaylistSongView) => {
+    try {
+      await axios.post(`/api/v1/list/${data.id}/song/${song.id}/retry`);
+      mutate();
+    } catch (e) {
+      showFailure(e);
+    }
+  };
+
   const renderItem = (item: ListItem) => (
     <ListItemCard
       item={item}
@@ -197,8 +248,8 @@ const ListDetail = () => {
     setRenaming(true);
   };
 
-  // autoFocus is discouraged for accessibility, but focusing a field the user
-  // just asked for is the expected behaviour — do it via the ref instead.
+  // Focus via ref, as autoFocus is discouraged for a11y; the user just asked
+  // for this field.
   const focusNameInput = (input: HTMLInputElement | null) => {
     if (input && document.activeElement !== input) {
       input.focus();
@@ -295,7 +346,14 @@ const ListDetail = () => {
           }}
         />
       )}
-      {isImporting && (
+      {isImporting && isPlaylist && (
+        <PlaylistLinkModal
+          listId={data.id}
+          onClose={() => setImporting(false)}
+          onLinked={() => mutate()}
+        />
+      )}
+      {isImporting && !isPlaylist && (
         <ImportListModal
           listId={data.id}
           onClose={() => setImporting(false)}
@@ -319,7 +377,7 @@ const ListDetail = () => {
           {isRenaming ? (
             <div className="mt-8 flex items-center space-x-2 md:mb-0">
               <input
-                className="min-w-0 flex-1 rounded border-gray-600 bg-gray-700 px-3 py-1 text-2xl font-bold leading-7 text-white sm:text-4xl sm:leading-9"
+                className="min-w-0 flex-1 rounded border-strong bg-field px-3 py-1 text-2xl font-bold leading-7 text-strong sm:text-4xl sm:leading-9"
                 disabled={isSavingName}
                 onChange={(e) => setDraftName(e.target.value)}
                 onKeyDown={(e) => {
@@ -350,7 +408,7 @@ const ListDetail = () => {
             <Header>{data.name}</Header>
           )}
           {!data.isOwner && (
-            <p className="mt-1 text-sm text-gray-400">
+            <p className="mt-1 text-sm text-muted">
               {intl.formatMessage(messages.sharedby, {
                 name: data.owner.displayName,
               })}
@@ -411,7 +469,18 @@ const ListDetail = () => {
         </Alert>
       )}
 
-      {data.items.length > 1 && (
+      {isPlaylist && data.playlist && (
+        <PlaylistSongs
+          playlist={data.playlist}
+          isOwner={data.isOwner}
+          onUnlink={unlinkPlaylist}
+          onRemove={removeSong}
+          onRetry={retrySong}
+          onSearchAgain={searchAgain}
+        />
+      )}
+
+      {!isPlaylist && data.items.length > 1 && (
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap gap-2">
             {(
@@ -433,7 +502,7 @@ const ListDetail = () => {
             ))}
           </div>
           <div className="flex">
-            <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-gray-100">
+            <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-surface px-3 text-gray-100">
               <BarsArrowDownIcon className="h-5 w-5" />
             </span>
             <select
@@ -458,11 +527,11 @@ const ListDetail = () => {
         </div>
       )}
 
-      {data.isOwner && (
-        <label className="mb-4 flex items-center space-x-2 text-xs text-gray-400 sm:text-sm">
+      {!isPlaylist && data.isOwner && (
+        <label className="mb-4 flex items-center space-x-2 text-xs text-muted sm:text-sm">
           <input
             checked={!!data.watchedSync}
-            className="h-4 w-4 flex-none rounded border-gray-600 bg-gray-700 text-indigo-600"
+            className="h-4 w-4 flex-none rounded border-strong bg-field text-indigo-600"
             disabled={isSavingWatchedSync}
             onChange={toggleWatchedSync}
             type="checkbox"
@@ -472,18 +541,21 @@ const ListDetail = () => {
           </span>
         </label>
       )}
-      {data.isOwner && data.watchedSync && !!data.cannotCheck?.length && (
-        <p className="-mt-2 mb-4 text-xs text-yellow-400 sm:text-sm">
-          {intl.formatMessage(messages.cannotcheck, {
-            names: intl.formatList(
-              data.cannotCheck.map((person) => person.displayName),
-              { type: 'conjunction' }
-            ),
-          })}
-        </p>
-      )}
+      {!isPlaylist &&
+        data.isOwner &&
+        data.watchedSync &&
+        !!data.cannotCheck?.length && (
+          <p className="-mt-2 mb-4 text-xs text-yellow-400 light:text-warning-text sm:text-sm">
+            {intl.formatMessage(messages.cannotcheck, {
+              names: intl.formatList(
+                data.cannotCheck.map((person) => person.displayName),
+                { type: 'conjunction' }
+              ),
+            })}
+          </p>
+        )}
 
-      {data.items.length ? (
+      {isPlaylist ? null : data.items.length ? (
         <>
           {unwatched.length > 0 && (
             <>
@@ -523,7 +595,7 @@ const ListDetail = () => {
           )}
         </>
       ) : (
-        <p className="text-gray-400">{intl.formatMessage(messages.empty)}</p>
+        <p className="text-muted">{intl.formatMessage(messages.empty)}</p>
       )}
     </>
   );

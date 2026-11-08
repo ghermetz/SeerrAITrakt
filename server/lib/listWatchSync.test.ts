@@ -1,5 +1,6 @@
 import TautulliAPI from '@server/api/tautulli';
 import { MediaStatus, MediaType } from '@server/constants/media';
+import { MediaServerType } from '@server/constants/server';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import {
@@ -17,9 +18,9 @@ import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
 /*
- * Watch sync suggests taking a title off a list once everyone on the list
- * has finished it, from Tautulli's history. Someone a list was shared with
- * is only asked about once they have accepted it.
+ * Watch sync suggests removing a title from a list once everyone on it has
+ * finished it, per Tautulli history. A share recipient counts only once they
+ * accept.
  */
 
 describe('watch sync', () => {
@@ -29,11 +30,11 @@ describe('watch sync', () => {
   let member: User;
   let list: MediaList;
   let item: MediaListItem;
-  /** Plex ids whose plays were asked for. */
+  /** Plex ids whose plays were requested. */
   let asked: number[];
-  /** Plex ids that have finished the film. */
+  /** Plex ids that finished the film. */
   let watchedBy: number[];
-  /** Runs while Tautulli is being asked, to change things meanwhile. */
+  /** Runs during the Tautulli call, to change things meanwhile. */
   let duringCheck: () => Promise<void>;
   let kept: ReturnType<typeof getSettings>['tautulli'];
 
@@ -68,6 +69,8 @@ describe('watch sync', () => {
     asked = [];
     watchedBy = [];
     duringCheck = async () => undefined;
+    // Tautulli is Plex's watch history, read while Plex is connected.
+    getSettings().main.mediaServerType = MediaServerType.PLEX;
     getSettings().tautulli = {
       hostname: 'tautulli.invalid',
       port: 8181,
@@ -170,8 +173,8 @@ describe('watch sync', () => {
       where: { id: list.id },
     });
 
-    // The owner renames the list while the check is running (kept at last
-    // week's time here, so only the check could move it).
+    // The owner renames the list mid-check (kept at last week's time, so only
+    // the check could move it).
     duringCheck = async () => {
       await getRepository(MediaList).update(list.id, {
         name: 'Renamed',

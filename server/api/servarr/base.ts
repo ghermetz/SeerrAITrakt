@@ -2,6 +2,7 @@ import ExternalAPI from '@server/api/externalapi';
 import type { AvailableCacheIds } from '@server/lib/cache';
 import cacheManager from '@server/lib/cache';
 import { getSettings, type DVRSettings } from '@server/lib/settings';
+import { hostRefusedMessage, refusedHost } from '@server/utils/hostRefused';
 
 export interface SystemStatus {
   version: string;
@@ -32,7 +33,7 @@ export interface SystemStatus {
   packageUpdateMechanism: string;
 }
 
-/** One problem Sonarr, Radarr or Prowlarr reports on its own health page. */
+/** One issue from a Sonarr, Radarr or Prowlarr health page. */
 export interface ServarrHealthIssue {
   source: string;
   type: 'ok' | 'notice' | 'warning' | 'error';
@@ -75,6 +76,25 @@ interface QueueItem {
 export interface Tag {
   id: number;
   label: string;
+}
+
+/** A download Radarr or Sonarr imported, from its history. */
+export interface ImportRecord {
+  /** History id; only increases. */
+  id: number;
+  date: string;
+  /** None for a manual import. */
+  downloadId?: string;
+  sourceTitle: string;
+  movieId?: number;
+  seriesId?: number;
+  episode?: {
+    id: number;
+    seasonNumber: number;
+    episodeNumber: number;
+    absoluteEpisodeNumber?: number;
+  };
+  data?: { size?: string };
 }
 
 const QUEUE_PAGE_SIZE = 250;
@@ -123,6 +143,23 @@ class ServarrBase<QueueItemAppendT> extends ExternalAPI {
     );
 
     this.apiName = apiName;
+    // Settings → Network → API Request Timeout as it is now, for requests
+    // that don't set their own.
+    this.axios.interceptors.request.use((config) => {
+      if (config.timeout === timeout) {
+        config.timeout = getSettings().network.apiRequestTimeout;
+      }
+      return config;
+    });
+    // Refused for the hostname used: say how to allow Seerr AI instead of
+    // "status code 400".
+    this.axios.interceptors.response.use(undefined, (e) => {
+      const host = refusedHost(e);
+      if (host !== undefined && e instanceof Error) {
+        e.message = hostRefusedMessage(apiName, host);
+      }
+      return Promise.reject(e);
+    });
   }
 
   public getSystemStatus = async (): Promise<SystemStatus> => {
@@ -172,32 +209,38 @@ class ServarrBase<QueueItemAppendT> extends ExternalAPI {
     }
   };
 
-  /** Root folders as they are now, free space included: never cached. */
+  /** Root folders with current free space; never cached. */
   public getRootFolderSpace = async (): Promise<RootFolder[]> => {
     const response = await this.axios.get<RootFolder[]>('/rootfolder');
     return response.data;
   };
 
   /**
-   * What the app itself says is wrong: indexers or download clients it
-   * cannot reach, missing root folders, failing imports and the like.
+   * The app's health issues: unreachable indexers or download clients,
+   * missing root folders, failing imports and the like.
    */
   public getHealth = async (): Promise<ServarrHealthIssue[]> => {
     const response = await this.axios.get<ServarrHealthIssue[]>('/health');
     return response.data ?? [];
   };
 
-  public getQueue = async (): Promise<(QueueItem & QueueItemAppendT)[]> => {
+  /**
+   * The whole download queue. `include` adds what each item is for: Sonarr
+   * episodes by default, or Lidarr albums and artists.
+   */
+  public getQueue = async (
+    include: Record<string, boolean> = { includeEpisode: true }
+  ): Promise<(QueueItem & QueueItemAppendT)[]> => {
     try {
-      // The queue comes in pages (10 items unless asked for more): every
-      // page, so a busy queue does not leave titles without progress.
+      // Read every page (10 items by default) so a busy queue doesn't leave
+      // titles without progress.
       const records: (QueueItem & QueueItemAppendT)[] = [];
       for (let page = 1; page <= QUEUE_MAX_PAGES; page++) {
         const response = await this.axios.get<QueueResponse<QueueItemAppendT>>(
           `/queue`,
           {
             params: {
-              includeEpisode: true,
+              ...include,
               page,
               pageSize: QUEUE_PAGE_SIZE,
             },
@@ -219,6 +262,48 @@ class ServarrBase<QueueItemAppendT> extends ExternalAPI {
         { cause: e }
       );
     }
+  };
+
+  /** Imports from downloads since a time; Sonarr has one record per episode. */
+  public getImportsSince = async (since: Date): Promise<ImportRecord[]> => {
+    const response = await this.axios.get<ImportRecord[]>('/history/since', {
+      params: {
+        date: since.toISOString(),
+        eventType: 'downloadFolderImported',
+        includeEpisode: true,
+      },
+    });
+    return Array.isArray(response.data) ? response.data : [];
+  };
+
+  /** Categories (or labels) this app files its downloads under. */
+  public getDownloadCategories = async (): Promise<string[]> => {
+    const response =
+      await this.axios.get<{ fields?: { name?: string; value?: unknown }[] }[]>(
+        '/downloadclient'
+      );
+    return (Array.isArray(response.data) ? response.data : []).flatMap(
+      (client) =>
+        (client.fields ?? [])
+          .filter((f) => /category$/i.test(f.name ?? ''))
+          .map((f) => f.value)
+          .filter((v): v is string => typeof v === 'string' && v !== '')
+    );
+  };
+
+  /** The addresses of the indexers this app has set up. */
+  public getIndexerUrls = async (): Promise<string[]> => {
+    const response =
+      await this.axios.get<{ fields?: { name?: string; value?: unknown }[] }[]>(
+        '/indexer'
+      );
+    return (Array.isArray(response.data) ? response.data : []).flatMap(
+      (indexer) =>
+        (indexer.fields ?? [])
+          .filter((f) => f.name === 'baseUrl')
+          .map((f) => f.value)
+          .filter((v): v is string => typeof v === 'string' && v !== '')
+    );
   };
 
   public getTags = async (): Promise<Tag[]> => {

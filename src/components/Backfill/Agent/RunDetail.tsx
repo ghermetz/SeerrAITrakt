@@ -1,33 +1,48 @@
 import ProposalCard from '@app/components/Backfill/Agent/ProposalCard';
+import { changeMessages } from '@app/components/Backfill/Agent/changeMessages';
 import {
   RunMeta,
   RunStatusBadge,
   messages,
 } from '@app/components/Backfill/Agent/parts';
 import { runRefreshMs } from '@app/components/Backfill/Agent/refresh';
+import { toolMessages } from '@app/components/Backfill/Agent/toolMessages';
+import type { ChangeIcon } from '@app/components/Backfill/Agent/work';
+import {
+  changeIcon,
+  changeWords,
+  matchActions,
+  toolWords,
+} from '@app/components/Backfill/Agent/work';
 import Alert from '@app/components/Common/Alert';
 import Button from '@app/components/Common/Button';
 import ConfirmButton from '@app/components/Common/ConfirmButton';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import PageTitle from '@app/components/Common/PageTitle';
+import useScrollToHash from '@app/hooks/useScrollToHash';
 import ErrorPage from '@app/pages/_error';
 import defineMessages from '@app/utils/defineMessages';
 import {
+  AdjustmentsHorizontalIcon,
   ArrowDownIcon,
   ArrowDownTrayIcon,
+  ArrowPathRoundedSquareIcon,
   CheckBadgeIcon,
   ExclamationTriangleIcon,
   HandRaisedIcon,
   LinkIcon,
+  LockOpenIcon,
   NoSymbolIcon,
   PaperAirplaneIcon,
   PlusCircleIcon,
   QuestionMarkCircleIcon,
   SparklesIcon,
+  StopCircleIcon,
   TrashIcon,
   WrenchScrewdriverIcon,
+  XCircleIcon,
 } from '@heroicons/react/24/outline';
-import type { AgentStep } from '@server/entity/AgentRun';
+import type { AgentAction, AgentStep } from '@server/entity/AgentRun';
 import type { AgentRunDetail } from '@server/interfaces/api/agentInterfaces';
 import axios from 'axios';
 import Link from 'next/link';
@@ -36,7 +51,7 @@ import { useEffect, useRef, useState } from 'react';
 import { FormattedTime, useIntl } from 'react-intl';
 import useSWR from 'swr';
 
-/** How close to the bottom still counts as following the conversation. */
+/** Distance from the bottom that still counts as following the conversation. */
 const NEAR_BOTTOM_PX = 80;
 
 const runMessages = defineMessages('components.Backfill.Agent.Run', {
@@ -45,13 +60,19 @@ const runMessages = defineMessages('components.Backfill.Agent.Run', {
   changes: 'What it changed',
   openDownload: 'Open download',
   openTitle: 'Open in Backfill',
+  openPage: 'Open its page',
   worked: 'Worked: {count, plural, one {# step} other {# steps}} · {tools}',
   showResult: 'What it saw',
   tokens: '{input} tokens read, {output} written',
   untitled: 'Admin agent',
   started: 'Backfill came up empty for {title}, so it looked further.',
   question: 'It needs your answer',
-  replyPlaceholder: 'Correct it or ask for more: “check it is English first”',
+  replyPlaceholder: 'Correct it or ask for more…',
+  workingPlaceholder: 'Correct it while it works…',
+  waitingToRead: 'It reads this before its next step.',
+  stop: 'Stop',
+  stopping: 'Stopping…',
+  stopFailed: 'It could not be stopped.',
   answerPlaceholder: 'Answer its question…',
   send: 'Send',
   sending: 'Sending…',
@@ -68,7 +89,14 @@ const runMessages = defineMessages('components.Backfill.Agent.Run', {
 });
 
 type Entry =
-  | { type: 'admin'; at: string; text: string; who?: string }
+  | {
+      type: 'admin';
+      at: string;
+      text: string;
+      who?: string;
+      /** Sent by Backfill: a download the agent started failed. */
+      backfill?: boolean;
+    }
   | {
       type: 'agent';
       at: string;
@@ -77,11 +105,12 @@ type Entry =
       proposal?: boolean;
     }
   | { type: 'work'; at: string; steps: AgentStep[] }
-  | { type: 'action'; at: string; text: string };
+  | { type: 'action'; at: string; text: string; action?: AgentAction };
 
-/** The steps as a conversation: who said what, and the work in between. */
+/** Groups a run's steps into conversation entries. */
 const conversationOf = (run: AgentRunDetail): Entry[] => {
   const entries: Entry[] = [];
+  const actionFor = matchActions(run.actions);
   if (run.ask) {
     entries.push({
       type: 'admin',
@@ -103,6 +132,14 @@ const conversationOf = (run: AgentRunDetail): Entry[] => {
         });
         break;
       }
+      case 'followUp':
+        entries.push({
+          type: 'admin',
+          at: step.at,
+          text: step.text,
+          backfill: true,
+        });
+        break;
       case 'say':
         entries.push({ type: 'agent', at: step.at, text: step.text });
         break;
@@ -123,7 +160,12 @@ const conversationOf = (run: AgentRunDetail): Entry[] => {
         });
         break;
       case 'action':
-        entries.push({ type: 'action', at: step.at, text: step.text });
+        entries.push({
+          type: 'action',
+          at: step.at,
+          text: step.text,
+          action: actionFor(step.text),
+        });
         break;
       default:
         if (last?.type === 'work') {
@@ -136,23 +178,51 @@ const conversationOf = (run: AgentRunDetail): Entry[] => {
   return entries;
 };
 
+const CHANGE_ICONS: Record<ChangeIcon, typeof TrashIcon> = {
+  download: ArrowDownTrayIcon,
+  request: PlusCircleIcon,
+  stop: StopCircleIcon,
+  link: LinkIcon,
+  delete: TrashIcon,
+  block: NoSymbolIcon,
+  unblock: LockOpenIcon,
+  failed: XCircleIcon,
+  profile: AdjustmentsHorizontalIcon,
+  replace: ArrowPathRoundedSquareIcon,
+  done: CheckBadgeIcon,
+};
+
+const changeColour = (icon: ChangeIcon): string =>
+  icon === 'stop'
+    ? 'text-gray-300'
+    : icon === 'delete'
+      ? 'text-red-200 light:text-danger-text'
+      : 'text-green-200 light:text-success-text';
+
 const WorkStep = ({ step }: { step: AgentStep }) => {
   const intl = useIntl();
   if (step.kind === 'tool') {
+    const words = intl.formatMessage(toolMessages[toolWords(step.tool)]);
+    // Plain words first; the raw call in small print below.
     return (
       <div className="flex gap-2">
         <WrenchScrewdriverIcon className="mt-0.5 h-4 w-4 flex-none text-gray-500" />
-        <code className="min-w-0 break-all text-xs leading-5 text-gray-400">
-          {step.text}
-        </code>
+        <div className="min-w-0">
+          <p className="text-xs leading-5 text-gray-300">
+            {words.charAt(0).toLocaleUpperCase(intl.locale) + words.slice(1)}
+          </p>
+          <code className="block break-all text-[11px] leading-4 text-gray-500">
+            {step.text}
+          </code>
+        </div>
       </div>
     );
   }
   if (step.kind === 'error') {
     return (
       <div className="flex gap-2 pl-6">
-        <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 flex-none text-yellow-400" />
-        <p className="whitespace-pre-wrap text-xs leading-5 text-yellow-200">
+        <ExclamationTriangleIcon className="mt-0.5 h-4 w-4 flex-none text-yellow-400 light:text-warning-text" />
+        <p className="whitespace-pre-wrap text-xs leading-5 text-yellow-200 light:text-warning-text">
           {step.text}
         </p>
       </div>
@@ -163,9 +233,9 @@ const WorkStep = ({ step }: { step: AgentStep }) => {
   return (
     <details className="group/result ml-6 rounded-md bg-gray-900/60 ring-1 ring-gray-700">
       <summary className="flex cursor-pointer list-none items-start gap-2 px-3 py-1.5 text-xs text-gray-300 marker:hidden">
-        <span className="min-w-0 flex-1 truncate">{first}</span>
+        <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{first}</span>
         {more && (
-          <span className="flex-none text-indigo-300 group-open/result:hidden">
+          <span className="flex-none text-indigo-300 group-open/result:hidden light:text-accent-text">
             {intl.formatMessage(runMessages.showResult)}
           </span>
         )}
@@ -190,9 +260,21 @@ const EntryView = ({ entry }: { entry: Entry }) => {
   if (entry.type === 'admin') {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[85%] rounded-2xl rounded-br-sm bg-indigo-600 px-4 py-2.5 text-white shadow">
-          <div className="mb-0.5 flex items-center justify-between gap-3 text-[11px] text-indigo-200">
-            <span>{entry.who ?? intl.formatMessage(runMessages.you)}</span>
+        <div
+          className={`max-w-[85%] rounded-2xl rounded-br-sm px-4 py-2.5 text-strong shadow ${
+            entry.backfill ? 'bg-gray-600' : 'bg-indigo-600'
+          }`}
+        >
+          <div
+            className={`mb-0.5 flex items-center justify-between gap-3 text-[11px] ${
+              entry.backfill ? 'text-gray-300' : 'text-indigo-200'
+            }`}
+          >
+            <span>
+              {entry.backfill
+                ? intl.formatMessage(runMessages.backfill)
+                : (entry.who ?? intl.formatMessage(runMessages.you))}
+            </span>
             <Time at={entry.at} />
           </div>
           <p className="whitespace-pre-wrap break-words text-sm">
@@ -215,11 +297,11 @@ const EntryView = ({ entry }: { entry: Entry }) => {
           <div className="mb-0.5 flex items-center justify-between gap-3 text-[11px] text-gray-400">
             <span className="flex items-center gap-1">
               {entry.proposal ? (
-                <HandRaisedIcon className="h-3.5 w-3.5 text-yellow-300" />
+                <HandRaisedIcon className="h-3.5 w-3.5 text-yellow-300 light:text-warning-text" />
               ) : entry.question ? (
-                <QuestionMarkCircleIcon className="h-3.5 w-3.5 text-yellow-300" />
+                <QuestionMarkCircleIcon className="h-3.5 w-3.5 text-yellow-300 light:text-warning-text" />
               ) : (
-                <SparklesIcon className="h-3.5 w-3.5 text-indigo-300" />
+                <SparklesIcon className="h-3.5 w-3.5 text-indigo-300 light:text-accent-text" />
               )}
               {intl.formatMessage(
                 entry.proposal
@@ -239,26 +321,39 @@ const EntryView = ({ entry }: { entry: Entry }) => {
     );
   }
   if (entry.type === 'action') {
+    // Short form; the full change is under What it changed. Entries without
+    // a kind keep their recorded text.
+    const icon = entry.action ? changeIcon(entry.action) : 'done';
+    const Icon = CHANGE_ICONS[icon];
     return (
-      <div className="flex items-start gap-2 px-1 text-sm font-medium text-green-200">
-        <ArrowDownTrayIcon className="mt-0.5 h-4 w-4 flex-none text-green-400" />
-        <span className="min-w-0 break-words">{entry.text}</span>
+      <div
+        className={`flex items-start gap-2 px-1 text-sm font-medium ${changeColour(icon)}`}
+      >
+        <Icon className="mt-0.5 h-4 w-4 flex-none" />
+        <span className="min-w-0 break-words">
+          {entry.action
+            ? intl.formatMessage(changeMessages[changeWords(entry.action)])
+            : entry.text}
+        </span>
       </div>
     );
   }
-  const tools = [
-    ...new Set(
-      entry.steps.filter((s) => s.kind === 'tool').map((s) => s.tool ?? '')
-    ),
-  ]
-    .filter(Boolean)
-    .join(', ');
+  const tools = intl.formatList(
+    [
+      ...new Set(
+        entry.steps.filter((s) => s.kind === 'tool').map((s) => s.tool ?? '')
+      ),
+    ]
+      .filter(Boolean)
+      .map((tool) => intl.formatMessage(toolMessages[toolWords(tool)])),
+    { type: 'conjunction' }
+  );
   const calls = entry.steps.filter((s) => s.kind === 'tool').length;
   return (
     <details className="rounded-lg bg-gray-800/60 px-3 py-1.5 ring-1 ring-gray-700">
-      <summary className="flex cursor-pointer list-none items-center gap-2 text-xs text-gray-400 marker:hidden">
-        <WrenchScrewdriverIcon className="h-4 w-4 flex-none" />
-        <span className="min-w-0 flex-1 truncate">
+      <summary className="flex cursor-pointer list-none items-start gap-2 text-xs leading-5 text-gray-400 marker:hidden">
+        <WrenchScrewdriverIcon className="mt-0.5 h-4 w-4 flex-none" />
+        <span className="min-w-0 flex-1">
           {intl.formatMessage(runMessages.worked, { count: calls, tools })}
         </span>
       </summary>
@@ -271,17 +366,27 @@ const EntryView = ({ entry }: { entry: Entry }) => {
   );
 };
 
-/** A conversation with the admin agent: what it was told, did and said. */
+/** One admin agent run shown as a conversation. */
 const RunDetail = () => {
   const intl = useIntl();
   const router = useRouter();
   const id = Number(router.query.runId);
   const [text, setText] = useState('');
+  // Auto-grow the reply box up to its max height.
+  const replyBox = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const box = replyBox.current;
+    if (!box) return;
+    box.style.height = 'auto';
+    box.style.height = `${box.scrollHeight + box.offsetHeight - box.clientHeight}px`;
+  }, [text]);
   const [sending, setSending] = useState(false);
   const [failed, setFailed] = useState<string>();
-  // The conversation scrolls inside its own box. It follows the newest
-  // message while the admin is at the bottom, and stays put once they
-  // scroll up to read, offering a way back down instead.
+  // Messages sent while it works, shown until a reply step picks them up.
+  const [pending, setPending] = useState<string[]>([]);
+  const [stopping, setStopping] = useState(false);
+  // Follow new messages while scrolled to the bottom; otherwise stay put and
+  // flag unseen ones.
   const log = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const [unseen, setUnseen] = useState(false);
@@ -309,6 +414,13 @@ const RunDetail = () => {
       setUnseen(true);
     }
   }, [count, status]);
+  // Clear Stop and pending messages once the run ends.
+  useEffect(() => {
+    if (status !== 'running' && status !== 'queued') {
+      setStopping(false);
+      setPending([]);
+    }
+  }, [status]);
   const onScroll = () => {
     const box = log.current;
     if (!box) return;
@@ -317,20 +429,29 @@ const RunDetail = () => {
     if (pinned.current) setUnseen(false);
   };
 
+  // Notifications link to #review or #answer; scroll once rendered.
+  useScrollToHash(!!data);
+
   if (error && !data) return <ErrorPage statusCode={404} />;
   if (!data) return <LoadingSpinner />;
   const working = data.status === 'running' || data.status === 'queued';
   const entries = conversationOf(data);
+  const read = new Set(
+    data.steps
+      .filter((step) => step.kind === 'reply')
+      .map((step) => step.text.slice(step.text.indexOf(': ') + 2))
+  );
+  const unread = working ? pending.filter((note) => !read.has(note)) : [];
 
   const send = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!text.trim() || sending || working) return;
+    if (!text.trim() || sending || stopping) return;
     setSending(true);
     setFailed(undefined);
+    const said = text.trim();
     try {
-      await axios.post(`/api/v1/agent/${data.id}/reply`, {
-        text: text.trim(),
-      });
+      await axios.post(`/api/v1/agent/${data.id}/reply`, { text: said });
+      if (working) setPending((before) => [...before, said]);
       setText('');
       pinned.current = true;
       await mutate();
@@ -343,6 +464,24 @@ const RunDetail = () => {
     } finally {
       setSending(false);
     }
+  };
+
+  const stop = async () => {
+    if (stopping) return;
+    setStopping(true);
+    setFailed(undefined);
+    try {
+      await axios.post(`/api/v1/agent/${data.id}/stop`);
+      setPending([]);
+    } catch (err) {
+      setStopping(false);
+      setFailed(
+        axios.isAxiosError(err) && err.response?.data?.message
+          ? String(err.response.data.message)
+          : intl.formatMessage(runMessages.stopFailed)
+      );
+    }
+    await mutate();
   };
 
   const decide = async (approve: boolean) => {
@@ -362,7 +501,6 @@ const RunDetail = () => {
           : intl.formatMessage(runMessages.decideFailed)
       );
     } finally {
-      // Whatever happened, show where it stands now.
       await mutate();
       setSending(false);
     }
@@ -402,8 +540,8 @@ const RunDetail = () => {
       </div>
       <div className="mt-3 flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
         <div className="min-w-0">
-          <h1 className="flex items-start gap-2 text-2xl font-bold text-white sm:text-3xl">
-            <SparklesIcon className="mt-1 h-6 w-6 flex-none text-indigo-300 sm:h-7 sm:w-7" />
+          <h1 className="flex items-start gap-2 text-2xl font-bold text-strong sm:text-3xl">
+            <SparklesIcon className="mt-1 h-6 w-6 flex-none text-indigo-300 light:text-accent-text sm:h-7 sm:w-7" />
             <span className="min-w-0 break-words">
               {data.title ?? intl.formatMessage(runMessages.untitled)}
             </span>
@@ -414,6 +552,17 @@ const RunDetail = () => {
           </div>
         </div>
         <div className="flex flex-none gap-2">
+          {data.titlePage && (
+            <Link href={data.titlePage} passHref legacyBehavior>
+              <Button
+                as="a"
+                buttonType="default"
+                className="flex-1 sm:flex-none"
+              >
+                {intl.formatMessage(runMessages.openPage)}
+              </Button>
+            </Link>
+          )}
           {data.backfillId && (
             <Link
               href={`/backfill/series/${data.backfillId}`}
@@ -428,6 +577,21 @@ const RunDetail = () => {
                 {intl.formatMessage(runMessages.openTitle)}
               </Button>
             </Link>
+          )}
+          {working && (
+            <Button
+              buttonType="danger"
+              onClick={() => void stop()}
+              disabled={stopping}
+              className="flex-1 sm:flex-none"
+            >
+              <StopCircleIcon />
+              <span>
+                {intl.formatMessage(
+                  stopping ? runMessages.stopping : runMessages.stop
+                )}
+              </span>
+            </Button>
           )}
           {!working && (
             <ConfirmButton
@@ -447,56 +611,61 @@ const RunDetail = () => {
           <div className="text-xs font-semibold uppercase tracking-wider text-gray-500">
             {intl.formatMessage(runMessages.changes)}
           </div>
-          <ul className="mt-2 max-h-28 space-y-2 overflow-y-auto overscroll-contain pr-1">
-            {data.actions.map((action, i) => (
-              <li
-                key={`${action.at}-${i}`}
-                className="flex flex-col gap-2 sm:flex-row sm:items-center"
-              >
-                <span
-                  className={`flex min-w-0 flex-1 items-start gap-2 text-sm ${
-                    action.type === 'stop' ? 'text-gray-300' : 'text-green-200'
-                  }`}
+          <ul className="mt-2 max-h-60 space-y-3 overflow-y-auto overscroll-contain pr-1 sm:max-h-40">
+            {data.actions.map((action, i) => {
+              const icon = changeIcon(action);
+              const Icon = CHANGE_ICONS[icon];
+              return (
+                <li
+                  key={`${action.at}-${i}`}
+                  className="flex flex-col items-start gap-1.5 sm:flex-row sm:items-center sm:gap-3"
                 >
-                  {action.type === 'grab' ? (
-                    <ArrowDownTrayIcon className="mt-0.5 h-4 w-4 flex-none" />
-                  ) : action.type === 'change' ? (
-                    <CheckBadgeIcon className="mt-0.5 h-4 w-4 flex-none" />
-                  ) : action.type === 'stop' ? (
-                    <NoSymbolIcon className="mt-0.5 h-4 w-4 flex-none" />
-                  ) : action.type === 'relink' ? (
-                    <LinkIcon className="mt-0.5 h-4 w-4 flex-none" />
-                  ) : (
-                    <PlusCircleIcon className="mt-0.5 h-4 w-4 flex-none" />
-                  )}
-                  <span className="min-w-0 break-words">{action.detail}</span>
-                </span>
-                {action.jobId && action.type === 'grab' && (
-                  <Link
-                    href={`/backfill/jobs/${action.jobId}`}
-                    passHref
-                    legacyBehavior
+                  <span
+                    className={`flex min-w-0 flex-1 items-start gap-2 text-sm ${changeColour(icon)}`}
                   >
-                    <Button as="a" buttonType="primary" buttonSize="sm">
-                      {intl.formatMessage(runMessages.openDownload)}
-                    </Button>
-                  </Link>
-                )}
-              </li>
-            ))}
+                    <Icon className="mt-0.5 h-4 w-4 flex-none" />
+                    <span className="min-w-0 break-words">{action.detail}</span>
+                  </span>
+                  {action.jobId && action.type === 'grab' && (
+                    <Link
+                      href={`/backfill/jobs/${action.jobId}`}
+                      passHref
+                      legacyBehavior
+                    >
+                      <Button
+                        as="a"
+                        buttonType="primary"
+                        buttonSize="sm"
+                        className="ml-6 flex-none sm:ml-0"
+                      >
+                        {intl.formatMessage(runMessages.openDownload)}
+                      </Button>
+                    </Link>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </section>
       )}
 
       {data.proposal && (
-        <ProposalCard
-          proposal={data.proposal}
-          busy={sending}
-          onDecide={(approve) => void decide(approve)}
-        />
+        <div
+          id="review"
+          className="scroll-mt-[calc(5rem+env(safe-area-inset-top))]"
+        >
+          <ProposalCard
+            proposal={data.proposal}
+            busy={sending}
+            onDecide={(approve) => void decide(approve)}
+          />
+        </div>
       )}
 
-      <section className="mt-4 rounded-lg bg-gray-800 ring-1 ring-gray-700">
+      <section
+        id="answer"
+        className="mt-4 scroll-mt-[calc(5rem+env(safe-area-inset-top))] rounded-lg bg-gray-800 ring-1 ring-gray-700"
+      >
         <div className="relative">
           <div
             ref={log}
@@ -513,8 +682,18 @@ const RunDetail = () => {
             {entries.map((entry, i) => (
               <EntryView key={`${entry.at}-${i}`} entry={entry} />
             ))}
+            {unread.map((note, i) => (
+              <div key={`pending-${i}`} className="flex justify-end">
+                <div className="max-w-[85%] rounded-2xl bg-accent/70 px-4 py-2 text-sm text-on-accent">
+                  <p className="whitespace-pre-wrap break-words">{note}</p>
+                  <p className="mt-1 text-[11px] opacity-80">
+                    {intl.formatMessage(runMessages.waitingToRead)}
+                  </p>
+                </div>
+              </div>
+            ))}
             {working && (
-              <div className="flex items-center gap-2 text-sm text-indigo-200">
+              <div className="flex items-center gap-2 text-sm text-indigo-200 light:text-accent-text">
                 <SparklesIcon className="h-4 w-4 animate-pulse" />
                 {intl.formatMessage(messages.working)}
               </div>
@@ -525,7 +704,7 @@ const RunDetail = () => {
             <button
               type="button"
               onClick={toBottom}
-              className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white shadow-lg ring-1 ring-indigo-400 hover:bg-indigo-500"
+              className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full bg-accent px-3 py-1.5 text-xs font-medium text-on-accent shadow-lg ring-1 ring-indigo-400 hover:bg-accent-hover"
             >
               <ArrowDownIcon className="h-3.5 w-3.5" />
               {intl.formatMessage(runMessages.newMessages)}
@@ -542,10 +721,11 @@ const RunDetail = () => {
             </label>
             <textarea
               id="agent-reply"
-              rows={2}
+              ref={replyBox}
+              rows={1}
               value={text}
               maxLength={1000}
-              disabled={working || sending}
+              disabled={sending || stopping}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
@@ -558,33 +738,43 @@ const RunDetail = () => {
                   ? runMessages.proposalPlaceholder
                   : data.status === 'waiting'
                     ? runMessages.answerPlaceholder
-                    : runMessages.replyPlaceholder
+                    : working
+                      ? runMessages.workingPlaceholder
+                      : runMessages.replyPlaceholder
               )}
-              className="min-h-[44px] min-w-0 flex-1 resize-y rounded-md border border-gray-500 bg-gray-700 px-3 py-2 text-sm text-white placeholder:text-gray-400 disabled:opacity-60"
+              className="block max-h-40 min-h-[44px] min-w-0 flex-1 resize-none rounded-md border border-field-border bg-field px-3 py-[11px] text-sm leading-5 text-strong placeholder:truncate placeholder:text-gray-400 disabled:opacity-60"
             />
+            {/* Icon only on phones. */}
             <Button
               buttonType="primary"
               type="submit"
-              disabled={working || sending || !text.trim()}
-              className="flex-none"
+              disabled={sending || stopping || !text.trim()}
+              className="h-11 flex-none"
+              aria-label={intl.formatMessage(
+                sending ? runMessages.sending : runMessages.send
+              )}
             >
               <PaperAirplaneIcon />
-              <span>
+              <span className="hidden sm:inline">
                 {intl.formatMessage(
                   sending ? runMessages.sending : runMessages.send
                 )}
               </span>
             </Button>
           </div>
-          {failed && <p className="text-sm text-red-300">{failed}</p>}
-          <p className="text-right text-[11px] text-gray-500">
-            {intl.formatMessage(runMessages.tokens, {
-              input: intl.formatNumber(data.inputTokens),
-              output: intl.formatNumber(data.outputTokens),
-            })}
-          </p>
+          {failed && (
+            <p className="text-sm text-red-300 light:text-danger-text">
+              {failed}
+            </p>
+          )}
         </form>
       </section>
+      <p className="mt-2 px-1 text-right text-[11px] text-gray-500">
+        {intl.formatMessage(runMessages.tokens, {
+          input: intl.formatNumber(data.inputTokens),
+          output: intl.formatNumber(data.outputTokens),
+        })}
+      </p>
     </>
   );
 };

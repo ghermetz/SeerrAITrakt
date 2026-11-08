@@ -5,11 +5,16 @@ export type AvailableCacheIds =
   | 'tmdbscan'
   | 'radarr'
   | 'sonarr'
+  | 'lidarr'
+  | 'musicbrainz'
+  | 'listenbrainz'
+  | 'applecharts'
   | 'rt'
   | 'imdb'
   | 'github'
   | 'plextv'
   | 'plexwatchlist'
+  | 'libraryaccess'
   | 'tvdb';
 
 const DEFAULT_TTL = 300;
@@ -18,16 +23,29 @@ const OBJECT_VALUE_SIZE = 80;
 const PROMISE_VALUE_SIZE = 80;
 const ARRAY_VALUE_SIZE = 40;
 
-// Limits key count, not memory, since TMDB never caps the credits rosters.
 const TMDB_MAX_KEYS = 1000;
 
-// Backstop against unbounded growth as the 15 minute TTL is what bounds this tier.
+// Backstop only; the 15 minute TTL bounds this tier.
 const TMDB_SCAN_MAX_KEYS = 2000;
 
-// Only the rolling quality profile, root folder and language profile lookups reach
-// these tiers, and keys are prefixed by server url, so this is a few keys per server.
+// Credits rosters are uncapped, so TMDB answers are also capped by their size
+// (as JSON); the least recently used go first.
+const TMDB_MAX_BYTES = 64 * 1024 * 1024;
+
+// Only profile, root folder and language lookups land here, keyed by server
+// url: a few keys per server.
 const RADARR_MAX_KEYS = 64;
 const SONARR_MAX_KEYS = 64;
+const LIDARR_MAX_KEYS = 64;
+
+// Viewed artists, albums and track lists. MusicMetadata keeps them longer;
+// this skips the database read.
+const MUSICBRAINZ_MAX_KEYS = 2000;
+
+// A few Discover rows, the same for everyone.
+const LISTENBRAINZ_MAX_KEYS = 32;
+/** Two charts (songs, albums) for a country or two. */
+const APPLE_CHARTS_MAX_KEYS = 8;
 
 // One key per searched title, each holding twenty search hits.
 const RT_MAX_KEYS = 500;
@@ -38,14 +56,17 @@ const IMDB_MAX_KEYS = 500;
 // Releases and commits, varying only by page size and branch.
 const GITHUB_MAX_KEYS = 16;
 
-// Watchlist item metadata, shared between users as the token is not part of the key.
+// Watchlist item metadata; the token isn't in the key, so users share entries.
 const PLEX_TV_MAX_KEYS = 5000;
 
 // Keyed by auth token, so one key per Plex linked user.
 const PLEX_WATCHLIST_MAX_KEYS = 500;
 
-// Several keys per show, holding the largest payloads of any tier as the extended
-// series lookup carries every episode.
+// One key per person and media server (lib/libraryVisibility).
+const LIBRARY_ACCESS_MAX_KEYS = 2000;
+
+// Several keys per show; the largest payloads, as the extended series lookup
+// carries every episode.
 const TVDB_MAX_KEYS = 500;
 
 export interface CacheStats {
@@ -94,6 +115,18 @@ const valueLength = (value: unknown): number => {
   return 0;
 };
 
+/** An answer's size as JSON, or as bytes for a buffer. */
+const bytesOf = (value: unknown): number => {
+  if (Buffer.isBuffer(value)) {
+    return value.length;
+  }
+  try {
+    return Math.max(1, JSON.stringify(value)?.length ?? 1);
+  } catch {
+    return 1;
+  }
+};
+
 interface LruEntry {
   value: unknown;
   ksize: number;
@@ -108,14 +141,26 @@ class LruCacheStore implements CacheStore {
   private ksize = 0;
   private vsize = 0;
 
-  constructor({ max, stdTtl }: { max: number; stdTtl: number }) {
+  constructor({
+    max,
+    maxBytes,
+    stdTtl,
+  }: {
+    max: number;
+    maxBytes?: number;
+    stdTtl: number;
+  }) {
     this.stdTtl = stdTtl;
     this.cache = new LRUCache<string, LruEntry>({
       max,
+      ...(maxBytes && {
+        maxSize: maxBytes,
+        sizeCalculation: (entry) => bytesOf(entry.value),
+      }),
       ttl: stdTtl * 1000,
-      // Without this, expired entries are only dropped when their key is read.
+      // Otherwise expired entries are dropped only when read.
       ttlAutopurge: true,
-      // Fires on every removal path, so one decrement here covers all of them.
+      // Runs on every removal path.
       dispose: (entry) => {
         this.ksize -= entry.ksize;
         this.vsize -= entry.vsize;
@@ -123,8 +168,7 @@ class LruCacheStore implements CacheStore {
     });
   }
 
-  // Cloned on read because callers mutate what they get back, as getTvSeason
-  // does when it rewrites still_path in place.
+  // Cloned because callers mutate results (getTvSeason rewrites still_path).
   public get<T>(key: string): T | undefined {
     const entry = this.cache.get(key);
 
@@ -147,6 +191,10 @@ class LruCacheStore implements CacheStore {
     // A ttl of 0 means the entry never expires.
     this.cache.set(key, entry, { ttl: (ttl ?? this.stdTtl) * 1000 });
 
+    // An answer larger than the whole size limit isn't kept.
+    if (this.cache.peek(key) !== entry) {
+      return false;
+    }
     this.ksize += entry.ksize;
     this.vsize += entry.vsize;
 
@@ -187,7 +235,7 @@ class LruCacheStore implements CacheStore {
   }
 }
 
-class Cache {
+export class Cache {
   public id: AvailableCacheIds;
   public data: CacheStore;
   public name: string;
@@ -195,13 +243,14 @@ class Cache {
   constructor(
     id: AvailableCacheIds,
     name: string,
-    options: { max: number; stdTtl?: number }
+    options: { max: number; maxBytes?: number; stdTtl?: number }
   ) {
     this.id = id;
     this.name = name;
 
     this.data = new LruCacheStore({
       max: options.max,
+      maxBytes: options.maxBytes,
       stdTtl: options.stdTtl ?? DEFAULT_TTL,
     });
   }
@@ -220,13 +269,28 @@ class CacheManager {
     tmdb: new Cache('tmdb', 'The Movie Database API', {
       stdTtl: 21600,
       max: TMDB_MAX_KEYS,
+      maxBytes: TMDB_MAX_BYTES,
     }),
     tmdbscan: new Cache('tmdbscan', 'The Movie Database API (Library Scans)', {
       stdTtl: 900,
       max: TMDB_SCAN_MAX_KEYS,
+      maxBytes: TMDB_MAX_BYTES,
     }),
     radarr: new Cache('radarr', 'Radarr API', { max: RADARR_MAX_KEYS }),
     sonarr: new Cache('sonarr', 'Sonarr API', { max: SONARR_MAX_KEYS }),
+    lidarr: new Cache('lidarr', 'Lidarr API', { max: LIDARR_MAX_KEYS }),
+    musicbrainz: new Cache('musicbrainz', 'MusicBrainz API', {
+      stdTtl: 21600,
+      max: MUSICBRAINZ_MAX_KEYS,
+    }),
+    listenbrainz: new Cache('listenbrainz', 'ListenBrainz API', {
+      stdTtl: 21600,
+      max: LISTENBRAINZ_MAX_KEYS,
+    }),
+    applecharts: new Cache('applecharts', 'Apple Music Charts', {
+      stdTtl: 21600,
+      max: APPLE_CHARTS_MAX_KEYS,
+    }),
     rt: new Cache('rt', 'Rotten Tomatoes API', {
       stdTtl: 43200,
       max: RT_MAX_KEYS,
@@ -245,6 +309,10 @@ class CacheManager {
     }),
     plexwatchlist: new Cache('plexwatchlist', 'Plex Watchlist', {
       max: PLEX_WATCHLIST_MAX_KEYS,
+    }),
+    libraryaccess: new Cache('libraryaccess', 'Library Access', {
+      stdTtl: 600,
+      max: LIBRARY_ACCESS_MAX_KEYS,
     }),
     tvdb: new Cache('tvdb', 'The TVDB API', {
       stdTtl: 21600,

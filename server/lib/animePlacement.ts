@@ -9,32 +9,34 @@ import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import {
-  hasAnimeProfile,
   judgeMovie,
   judgeSeries,
+  onWrongProfile,
 } from '@server/lib/animeCheck';
 import type { AnimeDecidedBy } from '@server/lib/animeDecision';
-import { decideAnime } from '@server/lib/animeDecision';
+import {
+  decideAnime,
+  detectAnime,
+  requestSeriesType,
+} from '@server/lib/animeDecision';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import type { AnimeSignals } from '@server/utils/isAnime';
-import { isAnime } from '@server/utils/isAnime';
 import { In } from 'typeorm';
 
 /*
- * A title's anime setting, set on its page by an admin, and where it sits in
- * Sonarr or Radarr against where that says it belongs. Saving the setting
- * puts it there: the anime or standard root folder (Sonarr or Radarr moves
- * the files), quality profile and, for a series, series type, the same
- * things Anime Check looks at.
+ * A title's anime setting (set by an admin on its page) and its Sonarr or
+ * Radarr placement against it. Saving the setting moves the title to match:
+ * root folder (Sonarr or Radarr moves the files), quality profile and, for a
+ * series, series type, the same things Anime Check looks at.
  */
 
-/** What would put a title where it belongs. Empty when it is there. */
+/** Changes that would put a title where it belongs; empty when it is there. */
 export interface AnimePlacementChanges {
   rootFolderPath?: string;
   qualityProfileId?: number;
-  /** The new quality profile's name, for showing; not sent. */
+  /** Display only; not sent. */
   qualityProfileName?: string;
   seriesType?: SeriesType;
 }
@@ -52,7 +54,7 @@ export interface AnimePlacementServer {
   path?: string;
   qualityProfile?: string;
   seriesType?: SeriesType;
-  /** What would put it where anime belongs, and where the rest does. */
+  /** Changes to place it as anime, and as not anime. */
   ifAnime: AnimePlacementChanges;
   ifNotAnime: AnimePlacementChanges;
   error?: string;
@@ -61,7 +63,7 @@ export interface AnimePlacementServer {
 export interface AnimePlacement {
   /** The title's own setting; null leaves it to rules and detection. */
   animeSetting: boolean | null;
-  /** What anime detection says, from TMDB. */
+  /** Detection result from TMDB. */
   detected: boolean;
   /** Whether Seerr treats the title as anime, and why. */
   anime: boolean;
@@ -100,11 +102,7 @@ export const seriesChanges = (
         ? server.seriesType
         : 'standard';
   }
-  // Other series may sit on any profile but the anime one.
-  if (
-    hasAnimeProfile(server) &&
-    anime !== (series.qualityProfileId === server.activeAnimeProfileId)
-  ) {
+  if (onWrongProfile(series.qualityProfileId, anime, server)) {
     changes.qualityProfileId = anime
       ? server.activeAnimeProfileId
       : server.activeProfileId;
@@ -131,13 +129,9 @@ export const movieChanges = (
   return changes;
 };
 
-/** The series type chosen on the title's newest request that has one. */
-const requestSeriesType = (media: Media, is4k: boolean) => {
-  const seriesType =
-    (media.requests ?? [])
-      .filter((r) => r.is4k === is4k && r.seriesType)
-      .sort((a, b) => b.id - a.id)[0]?.seriesType ?? null;
-  // A movie is only ever anime or not.
+/** The newest request's series type; a movie only takes anime or standard. */
+const requestTypeOf = (media: Media, is4k: boolean) => {
+  const seriesType = requestSeriesType(media.requests ?? [], is4k);
   return media.mediaType === MediaType.MOVIE &&
     seriesType !== 'anime' &&
     seriesType !== 'standard'
@@ -190,7 +184,7 @@ const placeOnServer = async (
   arrId: number,
   is4k: boolean
 ): Promise<AnimePlacementServer & { arrId: number }> => {
-  const requestType = requestSeriesType(media, is4k);
+  const requestType = requestTypeOf(media, is4k);
   const { anime, decidedBy } = decideAnime(
     details,
     requestType,
@@ -262,7 +256,7 @@ const place = async (media: Media) => {
     media.mediaType === MediaType.MOVIE
       ? await tmdb.getMovieForScan({ movieId: media.tmdbId })
       : await tmdb.getTvShowForScan({ tvId: media.tmdbId });
-  const requestType = requestSeriesType(media, false);
+  const requestType = requestTypeOf(media, false);
   const { anime, decidedBy } = decideAnime(
     details,
     requestType,
@@ -275,7 +269,7 @@ const place = async (media: Media) => {
   );
   return {
     animeSetting: media.animeSetting ?? null,
-    detected: isAnime(details),
+    detected: detectAnime(details),
     anime,
     decidedBy,
     automatic: decideAnime(details, requestType, null).anime,
@@ -283,7 +277,7 @@ const place = async (media: Media) => {
   };
 };
 
-/** The placement as the API gives it, without Sonarr's or Radarr's ids. */
+/** The placement for the API, without Sonarr or Radarr ids. */
 const withoutIds = (
   placement: Awaited<ReturnType<typeof place>>
 ): AnimePlacement => ({
@@ -307,10 +301,10 @@ export const getAnimePlacement = async (
 ): Promise<AnimePlacement> => withoutIds(await place(await loadMedia(mediaId)));
 
 /**
- * Sets a title's anime setting (null for automatic) and puts it where that
- * says it belongs on every Sonarr or Radarr server it is on. Anime or not
- * chosen on its requests that disagrees is cleared, so the setting decides.
- * Saving the same setting again puts it right if it has moved since.
+ * Sets a title's anime setting (null for automatic) and moves it to match on
+ * every Sonarr or Radarr server it is on. Clears disagreeing request series
+ * types so the setting decides. Saving the same setting again re-fixes a
+ * title that has since moved.
  */
 export const setAnimeSetting = async (
   mediaId: number,
@@ -318,9 +312,8 @@ export const setAnimeSetting = async (
 ): Promise<AnimePlacementResult> => {
   const found = await loadMedia(mediaId);
   await getRepository(Media).update(found.id, { animeSetting });
-  // The title's setting is now the decision: anime or not chosen on its
-  // requests that says otherwise gives way (lib/animeDecision). A rule's
-  // daily type for a title set as not anime agrees, so it stays.
+  // The setting decides (lib/animeDecision), so clear request types that
+  // disagree. A rule's daily type agrees with not anime, so it stays.
   if (animeSetting !== null) {
     const disagreeing = (found.requests ?? []).filter(
       (r) => r.seriesType && (r.seriesType === 'anime') !== animeSetting
@@ -337,7 +330,7 @@ export const setAnimeSetting = async (
   const before = await place(media);
   const applied: AnimePlacementResult['applied'] = [];
   for (const server of before.servers) {
-    // The profile's name is for showing; Sonarr and Radarr take its id.
+    // The name is display only; the API takes the id.
     const changes = { ...(server.anime ? server.ifAnime : server.ifNotAnime) };
     delete changes.qualityProfileName;
     if (server.error || !Object.keys(changes).length) {

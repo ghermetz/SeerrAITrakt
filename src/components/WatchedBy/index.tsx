@@ -16,10 +16,7 @@ const messages = defineMessages('components.WatchedBy', {
 
 const SHOWN = 4;
 
-/**
- * How long ago, in the unit a person would use: "yesterday", "3 weeks ago",
- * "7 months ago" — not "200 days ago".
- */
+/** Relative time in a natural unit: "yesterday", "3 weeks ago", not "200 days ago". */
 const sinceLastWatched = (
   iso: string
 ): {
@@ -41,9 +38,8 @@ const sinceLastWatched = (
 };
 
 /**
- * Who has watched this title and when last, from the server's watch
- * history (Tautulli for Plex, Jellyfin or Emby themselves), as a row in the
- * title's facts. Admins only. Nothing when there is no watch history.
+ * Admin-only facts row: who watched this title and when last (Tautulli for
+ * Plex, or Jellyfin/Emby). Nothing without watch history.
  */
 const WatchedBy = ({
   mediaId,
@@ -76,7 +72,7 @@ const WatchedBy = ({
         {data.people.length === 0
           ? intl.formatMessage(messages.nobody)
           : shown.map((person) => {
-              // Emby keeps no date for something marked watched by hand.
+              // Emby has no date for items marked watched by hand.
               const since = person.lastWatched
                 ? sinceLastWatched(person.lastWatched)
                 : undefined;
@@ -87,7 +83,7 @@ const WatchedBy = ({
                   className="mb-1 block last:mb-0"
                 >
                   <span className="block text-gray-200">{person.name}</span>
-                  <span className="block text-xs text-gray-400">
+                  <span className="block text-xs text-muted">
                     {counted &&
                       intl.formatMessage(
                         isShow ? messages.episodes : messages.plays,
@@ -108,7 +104,7 @@ const WatchedBy = ({
         {!expanded && data.people.length > SHOWN && (
           <button
             type="button"
-            className="block text-indigo-400 hover:text-indigo-300"
+            className="block text-accent-soft hover:text-indigo-300 light:text-accent-text light:hover:text-accent-text"
             onClick={() => setExpanded(true)}
           >
             {intl.formatMessage(messages.showAll, {

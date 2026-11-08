@@ -4,6 +4,7 @@ import PageTitle from '@app/components/Common/PageTitle';
 import type { SettingsRoute } from '@app/components/Common/SettingsTabs';
 import SettingsTabs from '@app/components/Common/SettingsTabs';
 import ProfileHeader from '@app/components/UserProfile/ProfileHeader';
+import useFeature from '@app/hooks/useFeature';
 import useSettings from '@app/hooks/useSettings';
 import { useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
@@ -18,11 +19,15 @@ import useSWR from 'swr';
 const messages = defineMessages('components.UserProfile.UserSettings', {
   menuGeneralSettings: 'General',
   menuFeatures: 'Features',
+  menuAppearance: 'Appearance',
   menuChangePass: 'Password',
   menuLinkedAccounts: 'Linked Accounts',
   menuPasskeys: 'Passkeys',
+  menuApiKeys: 'API Keys',
+  menuSiri: 'Siri',
   menuNotifications: 'Notifications',
   menuPermissions: 'Permissions',
+  menuLibraries: 'Libraries',
   unauthorizedDescription:
     "You do not have permission to modify this user's settings.",
 });
@@ -37,6 +42,7 @@ const UserSettings = ({ children }: UserSettingsProps) => {
   const { user: currentUser } = useUser();
   const { user, error } = useUser({ id: Number(router.query.userId) });
   const intl = useIntl();
+  const siriOn = useFeature('siri');
   const { data } = useSWR<UserSettingsNotificationsResponse>(
     user ? `/api/v1/user/${user?.id}/settings/notifications` : null
   );
@@ -49,6 +55,14 @@ const UserSettings = ({ children }: UserSettingsProps) => {
     return <ErrorPage statusCode={500} />;
   }
 
+  // Only managers act on others' settings, and only the owner on the owner's
+  // or an admin's.
+  const cannotManageThem =
+    !hasPermission(Permission.MANAGE_USERS, currentUser?.permissions ?? 0) ||
+    (currentUser?.id !== 1 &&
+      (user.id === 1 ||
+        hasPermission(Permission.ADMIN, user.permissions ?? 0)));
+
   const settingsRoutes: SettingsRoute[] = [
     {
       text: intl.formatMessage(messages.menuGeneralSettings),
@@ -59,6 +73,11 @@ const UserSettings = ({ children }: UserSettingsProps) => {
       text: intl.formatMessage(messages.menuFeatures),
       route: '/settings/features',
       regex: /\/settings\/features/,
+    },
+    {
+      text: intl.formatMessage(messages.menuAppearance),
+      route: '/settings/appearance',
+      regex: /\/settings\/appearance/,
     },
     {
       text: intl.formatMessage(messages.menuChangePass),
@@ -80,17 +99,39 @@ const UserSettings = ({ children }: UserSettingsProps) => {
       text: intl.formatMessage(messages.menuPasskeys),
       route: '/settings/passkeys',
       regex: /\/settings\/passkeys/,
-      // Managed by the person it signs in. Someone who manages users can
-      // also remove one, except the owner's or another admin's.
+      // Own passkeys; managers can also remove others'.
+      hidden: currentUser?.id !== user.id && cannotManageThem,
+    },
+    {
+      text: intl.formatMessage(messages.menuApiKeys),
+      route: '/settings/api-keys',
+      regex: /\/settings\/api-keys/,
+      // Own keys when allowed; managers see others' while keys are on.
       hidden:
-        currentUser?.id !== user.id &&
-        (!hasPermission(
-          Permission.MANAGE_USERS,
-          currentUser?.permissions ?? 0
-        ) ||
-          (currentUser?.id !== 1 &&
-            (user.id === 1 ||
-              hasPermission(Permission.ADMIN, user.permissions ?? 0)))),
+        settings.currentSettings.personalApiKeys === 'off' ||
+        (currentUser?.id === user.id
+          ? settings.currentSettings.personalApiKeys === 'managers' &&
+            !hasPermission(
+              Permission.MANAGE_USERS,
+              currentUser?.permissions ?? 0
+            )
+          : cannotManageThem),
+    },
+    {
+      text: intl.formatMessage(messages.menuSiri),
+      route: '/settings/siri',
+      regex: /\/settings\/siri/,
+      // Own while Siri is on and you may report issues; managers see others'
+      // to revoke the key.
+      hidden:
+        currentUser?.id === user.id
+          ? !siriOn ||
+            !hasPermission(
+              [Permission.CREATE_ISSUES, Permission.MANAGE_ISSUES],
+              user.permissions ?? 0,
+              { type: 'or' }
+            )
+          : cannotManageThem,
     },
     {
       text: intl.formatMessage(messages.menuNotifications),
@@ -102,6 +143,15 @@ const UserSettings = ({ children }: UserSettingsProps) => {
             ? '/settings/notifications/discord'
             : '/settings/notifications/pushbullet',
       regex: /\/settings\/notifications/,
+      hidden: currentUser?.id !== user.id && cannotManageThem,
+    },
+    {
+      text: intl.formatMessage(messages.menuLibraries),
+      route: '/settings/libraries',
+      regex: /\/settings\/libraries/,
+      // Admins only, for another user with a media server account.
+      requiredPermission: Permission.ADMIN,
+      hidden: currentUser?.id === user.id || !user.linkedServers?.length,
     },
     {
       text: intl.formatMessage(messages.menuPermissions),
@@ -150,7 +200,9 @@ const UserSettings = ({ children }: UserSettingsProps) => {
       <div className="mt-6">
         <SettingsTabs settingsRoutes={settingsRoutes} />
       </div>
-      <div className="mt-10 text-white">{children}</div>
+      <div className="mt-10 text-strong" data-seerr="settings">
+        {children}
+      </div>
     </>
   );
 };

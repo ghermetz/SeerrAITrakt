@@ -4,13 +4,17 @@ import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import Modal from '@app/components/Common/Modal';
 import PageTitle from '@app/components/Common/PageTitle';
 import AnimeCheck from '@app/components/Settings/AnimeCheck';
+import AnimeSettings from '@app/components/Settings/AnimeSettings';
 import OverrideRuleModal from '@app/components/Settings/OverrideRule/OverrideRuleModal';
 import OverrideRuleTiles from '@app/components/Settings/OverrideRule/OverrideRuleTiles';
 import RadarrModal from '@app/components/Settings/RadarrModal';
 import ServerInstance from '@app/components/Settings/ServerInstance';
 import SettingsBazarr from '@app/components/Settings/SettingsBazarr';
 import SettingsDownloadClients from '@app/components/Settings/SettingsDownloadClients';
+import SettingsLidarr from '@app/components/Settings/SettingsLidarr';
 import SettingsMaintainerr from '@app/components/Settings/SettingsMaintainerr';
+import SettingsProwlarr from '@app/components/Settings/SettingsProwlarr';
+import SettingsSoulseek from '@app/components/Settings/SettingsSoulseek';
 import SettingsTautulli from '@app/components/Settings/SettingsTautulli';
 import SettingsTrakt from '@app/components/Settings/SettingsTrakt';
 import SonarrModal from '@app/components/Settings/SonarrModal';
@@ -19,7 +23,6 @@ import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import { Transition } from '@headlessui/react';
 import { PlusIcon } from '@heroicons/react/24/solid';
-import { MediaServerType } from '@server/constants/server';
 import type OverrideRule from '@server/entity/OverrideRule';
 import type { OverrideRuleResultsResponse } from '@server/interfaces/api/overrideRuleInterfaces';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
@@ -33,7 +36,7 @@ const messages = defineMessages('components.Settings', {
   radarrsettings: 'Radarr Settings',
   sonarrsettings: 'Sonarr Settings',
   serviceSettingsDescription:
-    'Configure your {serverType} server(s) below. You can connect multiple {serverType} servers, but only two of them can be marked as defaults (one non-4K and one 4K). Administrators are able to override the server used to process new requests prior to approval.',
+    'Connect one or more {serverType} servers. Up to two can be defaults: one non-4K, one 4K.',
   deleteserverconfirm: 'Are you sure you want to delete this server?',
   ssl: 'SSL',
   default: 'Default',
@@ -44,17 +47,17 @@ const messages = defineMessages('components.Settings', {
   addradarr: 'Add Radarr Server',
   addsonarr: 'Add Sonarr Server',
   noDefaultServer:
-    'At least one {serverType} server must be marked as default in order for {mediaType} requests to be processed.',
+    'Mark a {serverType} server as default so {mediaType} requests can be processed.',
   noDefaultNon4kServer:
-    'If you only have a single {serverType} server for both non-4K and 4K content (or if you only download 4K content), your {serverType} server should <strong>NOT</strong> be designated as a 4K server.',
+    'With one {serverType} server for both non-4K and 4K, or only 4K, do <strong>NOT</strong> mark it as a 4K server.',
   noDefault4kServer:
-    'A 4K {serverType} server must be marked as default in order to enable users to submit 4K {mediaType} requests.',
+    'Mark a 4K {serverType} server as default to allow 4K {mediaType} requests.',
   mediaTypeMovie: 'movie',
   mediaTypeSeries: 'series',
   deleteServer: 'Delete {serverType} Server',
   overrideRules: 'Override Rules',
   overrideRulesDescription:
-    'Override rules allow you to specify properties that will be replaced if a request matches the rule.',
+    'Override rules change a request’s settings when it matches.',
   addrule: 'New Override Rule',
 });
 
@@ -235,7 +238,7 @@ const SettingsServices = () => {
                   title={intl.formatMessage(messages.noDefaultNon4kServer, {
                     serverType: 'Radarr',
                     strong: (msg: React.ReactNode) => (
-                      <strong className="font-semibold text-white">
+                      <strong className="font-semibold text-strong">
                         {msg}
                       </strong>
                     ),
@@ -323,7 +326,7 @@ const SettingsServices = () => {
                   title={intl.formatMessage(messages.noDefaultNon4kServer, {
                     serverType: 'Sonarr',
                     strong: (msg: React.ReactNode) => (
-                      <strong className="font-semibold text-white">
+                      <strong className="font-semibold text-strong">
                         {msg}
                       </strong>
                     ),
@@ -382,6 +385,19 @@ const SettingsServices = () => {
           </>
         )}
       </div>
+      <SettingsLidarr />
+      {/* All services first, then the rules that use them. */}
+      <SettingsMaintainerr />
+      <SettingsProwlarr />
+      <SettingsDownloadClients />
+      {/* Soulseek is for songs taken from albums: offered once music is. */}
+      {settings.currentSettings.musicReady && <SettingsSoulseek />}
+      <SettingsBazarr />
+      <SettingsTrakt />
+      {/* Tautulli reads Plex's watch history: offered only with Plex connected. */}
+      {settings.currentSettings.mediaServers.some(
+        (server) => server.kind === 'plex'
+      ) && <SettingsTautulli />}
       <div className="mb-6 mt-10">
         <h3 className="heading">
           {intl.formatMessage(messages.overrideRules)}
@@ -422,7 +438,12 @@ const SettingsServices = () => {
           </li>
         </ul>
       </div>
-      {!!sonarrData?.length && <AnimeCheck />}
+      {/* Anime in its own section: what counts as anime, then the check of
+          Sonarr and Radarr against it. */}
+      <div className="mt-10 max-w-6xl rounded-lg p-4 ring-1 ring-gray-700 sm:p-6 [&>*:first-child]:mt-0">
+        <AnimeSettings />
+        {!!sonarrData?.length && <AnimeCheck />}
+      </div>
       {overrideRuleModal.open && radarrData && sonarrData && (
         <OverrideRuleModal
           rule={overrideRuleModal.rule}
@@ -436,14 +457,6 @@ const SettingsServices = () => {
           radarrServices={radarrData}
           sonarrServices={sonarrData}
         />
-      )}
-      <SettingsMaintainerr />
-      <SettingsDownloadClients />
-      <SettingsBazarr />
-      <SettingsTrakt />
-      {/* Tautulli reads Plex's watch history, so it is only offered with Plex. */}
-      {settings.currentSettings.mediaServerType === MediaServerType.PLEX && (
-        <SettingsTautulli />
       )}
     </>
   );

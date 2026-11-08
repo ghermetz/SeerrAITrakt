@@ -1,17 +1,17 @@
 import type * as ImageProxyModule from '@server/lib/imageproxy';
 import { getSettings } from '@server/lib/settings';
+import logger from '@server/logger';
 import assert from 'node:assert/strict';
 import { promises } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, before, beforeEach, describe, it } from 'node:test';
+import { after, before, beforeEach, describe, it, mock } from 'node:test';
 import sharp from 'sharp';
 
 /*
- * The image cache's own copies and upkeep: converted and smaller copies,
- * checking a stale image with its host instead of downloading it again, and
- * the size limit. In a cache directory of its own, as the size limit looks
- * at everything in it.
+ * The image cache's derived copies and upkeep: converted and resized copies,
+ * revalidating stale images instead of re-downloading, and the size limit.
+ * Uses its own cache directory, since the size limit counts everything in it.
  */
 
 const configDir = join(tmpdir(), `seerr-images-${process.pid}-${Date.now()}`);
@@ -239,6 +239,48 @@ describe('converted copies', () => {
     assert.ok(result.image.imageBuffer.length <= tiny.length);
   });
 
+  it('leaves alone a picture claiming more pixels than it converts, and does not try it again', async () => {
+    const small = await sharp({
+      create: { width: 16, height: 16, channels: 3, background: '#406080' },
+    })
+      .jpeg({ quality: 90 })
+      .toBuffer();
+    // The frame header claims 9000 x 9000.
+    const sof = small.indexOf(Buffer.from([0xff, 0xc0]));
+    assert.ok(sof > 0);
+    const claimed = Buffer.from(small);
+    claimed.writeUInt16BE(9000, sof + 5);
+    claimed.writeUInt16BE(9000, sof + 7);
+    const { proxy } = proxyAnswering(() => ({
+      data: claimed,
+      headers: JPEG_HEADERS,
+    }));
+    const path = unique('lantern-song');
+    const original = await proxy.getImage(path);
+    const warn = mock.method(logger, 'warn', () => logger);
+    try {
+      for (let i = 0; i < 2; i++) {
+        const result = await proxy.getVariant(
+          path,
+          { format: 'webp' },
+          original,
+          {
+            convert: true,
+          }
+        );
+        assert.equal(result.status, 'unavailable');
+      }
+      assert.equal(
+        warn.mock.calls.filter(
+          (c) => (c.arguments as unknown[])[0] === 'Could not convert an image'
+        ).length,
+        1
+      );
+    } finally {
+      warn.mock.restore();
+    }
+  });
+
   it('leaves alone what it cannot convert', async () => {
     const { proxy } = proxyAnswering(() => ({
       data: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'),
@@ -372,7 +414,7 @@ describe('the size limit', () => {
     const dir = join(imagesDir, source, name);
     await promises.mkdir(dir, { recursive: true });
     const file = join(dir, `31536000.${Date.now() + 1e9}..jpg`);
-    // Sparse: its size is what counts, not what it takes on this disk.
+    // Sparse: the apparent size counts, not disk usage.
     await promises.writeFile(file, '');
     await promises.truncate(file, bytes);
     const when = (Date.now() - minutesAgo * 60000) / 1000;

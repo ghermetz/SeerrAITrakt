@@ -1,20 +1,18 @@
 /*
- * Reading episode numbers out of file names, and building the name Sonarr
- * is asked to judge.
+ * Reads episode numbers from file names and builds the name Sonarr judges.
  *
- * Packs often name their files with less than Sonarr needs: Judas's Naruto
- * files are "[Judas] Naruto - S05E17 (202).mkv", with the quality only on
- * the pack, and with the pack's own season split, so Sonarr reads S05E17 as
- * TVDB's episode 196 when the file is episode 202. So each file is renamed
- * for Sonarr: the release group, the series' title as Sonarr knows it, the
- * episode number that is right for the series type, and the pack's quality
- * tags — "[Judas] Naruto - 202 [BD 1080p][HEVC x265 10bit][Multi-Audio]",
- * which Sonarr maps to the right episode and scores like the real release.
+ * Pack files often lack what Sonarr needs: "[Tengu] Kitsuraga - S05E17
+ * (202).mkv" has its quality only on the pack, and the pack's own season
+ * split makes Sonarr read S05E17 as TVDB episode 196, not 202. So each file
+ * is renamed with the release group, Sonarr's series title, the episode
+ * number right for the series type, and the pack's quality tags:
+ * "[Tengu] Kitsuraga - 202 [BD 1080p][HEVC x265 10bit][Multi-Audio]", which
+ * Sonarr maps correctly and scores like the real release.
  */
 
 export const VIDEO_RX = /\.(mkv|mp4|avi|m4v|ts|wmv|mov|webm)$/i;
 
-/** Files in a pack that are never episodes. */
+/** Pack files that are never episodes. */
 const EXTRA_RX =
   /(^|[\s._/\-[(])(sample|trailer|ncop\d*|nced\d*|creditless|preview|menu|bonus|extras?|featurettes?|behind[\s._-]the[\s._-]scenes)([\s._/\-\])]|$)/i;
 
@@ -31,22 +29,46 @@ export const isExtra = (path: string): boolean => EXTRA_RX.test(path);
 export const baseName = (path: string): string =>
   (path.split('/').pop() ?? path).replace(VIDEO_RX, '');
 
+/** Longest end of a name searched for a scene group and its tags. */
+const GROUP_TAIL = 256;
+
 /** A group in brackets at the front, or after a final dash (scene style). */
 export const releaseGroup = (title: string): string | undefined => {
   const front = title.match(/^\s*\[([^\]]+)\]/);
   if (front) return front[1].trim();
-  const back = title.match(/-([A-Za-z0-9][A-Za-z0-9.]*?)(\s*\[[^\]]*\])?\s*$/);
+  // Only the end can hold it; matching there keeps long names cheap.
+  const back = title
+    .slice(-GROUP_TAIL)
+    .match(/-([A-Za-z0-9][A-Za-z0-9.]*?)(\s*\[[^\]]*\])?\s*$/);
   return back && !/^\d+$/.test(back[1]) ? back[1] : undefined;
 };
 
 /**
- * The part of a name that describes the release rather than the show:
- * bracketed tags that carry quality, source, codec, audio or language, or,
- * in a dotted scene name, everything from the first such token on.
+ * Each "[...]" or "(...)": from an opening bracket to the next closing one,
+ * with something between. One pass, however many brackets.
+ */
+const bracketedParts = (title: string): string[] => {
+  const parts: string[] = [];
+  let start = -1;
+  for (let i = 0; i < title.length; i++) {
+    const c = title[i];
+    if (start < 0) {
+      if (c === '[' || c === '(') start = i;
+    } else if (c === ']' || c === ')') {
+      if (i > start + 1) parts.push(title.slice(start, i + 1));
+      start = -1;
+    }
+  }
+  return parts;
+};
+
+/**
+ * The release-describing part of a name: bracketed quality, source, codec,
+ * audio or language tags, or in a dotted scene name, everything from the
+ * first such token.
  */
 export const releaseTags = (title: string): string => {
-  const bracketed = [...title.matchAll(/[[(]([^\])]+)[\])]/g)]
-    .map((m) => m[0])
+  const bracketed = bracketedParts(title)
     .slice(/^\s*\[/.test(title) ? 1 : 0)
     .filter((tag) => QUALITY_TOKEN.test(tag) && !PACK_ONLY.test(tag));
   if (bracketed.length) {
@@ -68,19 +90,19 @@ export interface FileNumbers {
   absolute?: number;
   season?: number;
   episode?: number;
-  /** The last episode of a file that holds several (S01E01E02). */
+  /** Last episode of a multi-episode file (S01E01E02). */
   through?: number;
   version?: number;
 }
 
 /**
- * Episode numbers that can be read from a name directly. A number in
- * brackets after an SxxEyy is the absolute number (Judas, and others with
- * their own season split); " - 131v3" is an absolute number with a version.
+ * Episode numbers read directly from a name. A bracketed number after SxxEyy
+ * is absolute (Tengu and others with their own season split); " - 131v3" is
+ * absolute with a version.
  */
 export const readNumbers = (name: string): FileNumbers => {
   const found: FileNumbers = {};
-  // S01E01, S01E01E02, S01E01-E02, and S01E01-02 (but not S01E01-1080p).
+  // S01E01, S01E01E02, S01E01-E02, S01E01-02 (not S01E01-1080p).
   const sxe = name.match(
     /\bS(\d{1,2})E(\d{1,3})(?:-?E(\d{1,3})|-(\d{1,3})(?![\dp]))?\b/i
   );
@@ -112,7 +134,7 @@ export const readNumbers = (name: string): FileNumbers => {
   return found;
 };
 
-/** The series' name in the form Sonarr matches: "Perfect World 2021". */
+/** The series title as Sonarr matches it: "Ninefold Sky 2021". */
 export const titleForParse = (seriesTitle: string): string =>
   seriesTitle.replace(/[()]/g, ' ').replace(/\s+/g, ' ').trim();
 

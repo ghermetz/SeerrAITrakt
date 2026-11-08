@@ -1,4 +1,5 @@
-import { DbAwareColumn } from '@server/utils/DbColumnHelper';
+import type { CatalogSong } from '@server/lib/music/catalogSong';
+import { DbAwareColumn, resolveDbType } from '@server/utils/DbColumnHelper';
 import {
   Column,
   CreateDateColumn,
@@ -13,7 +14,13 @@ import {
 } from 'typeorm';
 import { User } from './User';
 
-/** A user-created list of media, visible only to its owner and members. */
+/** A list's contents: films and series, or songs. */
+export type MediaListKind = 'watch' | 'music';
+
+/** Where a playlist's songs come from, besides manual adds. */
+export type PlaylistService = 'spotify' | 'apple';
+
+/** A user-created list, visible only to its owner and members. */
 @Entity()
 export class MediaList {
   @PrimaryGeneratedColumn()
@@ -21,6 +28,35 @@ export class MediaList {
 
   @Column()
   public name: string;
+
+  /** A watch list (films and series) or a playlist (songs). */
+  @Column({ type: 'varchar', default: 'watch' })
+  public kind: MediaListKind;
+
+  /**
+   * The public link of a linked Spotify or Apple Music playlist, re-read daily
+   * for new songs.
+   */
+  @Column({ type: 'varchar', nullable: true })
+  public sourceUrl?: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  public sourceService?: PlaylistService | null;
+
+  /** The linked playlist's name, as last read. */
+  @Column({ type: 'varchar', nullable: true })
+  public sourceName?: string | null;
+
+  /** Who linked the playlist; its songs are requested for them. */
+  @Column({ type: 'integer', nullable: true })
+  public sourceUserId?: number | null;
+
+  @DbAwareColumn({ type: 'datetime', nullable: true })
+  public sourceReadAt?: Date | null;
+
+  /** Why the last read failed, if it did. */
+  @Column({ type: 'varchar', nullable: true })
+  public sourceProblem?: string | null;
 
   @ManyToOne(() => User, { eager: true, onDelete: 'CASCADE' })
   @JoinColumn({ name: 'ownerId' })
@@ -31,14 +67,14 @@ export class MediaList {
   public ownerId: number;
 
   /**
-   * When on, a scheduled job checks the watch history and suggests removing titles
-   * everyone on the list has finished. Off by default: watching people's
-   * viewing history is opt-in per list.
+   * When on, a scheduled job checks watch history and suggests removing titles
+   * everyone on the list has finished. Off by default: reading viewing history
+   * is opt-in per list.
    */
   @Column({ default: false })
   public watchedSync: boolean;
 
-  /** Throttles the watch-history check so it does not run on every page load. */
+  /** Throttles the watch-history check so it doesn't run on every page load. */
   @DbAwareColumn({ type: 'datetime', nullable: true })
   public lastWatchCheck?: Date | null;
 
@@ -48,10 +84,13 @@ export class MediaList {
   @OneToMany(() => MediaListMember, (member: MediaListMember) => member.list)
   public members: MediaListMember[];
 
-  @CreateDateColumn()
+  @OneToMany(() => MediaListSong, (song: MediaListSong) => song.list)
+  public songs: MediaListSong[];
+
+  @CreateDateColumn({ type: resolveDbType('datetime') })
   public createdAt: Date;
 
-  @UpdateDateColumn()
+  @UpdateDateColumn({ type: resolveDbType('datetime') })
   public updatedAt: Date;
 
   constructor(init?: Partial<MediaList>) {
@@ -83,14 +122,13 @@ export class MediaListItem {
   public mediaType: 'movie' | 'tv';
 
   /**
-   * Cached TMDB poster path. Kept here so the lists overview can draw its
-   * artwork without a TMDB lookup per title — which is what limited the
-   * rotation to a handful of posters.
+   * Cached TMDB poster path, so the lists overview draws artwork without a TMDB
+   * lookup per title.
    */
   @Column({ type: 'varchar', nullable: true })
   public posterPath?: string | null;
 
-  /** Who added it. Kept so a shared list shows attribution. */
+  /** Who added it, for attribution on shared lists. */
   @ManyToOne(() => User, { eager: true, onDelete: 'SET NULL', nullable: true })
   @JoinColumn({ name: 'addedById' })
   public addedBy?: User | null;
@@ -109,7 +147,7 @@ export class MediaListItem {
   @Column({ nullable: true })
   public watchedById?: number | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: resolveDbType('datetime') })
   public createdAt: Date;
 
   constructor(init?: Partial<MediaListItem>) {
@@ -117,7 +155,109 @@ export class MediaListItem {
   }
 }
 
-/** A user the list has been shared with. */
+/**
+ * A playlist song's state: being matched on MusicBrainz, not found, matched and
+ * about to be requested, requested (or already here or coming), waiting (on the
+ * requester's quota, `problem` "limit"), awaiting admin approval of a big
+ * import, or not requestable; or removed from a linked playlist and kept so it
+ * isn't re-imported.
+ */
+export type PlaylistSongState =
+  | 'matching'
+  | 'unmatched'
+  | 'matched'
+  | 'requested'
+  | 'here'
+  | 'waiting'
+  | 'approval'
+  | 'failed'
+  | 'removed';
+
+/** One song on a playlist, as its service or adder named it. */
+@Entity()
+@Unique(['list', 'sourceId'])
+export class MediaListSong {
+  @PrimaryGeneratedColumn()
+  public id: number;
+
+  @ManyToOne(() => MediaList, (list: MediaList) => list.songs, {
+    onDelete: 'CASCADE',
+  })
+  @JoinColumn({ name: 'listId' })
+  @Index()
+  public list: MediaList;
+
+  @Column()
+  public listId: number;
+
+  /** The service's id ("spotify:track:…"), or the recording's. */
+  @Column({ type: 'varchar' })
+  public sourceId: string;
+
+  /** Position in the playlist. */
+  @Column({ type: 'integer', default: 0 })
+  public position: number;
+
+  @Column({ type: 'varchar' })
+  public title: string;
+
+  @Column({ type: 'varchar' })
+  public artistName: string;
+
+  /** Milliseconds, when the service provides it. */
+  @Column({ type: 'integer', nullable: true })
+  public length?: number | null;
+
+  /** The matched MusicBrainz recording. */
+  @Column({ type: 'varchar', nullable: true })
+  @Index()
+  public recordingMbid?: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  public artistMbid?: string | null;
+
+  /** The album it's best known from, for its cover. */
+  @Column({ type: 'varchar', nullable: true })
+  public albumMbid?: string | null;
+
+  /** The recording's ISRC from Deezer, when listed. */
+  @Column({ type: 'varchar', nullable: true })
+  public isrc?: string | null;
+
+  /**
+   * The song's Deezer album and track, when listed, for adding songs
+   * MusicBrainz lacks.
+   */
+  @Column({ type: 'simple-json', nullable: true })
+  public catalog?: CatalogSong | null;
+
+  @Column({ type: 'varchar', default: 'matching' })
+  public state: PlaylistSongState;
+
+  /** Why it couldn't be requested. */
+  @Column({ type: 'varchar', nullable: true })
+  public problem?: string | null;
+
+  /** The music request it went into. */
+  @Column({ type: 'integer', nullable: true })
+  public requestId?: number | null;
+
+  /** Who it's requested for: who added it, or who linked the playlist. */
+  @Column({ type: 'integer', nullable: true })
+  public requestForId?: number | null;
+
+  @CreateDateColumn({ type: resolveDbType('datetime') })
+  public createdAt: Date;
+
+  @UpdateDateColumn({ type: resolveDbType('datetime') })
+  public updatedAt: Date;
+
+  constructor(init?: Partial<MediaListSong>) {
+    Object.assign(this, init);
+  }
+}
+
+/** A user the list is shared with. */
 @Entity()
 @Unique(['list', 'user'])
 export class MediaListMember {
@@ -143,10 +283,9 @@ export class MediaListMember {
   public userId: number;
 
   /**
-   * When the member accepted the list. Until then they can see it, but
-   * nothing that reads their watch history (watch sync, picks for a room)
-   * counts them: being added to a list is not agreeing to share what you
-   * watch.
+   * When the member accepted. Until then they can see the list, but nothing
+   * that reads their watch history (watch sync, picks for a room) counts them:
+   * being added isn't consent to share viewing.
    */
   @DbAwareColumn({ type: 'datetime', nullable: true })
   public acceptedAt?: Date | null;
@@ -157,8 +296,8 @@ export class MediaListMember {
 }
 
 /**
- * A title the job believes everyone on the list has finished. Surfaced to the
- * list owner as a prompt; nothing is ever removed automatically.
+ * A title the job believes everyone on the list has finished. Shown to the
+ * owner as a prompt; nothing is removed automatically.
  */
 @Entity()
 @Unique(['item'])
@@ -181,11 +320,11 @@ export class MediaListWatchSuggestion {
   @Column()
   public itemId: number;
 
-  /** Set when the owner chose to keep it, so it is not suggested again. */
+  /** Set when the owner keeps it, so it isn't suggested again. */
   @DbAwareColumn({ type: 'datetime', nullable: true })
   public dismissedAt?: Date | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: resolveDbType('datetime') })
   public createdAt: Date;
 
   constructor(init?: Partial<MediaListWatchSuggestion>) {

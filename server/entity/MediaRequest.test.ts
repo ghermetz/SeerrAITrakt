@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { beforeEach, describe, it, mock } from 'node:test';
+import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 
 import ExternalAPI from '@server/api/externalapi';
 import {
@@ -18,10 +18,13 @@ import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import { Notification } from '@server/lib/notifications';
 import { Permission } from '@server/lib/permissions';
+import { requestMissing } from '@server/lib/requestMissing';
+import { getSettings } from '@server/lib/settings';
 import { MediaRequestSubscriber } from '@server/subscriber/MediaRequestSubscriber';
 import { setupTestDb } from '@server/test/db';
 
-// get is a prototype method unlike getMovie, and replaces the cache lookup too
+// get is a prototype method, unlike getMovie, and also replaces the cache
+// lookup.
 const externalApiGetMock = mock.method(
   ExternalAPI.prototype as unknown as {
     get: (endpoint: string) => Promise<unknown>;
@@ -38,7 +41,7 @@ const externalApiGetMock = mock.method(
       id: tmdbId,
       external_ids: {},
       seasons: [1, 2, 3].map((season_number) => ({ season_number })),
-      // Skips getMovie's localized fallback call
+      // Skips getMovie's localized fallback call.
       videos: { results: [{ type: 'Trailer', key: 'trailer' }] },
     };
   }
@@ -136,7 +139,7 @@ describe('MediaRequest.request', () => {
       media,
       is4k: false,
     });
-    // Sending it on marks it complete while its media is being looked up.
+    // Dispatch completes it while its media is being looked up.
     const repository = getRepository(Media);
     const findOne = repository.findOne.bind(repository);
     const lookup = mock.method(
@@ -203,7 +206,7 @@ describe('MediaRequest.request', () => {
         status4k: MediaStatus.UNKNOWN,
       })
     );
-    // An old declined request, then one still waiting for approval.
+    // An old declined request, then one awaiting approval.
     for (const status of [
       MediaRequestStatus.DECLINED,
       MediaRequestStatus.PENDING,
@@ -333,7 +336,7 @@ describe('saving a request', () => {
         is4k: false,
       })
     );
-    // Approved long ago, without the save hooks.
+    // Approved long ago, bypassing save hooks.
     await requestRepository.update(id, {
       status: MediaRequestStatus.APPROVED,
     });
@@ -361,7 +364,7 @@ describe('saving a request', () => {
       MediaStatus.PROCESSING
     );
 
-    // A real change of status still is announced.
+    // A real status change is still announced.
     request.status = MediaRequestStatus.DECLINED;
     await requestRepository.save(request);
 
@@ -393,5 +396,191 @@ describe('saving a request', () => {
     }
 
     assert.deepStrictEqual(unhandled, []);
+  });
+});
+
+describe('a request over the quota, when such requests wait for an admin', () => {
+  const settings = getSettings();
+
+  beforeEach(() => {
+    settings.main.overQuotaRequests = true;
+  });
+
+  afterEach(() => {
+    settings.main.overQuotaRequests = false;
+  });
+
+  const limited = async (
+    email: string,
+    permissions: number,
+    quota: { movieQuotaLimit?: number; tvQuotaLimit?: number }
+  ) => {
+    const user = await createRequester(email, permissions);
+    Object.assign(user, quota);
+    return getRepository(User).save(user);
+  };
+
+  it('is saved pending and marked, never approved automatically', async () => {
+    const requester = await limited(
+      'glasswing@example.invalid',
+      Permission.REQUEST + Permission.AUTO_APPROVE,
+      { movieQuotaLimit: 1 }
+    );
+    await MediaRequest.request(
+      { mediaId: 41001, mediaType: MediaType.MOVIE, is4k: false },
+      requester
+    );
+    settings.main.overQuotaRequests = false;
+    await assert.rejects(
+      () =>
+        MediaRequest.request(
+          { mediaId: 41002, mediaType: MediaType.MOVIE, is4k: false },
+          requester
+        ),
+      QuotaRestrictedError
+    );
+    settings.main.overQuotaRequests = true;
+
+    const request = await MediaRequest.request(
+      { mediaId: 41002, mediaType: MediaType.MOVIE, is4k: false },
+      requester
+    );
+
+    assert.strictEqual(request.status, MediaRequestStatus.PENDING);
+    assert.strictEqual(request.overQuota, true);
+    assert.strictEqual(request.modifiedBy ?? null, null);
+  });
+
+  it('is not marked when within the quota', async () => {
+    const requester = await limited(
+      'harbour@example.invalid',
+      Permission.REQUEST,
+      { movieQuotaLimit: 2 }
+    );
+
+    const request = await MediaRequest.request(
+      { mediaId: 41003, mediaType: MediaType.MOVIE, is4k: false },
+      requester
+    );
+
+    assert.strictEqual(request.status, MediaRequestStatus.PENDING);
+    assert.strictEqual(request.overQuota, false);
+  });
+
+  it('takes every season of a series that needs more than are left', async () => {
+    const requester = await limited(
+      'lantern@example.invalid',
+      Permission.REQUEST + Permission.AUTO_APPROVE,
+      { tvQuotaLimit: 2 }
+    );
+
+    const request = await MediaRequest.request(
+      { mediaId: 41004, mediaType: MediaType.TV, seasons: [1, 2, 3] },
+      requester
+    );
+
+    assert.strictEqual(request.status, MediaRequestStatus.PENDING);
+    assert.strictEqual(request.overQuota, true);
+    assert.deepStrictEqual(
+      request.seasons.map((season) => season.status),
+      [
+        MediaRequestStatus.PENDING,
+        MediaRequestStatus.PENDING,
+        MediaRequestStatus.PENDING,
+      ]
+    );
+    assert.strictEqual((await requester.getQuota()).tv.used, 3);
+  });
+
+  it('stops counting towards the quota once declined', async () => {
+    const requester = await limited(
+      'static@example.invalid',
+      Permission.REQUEST,
+      { movieQuotaLimit: 1 }
+    );
+    await MediaRequest.request(
+      { mediaId: 41005, mediaType: MediaType.MOVIE, is4k: false },
+      requester
+    );
+    const over = await MediaRequest.request(
+      { mediaId: 41006, mediaType: MediaType.MOVIE, is4k: false },
+      requester
+    );
+    assert.strictEqual((await requester.getQuota()).movie.used, 2);
+
+    over.status = MediaRequestStatus.DECLINED;
+    await getRepository(MediaRequest).save(over);
+
+    assert.strictEqual((await requester.getQuota()).movie.used, 1);
+  });
+
+  it('is still refused for an automatic request', async () => {
+    const requester = await limited(
+      'watchlist@example.invalid',
+      Permission.REQUEST + Permission.AUTO_REQUEST,
+      { movieQuotaLimit: 1 }
+    );
+    await MediaRequest.request(
+      { mediaId: 41007, mediaType: MediaType.MOVIE, is4k: false },
+      requester
+    );
+
+    await assert.rejects(
+      () =>
+        MediaRequest.request(
+          { mediaId: 41008, mediaType: MediaType.MOVIE, is4k: false },
+          requester,
+          { isAutoRequest: true }
+        ),
+      QuotaRestrictedError
+    );
+  });
+
+  it('is still refused for a title added to a list, or several requested at once', async () => {
+    const requester = await limited(
+      'lists@example.invalid',
+      Permission.REQUEST,
+      { movieQuotaLimit: 1 }
+    );
+    await MediaRequest.request(
+      { mediaId: 41009, mediaType: MediaType.MOVIE, is4k: false },
+      requester
+    );
+
+    assert.deepStrictEqual(await requestMissing(41010, 'movie', requester), {
+      outcome: 'failed',
+      message: 'Your request limit has been reached.',
+    });
+    assert.strictEqual((await requester.getQuota()).movie.used, 1);
+  });
+
+  it('tells admins in the pending notification that it is over the limit', async (t) => {
+    const notify = t.mock.method(
+      MediaRequest,
+      'sendNotification',
+      async () => true
+    );
+    const requester = await limited(
+      'notice@example.invalid',
+      Permission.REQUEST,
+      { movieQuotaLimit: 1 }
+    );
+    await MediaRequest.request(
+      { mediaId: 41009, mediaType: MediaType.MOVIE, is4k: false },
+      requester
+    );
+    await MediaRequest.request(
+      { mediaId: 41010, mediaType: MediaType.MOVIE, is4k: false },
+      requester
+    );
+
+    const pending = notify.mock.calls.filter(
+      (call) => call.arguments[2] === Notification.MEDIA_PENDING
+    );
+    assert.strictEqual(pending.length, 2);
+    assert.strictEqual(pending[0].arguments[4], undefined);
+    assert.deepStrictEqual(pending[1].arguments[4], [
+      { name: 'Quota', value: 'Over the requester’s limit' },
+    ]);
   });
 });

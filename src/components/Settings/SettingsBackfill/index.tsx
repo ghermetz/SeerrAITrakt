@@ -1,38 +1,33 @@
 import Alert from '@app/components/Common/Alert';
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
-import SensitiveInput from '@app/components/Common/SensitiveInput';
+import SaveBar from '@app/components/Common/SaveBar';
 import AdvancedSection from '@app/components/Settings/AdvancedSection';
 import BlockedGroups from '@app/components/Settings/SettingsBackfill/BlockedGroups';
+import DownloadCheck from '@app/components/Settings/SettingsBackfill/DownloadCheck';
+import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
-import { ArrowDownOnSquareIcon, BeakerIcon } from '@heroicons/react/24/outline';
+import { ArrowDownOnSquareIcon } from '@heroicons/react/24/outline';
 import type { BackfillSettings } from '@server/lib/settings';
 import axios from 'axios';
 import { Field, Form, Formik } from 'formik';
 import Link from 'next/link';
-import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR from 'swr';
 
 const messages = defineMessages('components.Settings.SettingsBackfill', {
   backfill: 'Backfill',
   description:
-    'Backfill looks for series Sonarr has searched for and not found, searches Prowlarr directly under every name the show goes by, opens the likeliest packs and checks each file with Sonarr, then downloads and imports only what an admin approves. Approvals arrive as a Backfill notification; tap it to review.',
+    'Finds what Sonarr couldn’t by searching Prowlarr under every name, checks each file, and downloads only what you approve.',
   enabled: 'Enable Backfill',
   enabledTip: 'Scans run on a schedule (Settings → Jobs & Cache).',
   prowlarr: 'Prowlarr',
-  hostname: 'Hostname or IP address',
-  port: 'Port',
-  ssl: 'Use SSL',
-  urlBase: 'URL base',
-  apiKey: 'API key',
-  apiKeySaved: 'Saved; leave blank to keep it',
-  test: 'Test',
-  testing: 'Testing…',
-  testOk: 'Prowlarr {version} answered.',
-  testFailed: 'Could not reach Prowlarr.',
+  prowlarrAt:
+    'Searches Prowlarr at {address}. <ServicesLink>Change it in Services</ServicesLink>.',
+  prowlarrMissing:
+    'Backfill needs Prowlarr. <ServicesLink>Set it up in Settings → Services</ServicesLink> first.',
   downloads: 'Downloads',
   torrentClient: 'Torrent packs go to',
   usenetClient: 'Usenet packs go to',
@@ -40,63 +35,80 @@ const messages = defineMessages('components.Settings.SettingsBackfill', {
   noClients: 'Add a download client under Services → Download clients first.',
   category: 'Category',
   categoryTip:
-    'Backfill’s downloads go here, apart from Sonarr’s and Radarr’s, so neither imports them on its own.',
+    'Keeps Backfill’s downloads apart, so Sonarr and Radarr don’t import them on their own.',
+  categoryTipMusic:
+    'Keeps Backfill’s downloads apart, so Sonarr, Radarr and Lidarr don’t import them on their own.',
   when: 'When a title is stuck',
   includeMovies: 'Movies too',
-  includeMoviesTip:
-    'Follow movies Radarr has searched for and not found, as well as series.',
+  includeMoviesTip: 'Also follow movies Radarr couldn’t find.',
+  includeMusic: 'Music too',
+  includeMusicTip: 'Also follow albums Lidarr couldn’t find.',
   stuckAfterHours: 'Hours since Sonarr’s or Radarr’s last search',
+  newReleaseWaitHours:
+    'Hours a new episode or film is left to Sonarr or Radarr once it’s out',
+  searchAfterArr: 'Search right after Sonarr, Radarr or Lidarr finds nothing',
+  searchAfterArrTip:
+    'Titles requested in the last 3 days are searched about 20 minutes after their own search comes up empty, instead of waiting for the hours above and the next scan. Each is searched once this way.',
   includeCutoffUnmet: 'Treat files below the cutoff as gaps',
-  includeCutoffUnmetTip:
-    'Off: a pack that only upgrades files is not offered. Packs that fill gaps still show their upgrades.',
+  includeCutoffUnmetTip: 'Off: packs that only upgrade files aren’t offered.',
   includeSpecials: 'Include specials (season 0)',
   searchesPerScan: 'Titles searched per scan',
   researchAfterDays: 'Days before searching a title again',
   approval: 'Approval',
   autoApprove: 'Approve some packs automatically',
   autoApproveTip:
-    'Only a pack that fills what is missing and replaces nothing on disk, with at least this score and no bigger than this. Anything else waits for an admin.',
+    'Packs that only fill gaps, within this score and size. Anything else waits for an admin.',
   replaceFailed: 'Replace failed downloads',
   replaceFailedTip:
-    'When a download fails or stalls, the next pack that clears the score and size below is downloaded in its place, searching again if need be, until none is left. Anything else waits for an admin.',
+    'When a download fails or stalls, the next pack within the score and size below replaces it.',
   minScore: 'Minimum score',
   maxSizeGb: 'Largest download (GB)',
   safety: 'Limits',
-  maxActiveJobs: 'Downloads running at once, per client',
+  maxActiveJobs: 'Series downloads running at once, per client',
   maxActiveJobsTip:
     'Counted for torrents and Usenet apart. A download being imported does not count.',
+  maxMovieJobs: 'Movie downloads running at once, per client',
+  maxMusicJobs: 'Music downloads running at once, per client',
+  maxMusicJobsTip: 'Albums, and songs taken from albums.',
   stallHours: 'Give up on a torrent after this many hours without progress',
   stallHoursTip:
-    'Only time it is meant to be downloading counts: paused, queued or checking in the torrent client does not. It is then replaced or offered like any failed download. 0 waits forever.',
+    'Also when part of it is on no one’s computer for that long, so it can’t finish. Paused or queued time doesn’t count. 0 waits forever.',
+  slowHours: 'Give up on a torrent that would take longer than this many hours',
+  slowHoursTip:
+    'Judged by its speed over the last four hours. Paused or queued time doesn’t count. 0 never gives up.',
   minFreeSpaceGb: 'Keep free on the series’ disk (GB)',
+  stepDown: 'Step down a quality preset',
+  stepDownTip:
+    'A title on one of Seerr AI’s quality presets (Settings → Quality) that nothing is grabbed for moves to the next looser preset, then back once something is.',
+  stepDownDays: 'Days before it steps down',
   historyDays: 'Days to keep finished downloads',
   historyDaysTip:
-    'Then the nightly Database Maintenance job removes them and the packs they came from. Packs you turned down are kept. 0 keeps everything.',
+    'Older ones are removed nightly; packs you turned down are kept. 0 keeps everything.',
   saved: 'Backfill settings saved.',
   saveFailed: 'Backfill settings could not be saved.',
   loadFailed: 'Backfill settings could not be loaded.',
   openBackfill: 'Open Backfill',
   agent: 'Admin agent',
   agentTip:
-    'An AI that looks further when Backfill finds nothing usable for a requested title: it reads why releases were turned down, searches other ways, opens packs to check their files and downloads only what is missing. On its own it never replaces a file on disk; replacing files, blocking a release group or deleting files happens only when an admin asks and then approves it. It needs AI set up, with Admin Agent on.',
+    'An AI that digs further when Backfill finds nothing (needs AI and Admin Agent on). It replaces or deletes nothing without your approval.',
   agentAutoRun: 'Step in on its own',
   agentAutoRunTip:
-    'When Backfill finds nothing for a requested title, and when someone reports a title missing and Sonarr, Radarr and Backfill find nothing. Off: it only works when an admin asks.',
+    'Steps in when Backfill finds nothing for a requested or reported title. Off: only when an admin asks.',
   agentMaxAutoRunsPerDay: 'Times it may start on its own in a day',
   agentMaxGrabsPerDay: 'Downloads it may start in a day',
   agentMaxSizeGb: 'Largest download it may start (GB)',
   agentMaxSteps: 'Steps it may take in one go',
   agentAutoContinue: 'Times it carries on by itself',
   agentAutoContinueTip:
-    'When its steps run out mid-task it takes another go on its own, this many times, as long as the last go started a download. 0 always waits for you to reply.',
+    'Extra goes it takes on its own when out of steps, if the last started a download. 0 waits for you.',
   agentKeepDays: 'Days to keep finished conversations',
   agentKeepDaysTip:
-    'Older ones are deleted on their own; 0 keeps them. Ones waiting on your answer stay, and what they downloaded is never touched.',
+    'Older ones are deleted; 0 keeps them. Downloads are never touched.',
   agentInstructions: 'Standing instructions',
   agentInstructionsTip:
-    'What it should always do, in your words. For example: always check it is English before downloading; prefer usenet; never take anything under 720p for new shows.',
+    'Standing rules in your words, such as “prefer usenet” or “nothing under 720p”.',
   agentMaxStepsTip:
-    'Each time it looks at what it found and decides what next is a step; searches it runs at once count as one. Fewer steps cost less.',
+    'Each decision it makes is one step. Fewer steps cost less.',
 });
 
 interface Shown extends Omit<BackfillSettings, 'prowlarr'> {
@@ -106,18 +118,18 @@ interface Shown extends Omit<BackfillSettings, 'prowlarr'> {
 }
 
 /**
- * The client chosen, or "Not used" for none, or for one that has since been
- * removed, so the form can still be saved.
+ * The chosen client, or "Not used" for none or a removed one, so the form can
+ * still be saved.
  */
 const chosen = (id: number | null, clients: { id: number }[]): number | '' =>
   id !== null && clients.some((c) => c.id === id) ? id : '';
 
 const SettingsBackfill = () => {
   const intl = useIntl();
+  const { currentSettings } = useSettings();
+  const musicReady = !!currentSettings.musicReady;
   const { addToast } = useToasts();
   const { data, error, mutate } = useSWR<Shown>('/api/v1/settings/backfill');
-  const [test, setTest] = useState<{ ok: boolean; text: string }>();
-  const [testing, setTesting] = useState(false);
 
   if (!data && !error) return <LoadingSpinner />;
   if (!data) {
@@ -127,6 +139,11 @@ const SettingsBackfill = () => {
   }
 
   const noClients = !data.torrentClients.length && !data.usenetClients.length;
+  // Prowlarr is set up in Services; here, only whether it is.
+  const prowlarrReady = !!data.prowlarr.hostname && data.prowlarr.hasApiKey;
+  const prowlarrAddress = `${data.prowlarr.useSsl ? 'https' : 'http'}://${
+    data.prowlarr.hostname
+  }:${data.prowlarr.port}${data.prowlarr.urlBase}`;
 
   return (
     <>
@@ -134,7 +151,10 @@ const SettingsBackfill = () => {
         <h3 className="heading">{intl.formatMessage(messages.backfill)}</h3>
         <p className="description">
           {intl.formatMessage(messages.description)}{' '}
-          <Link href="/backfill" className="text-indigo-400 hover:underline">
+          <Link
+            href="/backfill"
+            className="text-indigo-400 hover:underline light:text-accent-text"
+          >
             {intl.formatMessage(messages.openBackfill)}
           </Link>
         </p>
@@ -150,13 +170,6 @@ const SettingsBackfill = () => {
           try {
             await axios.put('/api/v1/settings/backfill', {
               enabled: values.enabled,
-              prowlarr: {
-                hostname: values.prowlarr.hostname,
-                port: Number(values.prowlarr.port),
-                useSsl: values.prowlarr.useSsl,
-                urlBase: values.prowlarr.urlBase,
-                apiKey: values.prowlarr.apiKey,
-              },
               torrentClientId:
                 values.torrentClientId === ''
                   ? null
@@ -167,7 +180,10 @@ const SettingsBackfill = () => {
                   : Number(values.usenetClientId),
               category: values.category,
               includeMovies: values.includeMovies,
+              includeMusic: values.includeMusic,
               stuckAfterHours: Number(values.stuckAfterHours),
+              newReleaseWaitHours: Number(values.newReleaseWaitHours),
+              searchAfterArr: values.searchAfterArr,
               includeCutoffUnmet: values.includeCutoffUnmet,
               includeSpecials: values.includeSpecials,
               searchesPerScan: Number(values.searchesPerScan),
@@ -178,9 +194,16 @@ const SettingsBackfill = () => {
                 maxSizeGb: Number(values.autoApprove.maxSizeGb),
               },
               maxActiveJobs: Number(values.maxActiveJobs),
+              maxMovieJobs: Number(values.maxMovieJobs),
+              maxMusicJobs: Number(values.maxMusicJobs),
               minFreeSpaceGb: Number(values.minFreeSpaceGb),
               stallHours: Number(values.stallHours),
+              slowHours: Number(values.slowHours),
               replaceFailed: values.replaceFailed,
+              stepDown: {
+                enabled: values.stepDown.enabled,
+                days: Number(values.stepDown.days),
+              },
               historyDays: Number(values.historyDays),
               agent: {
                 autoRun: values.agent.autoRun,
@@ -218,38 +241,6 @@ const SettingsBackfill = () => {
               onChange={() => setFieldValue(name, !value)}
             />
           );
-          const runTest = async () => {
-            setTesting(true);
-            setTest(undefined);
-            try {
-              const { data: answer } = await axios.post<{ version: string }>(
-                '/api/v1/settings/backfill/test',
-                {
-                  hostname: values.prowlarr.hostname,
-                  port: Number(values.prowlarr.port),
-                  useSsl: values.prowlarr.useSsl,
-                  urlBase: values.prowlarr.urlBase,
-                  apiKey: values.prowlarr.apiKey,
-                }
-              );
-              setTest({
-                ok: true,
-                text: intl.formatMessage(messages.testOk, {
-                  version: answer.version,
-                }),
-              });
-            } catch (e) {
-              setTest({
-                ok: false,
-                text:
-                  axios.isAxiosError(e) && e.response?.data?.message
-                    ? String(e.response.data.message)
-                    : intl.formatMessage(messages.testFailed),
-              });
-            } finally {
-              setTesting(false);
-            }
-          };
           return (
             <Form className="section">
               <div className="form-row">
@@ -267,100 +258,30 @@ const SettingsBackfill = () => {
               <h4 className="mt-8 text-lg font-semibold text-gray-200">
                 {intl.formatMessage(messages.prowlarr)}
               </h4>
-              <div className="form-row">
-                <label htmlFor="prowlarr.hostname" className="text-label">
-                  {intl.formatMessage(messages.hostname)}
-                </label>
-                <div className="form-input-area">
-                  <div className="form-input-field">
-                    <Field
-                      id="prowlarr.hostname"
-                      name="prowlarr.hostname"
-                      type="text"
-                      placeholder="prowlarr"
-                    />
-                  </div>
-                </div>
-              </div>
-              <div className="form-row">
-                <label htmlFor="prowlarr.port" className="text-label">
-                  {intl.formatMessage(messages.port)}
-                </label>
-                <div className="form-input-area">
-                  <Field
-                    id="prowlarr.port"
-                    name="prowlarr.port"
-                    type="text"
-                    inputMode="numeric"
-                    className="short"
-                  />
-                </div>
-              </div>
-              <div className="form-row">
-                <label htmlFor="prowlarr.useSsl" className="checkbox-label">
-                  {intl.formatMessage(messages.ssl)}
-                </label>
-                <div className="form-input-area">
-                  {checkbox('prowlarr.useSsl', values.prowlarr.useSsl)}
-                </div>
-              </div>
-              <div className="form-row">
-                <label htmlFor="prowlarr.urlBase" className="text-label">
-                  {intl.formatMessage(messages.urlBase)}
-                </label>
-                <div className="form-input-area">
-                  <div className="form-input-field">
-                    <Field
-                      id="prowlarr.urlBase"
-                      name="prowlarr.urlBase"
-                      type="text"
-                    />
-                  </div>
-                </div>
-              </div>
-              <div className="form-row">
-                <label htmlFor="prowlarr.apiKey" className="text-label">
-                  {intl.formatMessage(messages.apiKey)}
-                  {data.prowlarr.hasApiKey && (
-                    <span className="label-tip">
-                      {intl.formatMessage(messages.apiKeySaved)}
-                    </span>
-                  )}
-                </label>
-                <div className="form-input-area">
-                  <div className="form-input-field">
-                    <SensitiveInput
-                      as="field"
-                      id="prowlarr.apiKey"
-                      name="prowlarr.apiKey"
-                      autoComplete="off"
-                    />
-                  </div>
-                  <div className="mt-2 flex flex-wrap items-center gap-3">
-                    <Button
-                      buttonType="warning"
-                      buttonSize="sm"
-                      type="button"
-                      disabled={testing || !values.prowlarr.hostname}
-                      onClick={runTest}
-                    >
-                      <BeakerIcon />
-                      <span>
-                        {intl.formatMessage(
-                          testing ? messages.testing : messages.test
-                        )}
-                      </span>
-                    </Button>
-                    {test && (
-                      <span
-                        className={`text-sm ${test.ok ? 'text-green-400' : 'text-red-400'}`}
+              <p
+                className={`mt-2 text-sm ${
+                  prowlarrReady
+                    ? 'text-gray-400'
+                    : 'text-yellow-300 light:text-warning-text'
+                }`}
+              >
+                {intl.formatMessage(
+                  prowlarrReady
+                    ? messages.prowlarrAt
+                    : messages.prowlarrMissing,
+                  {
+                    address: prowlarrAddress,
+                    ServicesLink: (msg: React.ReactNode) => (
+                      <Link
+                        href="/settings/services"
+                        className="text-indigo-400 hover:underline light:text-accent-text"
                       >
-                        {test.text}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
+                        {msg}
+                      </Link>
+                    ),
+                  }
+                )}
+              </p>
 
               <h4 className="mt-8 text-lg font-semibold text-gray-200">
                 {intl.formatMessage(messages.downloads)}
@@ -415,7 +336,11 @@ const SettingsBackfill = () => {
                 <label htmlFor="category" className="text-label">
                   {intl.formatMessage(messages.category)}
                   <span className="label-tip">
-                    {intl.formatMessage(messages.categoryTip)}
+                    {intl.formatMessage(
+                      musicReady
+                        ? messages.categoryTipMusic
+                        : messages.categoryTip
+                    )}
                   </span>
                 </label>
                 <div className="form-input-area">
@@ -428,24 +353,38 @@ const SettingsBackfill = () => {
               <h4 className="mt-8 text-lg font-semibold text-gray-200">
                 {intl.formatMessage(messages.when)}
               </h4>
-              {([['stuckAfterHours', messages.stuckAfterHours]] as const).map(
-                ([name, label]) => (
-                  <div className="form-row" key={name}>
-                    <label htmlFor={name} className="text-label">
-                      {intl.formatMessage(label)}
-                    </label>
-                    <div className="form-input-area">
-                      <Field
-                        id={name}
-                        name={name}
-                        type="text"
-                        inputMode="numeric"
-                        className="short"
-                      />
-                    </div>
+              {(
+                [
+                  ['stuckAfterHours', messages.stuckAfterHours],
+                  ['newReleaseWaitHours', messages.newReleaseWaitHours],
+                ] as const
+              ).map(([name, label]) => (
+                <div className="form-row" key={name}>
+                  <label htmlFor={name} className="text-label">
+                    {intl.formatMessage(label)}
+                  </label>
+                  <div className="form-input-area">
+                    <Field
+                      id={name}
+                      name={name}
+                      type="text"
+                      inputMode="numeric"
+                      className="short"
+                    />
                   </div>
-                )
-              )}
+                </div>
+              ))}
+              <div className="form-row">
+                <label htmlFor="searchAfterArr" className="checkbox-label">
+                  {intl.formatMessage(messages.searchAfterArr)}
+                  <span className="label-tip">
+                    {intl.formatMessage(messages.searchAfterArrTip)}
+                  </span>
+                </label>
+                <div className="form-input-area">
+                  {checkbox('searchAfterArr', values.searchAfterArr)}
+                </div>
+              </div>
               <div className="form-row">
                 <label htmlFor="includeMovies" className="checkbox-label">
                   {intl.formatMessage(messages.includeMovies)}
@@ -457,6 +396,19 @@ const SettingsBackfill = () => {
                   {checkbox('includeMovies', values.includeMovies)}
                 </div>
               </div>
+              {musicReady && (
+                <div className="form-row">
+                  <label htmlFor="includeMusic" className="checkbox-label">
+                    {intl.formatMessage(messages.includeMusic)}
+                    <span className="label-tip">
+                      {intl.formatMessage(messages.includeMusicTip)}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    {checkbox('includeMusic', values.includeMusic)}
+                  </div>
+                </div>
+              )}
               <div className="form-row">
                 <label htmlFor="includeCutoffUnmet" className="checkbox-label">
                   {intl.formatMessage(messages.includeCutoffUnmet)}
@@ -494,6 +446,33 @@ const SettingsBackfill = () => {
                   {checkbox('replaceFailed', values.replaceFailed)}
                 </div>
               </div>
+              <div className="form-row">
+                <label htmlFor="stepDown.enabled" className="checkbox-label">
+                  {intl.formatMessage(messages.stepDown)}
+                  <span className="label-tip">
+                    {intl.formatMessage(messages.stepDownTip)}
+                  </span>
+                </label>
+                <div className="form-input-area">
+                  {checkbox('stepDown.enabled', values.stepDown.enabled)}
+                </div>
+              </div>
+              {values.stepDown.enabled && (
+                <div className="form-row">
+                  <label htmlFor="stepDown.days" className="text-label">
+                    {intl.formatMessage(messages.stepDownDays)}
+                  </label>
+                  <div className="form-input-area">
+                    <Field
+                      id="stepDown.days"
+                      name="stepDown.days"
+                      type="text"
+                      inputMode="numeric"
+                      className="short"
+                    />
+                  </div>
+                </div>
+              )}
               {(values.autoApprove.enabled || values.replaceFailed) && (
                 <>
                   <div className="form-row">
@@ -611,8 +590,19 @@ const SettingsBackfill = () => {
                       messages.maxActiveJobs,
                       messages.maxActiveJobsTip,
                     ],
+                    ['maxMovieJobs', messages.maxMovieJobs, undefined],
+                    ...(musicReady
+                      ? ([
+                          [
+                            'maxMusicJobs',
+                            messages.maxMusicJobs,
+                            messages.maxMusicJobsTip,
+                          ],
+                        ] as const)
+                      : []),
                     ['minFreeSpaceGb', messages.minFreeSpaceGb, undefined],
                     ['stallHours', messages.stallHours, messages.stallHoursTip],
+                    ['slowHours', messages.slowHours, messages.slowHoursTip],
                     [
                       'historyDays',
                       messages.historyDays,
@@ -695,7 +685,7 @@ const SettingsBackfill = () => {
                 ))}
               </AdvancedSection>
 
-              <div className="actions">
+              <SaveBar>
                 <div className="flex justify-end">
                   <span className="ml-3 inline-flex rounded-md shadow-sm">
                     <Button
@@ -714,11 +704,12 @@ const SettingsBackfill = () => {
                     </Button>
                   </span>
                 </div>
-              </div>
+              </SaveBar>
             </Form>
           );
         }}
       </Formik>
+      <DownloadCheck initial={data.downloadCheck?.mode ?? 'off'} />
       <BlockedGroups initial={data.blockedGroups ?? []} />
     </>
   );

@@ -1,3 +1,4 @@
+import { PROJECT_BRANCH, PROJECT_REPO } from '@server/constants/project';
 import type { NotificationAgentEmail } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import Email from 'email-templates';
@@ -6,6 +7,29 @@ import nodemailer from 'nodemailer';
 import type SMTPTransport from 'nodemailer/lib/smtp-transport';
 import { URL } from 'url';
 import { openpgpEncrypt } from './openpgpEncrypt';
+
+// Light logo for the dark email background. PNG: Gmail and Outlook don't render
+// SVG.
+const LOGO_FILE = 'logo_ai_dark.png';
+const PUBLIC_LOGO_URL = `https://raw.githubusercontent.com/${PROJECT_REPO}/${PROJECT_BRANCH}/public/${LOGO_FILE}`;
+
+/**
+ * Email logo URL: the repository copy if `usePublicLogo`, else this server's
+ * (needs Application URL); undefined shows the app name. Test emails pass
+ * their unsaved settings.
+ */
+export const emailLogoUrl = (
+  options: Pick<
+    NotificationAgentEmail['options'],
+    'usePublicLogo'
+  > = getSettings().notifications.agents.email.options
+): string | undefined => {
+  if (options.usePublicLogo) {
+    return PUBLIC_LOGO_URL;
+  }
+  const { applicationUrl } = getSettings().main;
+  return applicationUrl ? `${applicationUrl}/${LOGO_FILE}` : undefined;
+};
 
 const getSocket: SMTPTransport.Options['getSocket'] = (options, callback) => {
   if (!options.host || typeof options.port !== 'number') {
@@ -88,9 +112,8 @@ class PreparedEmail extends Email {
         },
       },
       send: true,
-      // nodemailer 10 ships its own types; email-templates' still describe
-      // the same transporter through @types/nodemailer 8. It is the same
-      // object at run time: email-templates only calls its sendMail.
+      // email-templates types target @types/nodemailer 8; nodemailer 10's
+      // transporter is the same at run time (only sendMail is called).
       transport: transport as unknown as Email.NodeMailerTransportOptions,
       preview: false,
     });

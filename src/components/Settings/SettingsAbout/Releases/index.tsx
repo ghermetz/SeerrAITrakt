@@ -7,13 +7,13 @@ import defineMessages from '@app/utils/defineMessages';
 import { Transition } from '@headlessui/react';
 import { DocumentTextIcon } from '@heroicons/react/24/outline';
 import { PROJECT_REPO } from '@server/constants/project';
+import { isCurrentRelease, latestRelease } from '@server/utils/releases';
 import dynamic from 'next/dynamic';
 import { Fragment, useState } from 'react';
 import { FormattedRelativeTime, useIntl } from 'react-intl';
 import useSWR from 'swr';
 
-// dyanmic is having trouble extracting the props for react-markdown here so we are just ignoring it since its really
-// only children we are using
+// dynamic can't infer react-markdown's props; only children is used.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const ReactMarkdown = dynamic<any>(() => import('react-markdown'), {
   ssr: false,
@@ -88,8 +88,8 @@ const Release = ({ currentVersion, release, isLatest }: ReleaseProps) => {
           </div>
         </Modal>
       </Transition>
-      <div className="flex w-full flex-grow items-center justify-center space-x-2 truncate sm:justify-start">
-        <span className="truncate text-lg font-bold">
+      <div className="flex w-full flex-grow flex-wrap items-center justify-center gap-2 sm:justify-start">
+        <span className="min-w-0 break-words text-lg font-bold">
           <span className="mr-2 whitespace-nowrap text-xs font-normal">
             <FormattedRelativeTime
               value={Math.floor(
@@ -106,7 +106,7 @@ const Release = ({ currentVersion, release, isLatest }: ReleaseProps) => {
             {intl.formatMessage(messages.latestversion)}
           </Badge>
         )}
-        {release.name.includes(currentVersion) && (
+        {isCurrentRelease(release, currentVersion) && (
           <Badge badgeType="primary">
             {intl.formatMessage(messages.currentversion)}
           </Badge>
@@ -140,17 +140,20 @@ const Releases = ({ currentVersion }: ReleasesProps) => {
     );
   }
 
+  // The same release the update check counts as the latest.
+  const latest = latestRelease(data, currentVersion);
+
   return (
     <div>
       <h3 className="heading">{intl.formatMessage(messages.releases)}</h3>
       <div className="section space-y-3">
-        {data.map((release, index) => {
+        {data.map((release) => {
           return (
             <div key={`release-${release.id}`}>
               <Release
                 release={release}
                 currentVersion={currentVersion}
-                isLatest={index === 0}
+                isLatest={release === latest}
               />
             </div>
           );

@@ -5,20 +5,26 @@ import AdvancedRequester from '@app/components/RequestModal/AdvancedRequester';
 import AnimeChoice, {
   useAnimeChoice,
 } from '@app/components/RequestModal/AnimeChoice';
-import QuotaDisplay from '@app/components/RequestModal/QuotaDisplay';
+import FailedRequestAlert, {
+  failedMessages,
+} from '@app/components/RequestModal/FailedRequestAlert';
+import QuotaDisplay, {
+  OverQuotaAlert,
+} from '@app/components/RequestModal/QuotaDisplay';
 import RequestListPicker from '@app/components/RequestModal/RequestListPicker';
+import useIsAnime from '@app/hooks/useIsAnime';
 import useToasts from '@app/hooks/useToasts';
 import { useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import { addToLists } from '@app/utils/addToLists';
 import defineMessages from '@app/utils/defineMessages';
-import { MediaStatus } from '@server/constants/media';
+import { retryErrorMessage } from '@app/utils/requestServerIssue';
+import { MediaRequestStatus, MediaStatus } from '@server/constants/media';
 import type { MediaRequest } from '@server/entity/MediaRequest';
 import type { NonFunctionProperties } from '@server/interfaces/api/common';
 import type { QuotaResponse } from '@server/interfaces/api/userInterfaces';
 import { Permission } from '@server/lib/permissions';
 import type { MovieDetails } from '@server/models/Movie';
-import { isAnime } from '@server/utils/isAnime';
 import axios from 'axios';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -71,6 +77,7 @@ const MovieRequestModal = ({
   });
   const intl = useIntl();
   const { user, hasPermission } = useUser();
+  const isAnime = useIsAnime();
   const animeChoice = useAnimeChoice({
     detected: !!data && isAnime(data),
     animeSetting: data?.mediaInfo?.animeSetting,
@@ -115,25 +122,14 @@ const MovieRequestModal = ({
       globalMutate('/api/v1/request/count');
 
       if (response.data) {
-        // The request has already succeeded; adding to lists is a follow-on
-        // and must not be able to make it look like it failed.
+        // The request already succeeded; list errors must not undo that.
         if (listIds.length && data?.id) {
           await addToLists(listIds, data.id, 'movie', globalMutate);
         }
 
         if (onComplete) {
-          onComplete(
-            hasPermission(
-              is4k ? Permission.AUTO_APPROVE_4K : Permission.AUTO_APPROVE
-            ) ||
-              hasPermission(
-                is4k
-                  ? Permission.AUTO_APPROVE_4K_MOVIE
-                  : Permission.AUTO_APPROVE_MOVIE
-              )
-              ? MediaStatus.PROCESSING
-              : MediaStatus.PENDING
-          );
+          // Use the server's status, not a guess from permissions.
+          onComplete(response.data.media[is4k ? 'status4k' : 'status']);
         }
         addToast(
           <span>
@@ -164,7 +160,6 @@ const MovieRequestModal = ({
     onComplete,
     addToast,
     intl,
-    hasPermission,
   ]);
 
   const cancelRequest = async () => {
@@ -196,6 +191,9 @@ const MovieRequestModal = ({
     }
   };
 
+  // A failed request is edited by a manager and then retried.
+  const isFailed = editRequest?.status === MediaRequestStatus.FAILED;
+
   const updateRequest = async (alsoApproveRequest = false) => {
     setIsUpdating(true);
 
@@ -210,7 +208,9 @@ const MovieRequestModal = ({
         seriesType: animeChoice.seriesType,
       });
 
-      if (alsoApproveRequest) {
+      if (isFailed) {
+        await axios.post(`/api/v1/request/${editRequest?.id}/retry`);
+      } else if (alsoApproveRequest) {
         await axios.post(`/api/v1/request/${editRequest?.id}/approve`);
       }
       globalMutate('/api/v1/request?filter=all&take=10&sort=modified&skip=0');
@@ -219,9 +219,11 @@ const MovieRequestModal = ({
       addToast(
         <span>
           {intl.formatMessage(
-            alsoApproveRequest
-              ? messages.requestApproved
-              : messages.requestedited,
+            isFailed
+              ? failedMessages.retried
+              : alsoApproveRequest
+                ? messages.requestApproved
+                : messages.requestedited,
             {
               title: data?.title,
               strong: (msg: React.ReactNode) => <strong>{msg}</strong>,
@@ -235,13 +237,25 @@ const MovieRequestModal = ({
       );
 
       if (onComplete) {
-        onComplete(MediaStatus.PENDING);
+        onComplete(isFailed ? MediaStatus.PROCESSING : MediaStatus.PENDING);
       }
-    } catch {
-      addToast(<span>{intl.formatMessage(messages.errorediting)}</span>, {
-        appearance: 'error',
-        autoDismiss: true,
-      });
+    } catch (e) {
+      addToast(
+        <span>
+          {isFailed
+            ? retryErrorMessage(
+                e,
+                intl,
+                is4k,
+                intl.formatMessage(messages.errorediting)
+              )
+            : intl.formatMessage(messages.errorediting)}
+        </span>,
+        {
+          appearance: 'error',
+          autoDismiss: true,
+        }
+      );
     } finally {
       setIsUpdating(false);
     }
@@ -257,32 +271,45 @@ const MovieRequestModal = ({
         backgroundClickable
         onCancel={onCancel}
         title={intl.formatMessage(
-          is4k ? messages.pending4krequest : messages.pendingrequest
+          isFailed
+            ? is4k
+              ? failedMessages.title4k
+              : failedMessages.title
+            : is4k
+              ? messages.pending4krequest
+              : messages.pendingrequest
         )}
         subTitle={data?.title}
         onOk={() =>
-          hasPermission(Permission.MANAGE_REQUESTS)
-            ? updateRequest(true)
-            : hasPermission(Permission.REQUEST_ADVANCED)
-              ? updateRequest()
-              : cancelRequest()
+          isFailed
+            ? updateRequest()
+            : hasPermission(Permission.MANAGE_REQUESTS)
+              ? updateRequest(true)
+              : hasPermission(Permission.REQUEST_ADVANCED)
+                ? updateRequest()
+                : cancelRequest()
         }
         okDisabled={isUpdating}
         okText={
-          hasPermission(Permission.MANAGE_REQUESTS)
-            ? intl.formatMessage(messages.approve)
-            : hasPermission(Permission.REQUEST_ADVANCED)
-              ? intl.formatMessage(messages.edit)
-              : intl.formatMessage(messages.cancel)
+          isFailed
+            ? intl.formatMessage(failedMessages.saveAndRetry)
+            : hasPermission(Permission.MANAGE_REQUESTS)
+              ? intl.formatMessage(messages.approve)
+              : hasPermission(Permission.REQUEST_ADVANCED)
+                ? intl.formatMessage(messages.edit)
+                : intl.formatMessage(messages.cancel)
         }
         okButtonType={
-          hasPermission(Permission.MANAGE_REQUESTS)
-            ? 'success'
-            : hasPermission(Permission.REQUEST_ADVANCED)
-              ? 'primary'
-              : 'danger'
+          isFailed
+            ? 'primary'
+            : hasPermission(Permission.MANAGE_REQUESTS)
+              ? 'success'
+              : hasPermission(Permission.REQUEST_ADVANCED)
+                ? 'primary'
+                : 'danger'
         }
         onSecondary={
+          !isFailed &&
           isOwner &&
           hasPermission(
             [Permission.REQUEST_ADVANCED, Permission.MANAGE_REQUESTS],
@@ -305,11 +332,16 @@ const MovieRequestModal = ({
         cancelText={intl.formatMessage(globalMessages.close)}
         backdrop={`https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${data?.backdropPath}`}
       >
-        {isOwner
-          ? intl.formatMessage(messages.pendingapproval)
-          : intl.formatMessage(messages.requestfrom, {
-              username: editRequest.requestedBy.displayName,
-            })}
+        {isFailed ? (
+          <FailedRequestAlert request={editRequest} />
+        ) : isOwner ? (
+          intl.formatMessage(messages.pendingapproval)
+        ) : (
+          intl.formatMessage(messages.requestfrom, {
+            username: editRequest.requestedBy.displayName,
+          })
+        )}
+        {!isFailed && editRequest.overQuota && <OverQuotaAlert />}
         {data && (
           <AnimeChoice
             checked={animeChoice.anime}
@@ -331,12 +363,17 @@ const MovieRequestModal = ({
             onRuleSeriesType={animeChoice.setRuleSeriesType}
             requestUser={editRequest.requestedBy}
             requestId={editRequest.id}
-            defaultOverrides={{
-              folder: editRequest.rootFolder,
-              profile: editRequest.profileId,
-              server: editRequest.serverId,
-              tags: editRequest.tags,
-            }}
+            // Server removed: start from the default, like a new request.
+            defaultOverrides={
+              editRequest.serverIssue
+                ? undefined
+                : {
+                    folder: editRequest.rootFolder,
+                    profile: editRequest.profileId,
+                    server: editRequest.serverId,
+                    tags: editRequest.tags,
+                  }
+            }
             onChange={(overrides) => {
               setRequestOverrides(overrides);
             }}
@@ -355,6 +392,9 @@ const MovieRequestModal = ({
     { type: 'or' }
   );
 
+  // Past the limit: refused, or left for an admin when the server allows it.
+  const pastLimit = !!quota?.movie.restricted && !requestOverrides?.ignoreQuota;
+
   return (
     <Modal
       showCloseButton
@@ -362,10 +402,7 @@ const MovieRequestModal = ({
       backgroundClickable
       onCancel={onCancel}
       onOk={sendRequest}
-      okDisabled={
-        isUpdating ||
-        (quota?.movie.restricted && !requestOverrides?.ignoreQuota)
-      }
+      okDisabled={isUpdating || (pastLimit && !quota?.overQuotaWaits)}
       title={intl.formatMessage(
         is4k ? messages.requestmovie4ktitle : messages.requestmovietitle
       )}
@@ -388,6 +425,7 @@ const MovieRequestModal = ({
           />
         </div>
       )}
+      {pastLimit && quota?.overQuotaWaits && <OverQuotaAlert />}
       {(quota?.movie.limit ?? 0) > 0 && (
         <QuotaDisplay
           mediaType="movie"

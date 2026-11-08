@@ -1,25 +1,26 @@
 import PlexTvAPI from '@server/api/plextv';
-import { MediaServerType } from '@server/constants/server';
 import { getRepository } from '@server/datasource';
 import { User } from '@server/entity/User';
 import type {
   PlexSubtitleDefault,
   PlexSubtitleOption,
 } from '@server/interfaces/api/subtitlesInterfaces';
+import { isConnected } from '@server/lib/mediaServers';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import type { AxiosInstance } from 'axios';
 import axios from 'axios';
+import { createHash } from 'node:crypto';
 
 /*
- * Which subtitle someone's own Plex player starts with. Plex keeps that
- * choice per person and per video, so it is read and set with that person's
- * own access to the server: plex.tv lists the servers they can use, with a
- * token for each. Setting it for a series sets it on every episode.
+ * The subtitle a user's own Plex player starts with. Plex stores that per user
+ * and per video, so it is read and set with the user's own server access:
+ * plex.tv lists their servers, each with a token. Setting it for a series sets
+ * every episode.
  */
 
 const PLEX_TIMEOUT_MS = 10_000;
-/** Server tokens from plex.tv, kept for a while. */
+/** Cache lifetime for server tokens from plex.tv. */
 const TOKEN_TTL_MS = 60 * 60_000;
 const EPISODE_CONCURRENCY = 3;
 
@@ -35,7 +36,7 @@ interface PlexStream {
   selected?: boolean | number | string;
   forced?: boolean | number | string;
   hearingImpaired?: boolean | number | string;
-  /** Set for a file beside the video. */
+  /** Set for a sidecar subtitle file. */
   key?: string;
 }
 
@@ -58,35 +59,59 @@ interface PlexAnswer {
 const yes = (value: unknown) =>
   value === true || value === 1 || value === '1' || value === 'true';
 
-const tokens = new Map<number, { at: number; token: string }>();
+/**
+ * Per user: their server token, the server (machine id) it is for, and which
+ * of their Plex sign-ins it came from.
+ */
+const tokens = new Map<
+  number,
+  { at: number; machineId: string; signIn: string; token: string }
+>();
 
-/** The person's own token for this Plex server, if they have one. */
+const signInOf = (plexToken: string) =>
+  createHash('sha256').update(plexToken).digest('base64url');
+
+/** The user's own token for this Plex server, if any. */
 const serverToken = async (userId: number): Promise<string | undefined> => {
   const settings = getSettings();
-  if (
-    settings.main.mediaServerType !== MediaServerType.PLEX ||
-    !settings.plex.machineId
-  ) {
+  const { machineId } = settings.plex;
+  if (!isConnected('plex') || !machineId) {
     return undefined;
   }
-  const cached = tokens.get(userId);
-  if (cached && Date.now() - cached.at < TOKEN_TTL_MS) {
-    return cached.token;
-  }
+  // Read each time: a deleted account, an unlinked Plex account or a new
+  // Plex sign-in leaves nothing kept from before.
   const user = await getRepository(User).findOne({
     where: { id: userId },
     select: ['id', 'plexToken'],
   });
   if (!user?.plexToken) {
+    tokens.delete(userId);
     return undefined;
   }
+  const signIn = signInOf(user.plexToken);
+  // Never send a token for a server Seerr has since moved off to the new one.
+  const cached = tokens.get(userId);
+  if (
+    cached &&
+    cached.machineId === machineId &&
+    cached.signIn === signIn &&
+    Date.now() - cached.at < TOKEN_TTL_MS
+  ) {
+    return cached.token;
+  }
+  tokens.delete(userId);
   const server = (await new PlexTvAPI(user.plexToken).getDevices()).find(
-    (device) => device.clientIdentifier === settings.plex.machineId
+    (device) => device.clientIdentifier === machineId
   );
   if (!server?.accessToken) {
     return undefined;
   }
-  tokens.set(userId, { at: Date.now(), token: server.accessToken });
+  tokens.set(userId, {
+    at: Date.now(),
+    machineId,
+    signIn,
+    token: server.accessToken,
+  });
   return server.accessToken;
 };
 
@@ -190,7 +215,7 @@ const episodesOf = async (plex: AxiosInstance, showKey: string) => {
   );
 };
 
-/** The best of a language's subtitles to start with: plain over forced or SDH. */
+/** A language's best starting subtitle: plain over forced or SDH. */
 export const pickStream = (
   streams: PlexStream[],
   language: string
@@ -208,8 +233,8 @@ export const pickStream = (
 };
 
 /**
- * A series is set by language. What it is set to now is read from its
- * latest episode, the one most likely to be played next.
+ * Series defaults are per language, read from the latest episode, the one
+ * most likely played next.
  */
 export const seriesDefault = async (
   userId: number,
@@ -244,26 +269,24 @@ export const seriesDefault = async (
 };
 
 /*
- * The pass setting each person's series, by "user:show", numbered. A new
- * choice for the same series starts a new pass, and the one before stops
- * before its next write, so the episodes all end up with the latest choice
- * rather than a mix of the two.
+ * Numbered passes setting each user's series, by "user:show". A new choice
+ * for the same series starts a new pass and stops the previous one before its
+ * next write, so all episodes end with the latest choice, not a mix.
  */
 const seriesPasses = new Map<string, number>();
 let passCount = 0;
 
 /**
- * Sets every episode to the language given (or to none), in the
- * background. Returns how many episodes it will go through, or undefined
- * without a Plex sign-in to use.
+ * Sets every episode to the given language (or none) in the background.
+ * Returns how many episodes it will process, or undefined without a Plex
+ * sign-in.
  */
 export const setSeriesDefault = async (
   userId: number,
   showKey: string,
   language: string
 ): Promise<number | undefined> => {
-  // Numbered as it is asked, before anything is awaited, so the order of
-  // the choices is the order they were made in.
+  // Numbered before any await, so passes follow the order choices were made.
   const passKey = `${userId}:${showKey}`;
   const pass = ++passCount;
   seriesPasses.set(passKey, pass);
@@ -301,7 +324,7 @@ export const setSeriesDefault = async (
         const stream = language
           ? pickStream(subtitlesOf(part), language)
           : undefined;
-        // An episode without that language is left as it is.
+        // Episodes without that language are left alone.
         if (language && !stream) {
           continue;
         }

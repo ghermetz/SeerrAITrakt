@@ -94,7 +94,7 @@ const BlocklistBlock = ({
                 <Tooltip content={intl.formatMessage(messages.blocklistedby)}>
                   <UserIcon className="mr-1.5 h-5 w-5 min-w-0 flex-shrink-0" />
                 </Tooltip>
-                <span className="w-40 truncate md:w-auto">
+                <span className="min-w-0 break-words">
                   <Link
                     href={
                       data.user.id === user?.id
@@ -102,7 +102,7 @@ const BlocklistBlock = ({
                         : `/users/${data.user.id}`
                     }
                   >
-                    <span className="font-semibold text-gray-100 transition duration-300 hover:text-white hover:underline">
+                    <span className="font-semibold text-gray-100 transition duration-300 hover:text-strong hover:underline">
                       {data.user.displayName}
                     </span>
                   </Link>
@@ -110,7 +110,7 @@ const BlocklistBlock = ({
               </>
             ) : data.blocklistedTags ? (
               <>
-                <span className="w-40 truncate md:w-auto">
+                <span className="min-w-0 break-words">
                   {intl.formatMessage(messages.blocklistedby)}:&nbsp;
                 </span>
                 <BlocklistedTagsBadge data={data} />

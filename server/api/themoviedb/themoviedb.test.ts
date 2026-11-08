@@ -4,10 +4,7 @@ import logger from '@server/logger';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 
-/*
- * TMDB's searches, when TMDB does not answer: still an empty page for the
- * callers, but no longer silent.
- */
+/* A search TMDB doesn't answer: an empty page for callers, and a warning. */
 
 let warned: unknown[][] = [];
 
@@ -39,10 +36,148 @@ describe('a TMDB search TMDB does not answer', () => {
     'searchTvShows',
   ] as const) {
     it(`${search} says so in the log, and finds nothing`, async () => {
-      const result = await failing()[search]({ query: 'Alien' });
+      const result = await failing()[search]({ query: 'Aurelin' });
       assert.deepEqual(result.results, []);
       assert.equal(warned.length, 1);
       assert.match(JSON.stringify(warned[0]), /status code 503/);
     });
   }
+});
+
+describe('discovering series by when their episodes air', () => {
+  it('asks TMDB for episodes airing between two days', async () => {
+    const tmdb = new TheMovieDb();
+    let params: Record<string, unknown> = {};
+    (
+      tmdb as unknown as {
+        axios: { get: (url: string, config: { params: object }) => unknown };
+      }
+    ).axios = {
+      get: async (_url, config) => {
+        params = config.params as Record<string, unknown>;
+        return { data: { page: 1, total_pages: 1, results: [] } };
+      },
+    };
+    await tmdb.getDiscoverTv({
+      airDateGte: '2026-10-01',
+      airDateLte: '2026-12-31',
+    });
+    assert.equal(params['air_date.gte'], '2026-10-01');
+    assert.equal(params['air_date.lte'], '2026-12-31');
+    assert.equal(params['first_air_date.gte'], undefined);
+    assert.equal(params['first_air_date.lte'], undefined);
+  });
+});
+
+describe('discovering titles by where they were made', () => {
+  const capture = (tmdb: TheMovieDb) => {
+    const asked: Record<string, unknown>[] = [];
+    (
+      tmdb as unknown as {
+        axios: { get: (url: string, config: { params: object }) => unknown };
+      }
+    ).axios = {
+      get: async (_url, config) => {
+        asked.push(config.params as Record<string, unknown>);
+        return { data: { page: 1, total_pages: 1, results: [] } };
+      },
+    };
+    return asked;
+  };
+
+  it('asks TMDB for series and films from one country', async () => {
+    const tmdb = new TheMovieDb();
+    const asked = capture(tmdb);
+    await tmdb.getDiscoverTv({ originCountry: 'KR' });
+    await tmdb.getDiscoverMovies({ originCountry: 'KR' });
+    assert.deepEqual(
+      asked.map((params) => params.with_origin_country),
+      ['KR', 'KR']
+    );
+  });
+
+  it('does not narrow by country unless asked', async () => {
+    const tmdb = new TheMovieDb();
+    const asked = capture(tmdb);
+    await tmdb.getDiscoverTv({});
+    await tmdb.getDiscoverMovies({});
+    assert.deepEqual(
+      asked.map((params) => params.with_origin_country),
+      [undefined, undefined]
+    );
+  });
+});
+
+describe('discovering titles by streaming service', () => {
+  const capture = (tmdb: TheMovieDb) => {
+    const asked: Record<string, unknown>[] = [];
+    (
+      tmdb as unknown as {
+        axios: { get: (url: string, config: { params: object }) => unknown };
+      }
+    ).axios = {
+      get: async (_url, config) => {
+        asked.push(config.params as Record<string, unknown>);
+        return { data: { page: 1, total_pages: 1, results: [] } };
+      },
+    };
+    return asked;
+  };
+  const services = (params: Record<string, unknown>) => ({
+    region: params.watch_region,
+    on: params.with_watch_providers,
+    notOn: params.without_watch_providers,
+  });
+
+  it('asks TMDB for titles on some services and not on others', async () => {
+    const tmdb = new TheMovieDb();
+    const asked = capture(tmdb);
+    const options = {
+      watchRegion: 'US',
+      watchProviders: '8|9',
+      excludeWatchProviders: '337|350',
+    };
+    await tmdb.getDiscoverMovies(options);
+    await tmdb.getDiscoverTv(options);
+    const expected = { region: 'US', on: '8|9', notOn: '337|350' };
+    assert.deepEqual(asked.map(services), [expected, expected]);
+  });
+
+  it('leaves nothing out unless asked', async () => {
+    const tmdb = new TheMovieDb();
+    const asked = capture(tmdb);
+    await tmdb.getDiscoverMovies({ watchRegion: 'US', watchProviders: '8' });
+    await tmdb.getDiscoverTv({ watchRegion: 'US', watchProviders: '8' });
+    assert.deepEqual(
+      asked.map((params) => params.without_watch_providers),
+      [undefined, undefined]
+    );
+  });
+});
+
+describe('searching people', () => {
+  const asking = () => {
+    const tmdb = new TheMovieDb();
+    const asked: Record<string, unknown>[] = [];
+    (
+      tmdb as unknown as {
+        axios: { get: (url: string, config: { params: object }) => unknown };
+      }
+    ).axios = {
+      get: async (_url, config) => {
+        asked.push(config.params as Record<string, unknown>);
+        return { data: { page: 1, total_pages: 2, results: [] } };
+      },
+    };
+    return { tmdb, asked };
+  };
+
+  it('asks for a later page, and for the first as it always has', async () => {
+    const { tmdb, asked } = asking();
+    await tmdb.searchPerson({ query: 'Glasswing' });
+    await tmdb.searchPerson({ query: 'Glasswing', page: 2 });
+    assert.equal(asked.length, 2);
+    assert.equal('page' in asked[0], false);
+    assert.equal(asked[1].page, 2);
+  });
 });

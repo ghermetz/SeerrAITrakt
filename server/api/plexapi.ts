@@ -2,7 +2,7 @@ import ExternalAPI, {
   DEFAULT_REQUEST_TIMEOUT_MS,
 } from '@server/api/externalapi';
 import { ApiErrorCode } from '@server/constants/error';
-import type { Library, PlexSettings } from '@server/lib/settings';
+import type { Library, MusicLibrary, PlexSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { ApiError } from '@server/types/error';
@@ -34,6 +34,7 @@ export interface PlexLibraryItem {
   Media: Media[];
   /** A show's folders on disk. */
   Location?: { path: string }[];
+  librarySectionID?: number | string;
 }
 
 interface PlexLibraryResponse {
@@ -44,10 +45,20 @@ interface PlexLibraryResponse {
 }
 
 export interface PlexLibrary {
-  type: 'show' | 'movie';
+  /** 'artist' means a music library. */
+  type: 'show' | 'movie' | 'artist';
   key: string;
   title: string;
   agent: string;
+  language?: string;
+}
+
+/** A Fix Match candidate for an item. */
+export interface PlexMatchResult {
+  guid: string;
+  name: string;
+  year?: number;
+  score?: number;
 }
 
 interface PlexLibrariesResponse {
@@ -92,8 +103,18 @@ interface Media {
   container: string;
   videoFrameRate: string;
   videoProfile: string;
-  /** The files it is, for a movie: where it sits on disk. */
-  Part?: { file?: string }[];
+  /**
+   * A movie's files on disk; their streams (with HDR markers) only in a
+   * title's own metadata, not in library listings.
+   */
+  Part?: {
+    file?: string;
+    Stream?: {
+      streamType?: number;
+      DOVIPresent?: boolean;
+      colorTrc?: string;
+    }[];
+  }[];
 }
 
 interface PlexMetadataResponse {
@@ -102,8 +123,63 @@ interface PlexMetadataResponse {
   };
 }
 
+/** An artist, album or track in a music library. */
+export interface PlexMusicItem {
+  ratingKey: string;
+  /** An album's artist; a track's album. */
+  parentRatingKey?: string;
+  type: 'artist' | 'album' | 'track';
+  title: string;
+  /** An album's artist, by name. */
+  parentTitle?: string;
+  year?: number;
+  addedAt?: number;
+  /** An album's tracks in the library. */
+  leafCount?: number;
+  /**
+   * Agent-matched ids. Plex's music agent gives an artist `mbid://<artist>`
+   * and an album `mbid://<id>`, either the release group or one release.
+   */
+  Guid?: { id: string }[];
+  /** An artist's folders on disk, when Plex sends them. */
+  Location?: { path: string }[];
+  /** A track's files. */
+  Media?: { Part?: { file?: string }[] }[];
+}
+
+interface PlexMusicResponse {
+  MediaContainer: {
+    totalSize?: number;
+    Metadata?: PlexMusicItem[];
+  };
+}
+
+/** One playback session from /status/sessions. */
+export interface PlexSession {
+  type: string;
+  /** Movie or episode key. */
+  ratingKey: string;
+  /** An episode's series. */
+  grandparentRatingKey?: string;
+  title?: string;
+  grandparentTitle?: string;
+  /** Episode season and number. */
+  parentIndex?: number;
+  index?: number;
+  /** The viewer: plex.tv id, or "1" for the server owner. */
+  User?: { id?: string; title?: string };
+  Player?: { state?: string; title?: string };
+}
+
+interface PlexSessionsResponse {
+  MediaContainer: { size?: number; Metadata?: PlexSession[] };
+}
+
+/** Plex's type numbers for music items. */
+const PLEX_MUSIC_TYPE = { artist: 8, album: 9 } as const;
+
 const RECENT_PAGE_SIZE = 500;
-/** A bound on one recently added read, should a window be very wide. */
+/** Caps one recently-added read in case the window is very wide. */
 const RECENT_MAX_ITEMS = 5000;
 
 class PlexAPI extends ExternalAPI {
@@ -154,14 +230,13 @@ class PlexAPI extends ExternalAPI {
     try {
       const libraries = await this.getLibraries();
 
-      const newLibraries: Library[] = libraries
-        // Remove libraries that are not movie or show
+      const newLibraries = libraries
         .filter(
           (library) => library.type === 'movie' || library.type === 'show'
         )
-        // Remove libraries that do not have a metadata agent set (usually personal video libraries)
+        // No metadata agent: usually personal video libraries.
         .filter((library) => library.agent !== 'com.plexapp.agents.none')
-        .map((library) => {
+        .map((library): Library => {
           const existing = settings.plex.libraries.find(
             (l) => l.id === library.key
           );
@@ -170,12 +245,28 @@ class PlexAPI extends ExternalAPI {
             id: library.key,
             name: library.title,
             enabled: existing?.enabled ?? false,
-            type: library.type,
+            type: library.type as Library['type'],
             lastScan: existing?.lastScan,
           };
         });
 
       settings.plex.libraries = newLibraries;
+      // Music libraries are stored separately. Any agent counts, none
+      // included: albums are also matched by folder and title.
+      settings.plex.musicLibraries = libraries
+        .filter((library) => library.type === 'artist')
+        .map((library): MusicLibrary => {
+          const existing = (settings.plex.musicLibraries ?? []).find(
+            (l) => l.id === library.key
+          );
+          return {
+            id: library.key,
+            name: library.title,
+            enabled: existing?.enabled ?? false,
+            type: 'artist',
+            lastScan: existing?.lastScan,
+          };
+        });
     } catch (e) {
       logger.error('Failed to fetch Plex libraries', {
         label: 'Plex API',
@@ -225,6 +316,62 @@ class PlexAPI extends ExternalAPI {
     return response.MediaContainer.Metadata[0];
   }
 
+  /**
+   * One movie or show with its matched ids, a movie's files and a show's
+   * folders. Undefined once it is gone.
+   */
+  public async getMatchItem(
+    ratingKey: string
+  ): Promise<PlexLibraryItem | undefined> {
+    try {
+      const response = await this.get<PlexLibraryResponse>(
+        `/library/metadata/${ratingKey}?includeGuids=1`
+      );
+      return response.MediaContainer.Metadata?.[0];
+    } catch (e) {
+      if (e.response?.status === 404) return undefined;
+      throw e;
+    }
+  }
+
+  /**
+   * Fix Match candidates for `title`, which may be an id ("tmdb-123",
+   * "tvdb-456", "imdb-tt789") as in Plex Web. Uses the library's agent and
+   * language.
+   */
+  public async findMatches(
+    ratingKey: string,
+    title: string,
+    library?: { agent?: string; language?: string }
+  ): Promise<PlexMatchResult[]> {
+    const params = new URLSearchParams({ manual: '1', title });
+    if (library?.agent) params.set('agent', library.agent);
+    if (library?.language) params.set('language', library.language);
+    const response = await this.get<{
+      MediaContainer: { SearchResult?: PlexMatchResult[] };
+    }>(`/library/metadata/${encodeURIComponent(ratingKey)}/matches?${params}`);
+    return response.MediaContainer.SearchResult ?? [];
+  }
+
+  /** Matches an item to a Fix Match candidate, as Plex Web does. */
+  public async setMatch(
+    ratingKey: string,
+    to: { guid: string; name: string; year?: number }
+  ): Promise<void> {
+    const params = new URLSearchParams({ guid: to.guid, name: to.name });
+    if (to.year) params.set('year', String(to.year));
+    await this.axios.put(
+      `/library/metadata/${encodeURIComponent(ratingKey)}/match?${params}`
+    );
+  }
+
+  /** Unmatches an item, as Plex Web does. */
+  public async unmatch(ratingKey: string): Promise<void> {
+    await this.axios.put(
+      `/library/metadata/${encodeURIComponent(ratingKey)}/unmatch`
+    );
+  }
+
   public async getChildrenMetadata(key: string): Promise<PlexMetadata[]> {
     const response = await this.get<PlexMetadataResponse>(
       `/library/metadata/${key}/children`
@@ -234,9 +381,8 @@ class PlexAPI extends ExternalAPI {
   }
 
   /**
-   * Everything added to a library since a time, newest first. Read a page
-   * at a time, so a busy day (a whole series imported at once) is not cut
-   * off at the first page.
+   * Everything added to a library since a time, newest first. Paged so a
+   * busy day (a whole series imported) is not cut off at the first page.
    */
   public async getRecentlyAdded(
     id: string,
@@ -264,6 +410,82 @@ class PlexAPI extends ExternalAPI {
       if (page.length < RECENT_PAGE_SIZE) break;
     }
     return items;
+  }
+
+  /** One page of a music library's artists or albums, with matched ids. */
+  public async getMusicItems(
+    sectionId: string,
+    type: 'artist' | 'album',
+    { offset = 0, size = RECENT_PAGE_SIZE }: { offset?: number; size?: number }
+  ): Promise<{ totalSize: number; items: PlexMusicItem[] }> {
+    const response = await this.get<PlexMusicResponse>(
+      `/library/sections/${sectionId}/all?type=${PLEX_MUSIC_TYPE[type]}&includeGuids=1`,
+      {
+        headers: {
+          'X-Plex-Container-Start': String(offset),
+          'X-Plex-Container-Size': String(size),
+        },
+      }
+    );
+    const items = response.MediaContainer.Metadata ?? [];
+    return {
+      totalSize: response.MediaContainer.totalSize ?? items.length,
+      items,
+    };
+  }
+
+  /**
+   * Everything playing on the server now. Needs the owner's token; never
+   * cached, as it changes by the second.
+   */
+  public async getSessions(): Promise<PlexSession[]> {
+    const response = await this.get<PlexSessionsResponse>(
+      '/status/sessions',
+      undefined,
+      0
+    );
+    return response.MediaContainer?.Metadata ?? [];
+  }
+
+  /** Albums added to a music library since a time, newest first. */
+  public async getRecentlyAddedAlbums(
+    sectionId: string,
+    addedAt: number
+  ): Promise<PlexMusicItem[]> {
+    const items: PlexMusicItem[] = [];
+    for (let start = 0; start < RECENT_MAX_ITEMS; start += RECENT_PAGE_SIZE) {
+      const response = await this.get<PlexMusicResponse>(
+        `/library/sections/${sectionId}/all?type=${PLEX_MUSIC_TYPE.album}&includeGuids=1&sort=addedAt%3Adesc&addedAt>>=${Math.floor(addedAt / 1000)}`,
+        {
+          headers: {
+            'X-Plex-Container-Start': String(start),
+            'X-Plex-Container-Size': String(RECENT_PAGE_SIZE),
+          },
+        }
+      );
+      const page = response.MediaContainer.Metadata ?? [];
+      items.push(...page);
+      if (page.length < RECENT_PAGE_SIZE) break;
+    }
+    return items;
+  }
+
+  /** One artist, album or track, with matched ids. */
+  public async getMusicItem(
+    ratingKey: string
+  ): Promise<PlexMusicItem | undefined> {
+    const response = await this.get<PlexMusicResponse>(
+      `/library/metadata/${ratingKey}?includeGuids=1`
+    );
+    return response.MediaContainer.Metadata?.[0];
+  }
+
+  /** An album's tracks, with their files. */
+  public async getAlbumTracks(ratingKey: string): Promise<PlexMusicItem[]> {
+    const response = await this.get<PlexMusicResponse>(
+      `/library/metadata/${ratingKey}/children`
+    );
+    return response.MediaContainer.Metadata ?? [];
   }
 }
 

@@ -1,10 +1,18 @@
 import QBittorrentAPI from '@server/api/downloadclients/qbittorrent';
 import type { ProwlarrRelease } from '@server/api/prowlarr';
 import ProwlarrAPI from '@server/api/prowlarr';
+import {
+  MediaRequestStatus,
+  MediaStatus,
+  MediaType,
+} from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import BackfillCandidate from '@server/entity/BackfillCandidate';
 import BackfillJob from '@server/entity/BackfillJob';
 import BackfillSeries from '@server/entity/BackfillSeries';
+import Media from '@server/entity/Media';
+import { MediaRequest } from '@server/entity/MediaRequest';
+import { User } from '@server/entity/User';
 import backfill, { MAX_FAILED_PER_DAY } from '@server/lib/backfill/engine';
 import { mentionsShow, sameShow } from '@server/lib/backfill/matcher';
 import type { MovieContext } from '@server/lib/backfill/movies';
@@ -21,6 +29,7 @@ import type {
 } from '@server/lib/backfill/sonarr';
 import BackfillSonarr from '@server/lib/backfill/sonarr';
 import notificationManager from '@server/lib/notifications';
+import { Permission } from '@server/lib/permissions';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { BACKFILL_DEFAULTS, getSettings } from '@server/lib/settings';
 import { setupTestDb } from '@server/test/db';
@@ -33,10 +42,10 @@ import { Not } from 'typeorm';
 setupTestDb();
 
 /*
- * Backfill for movies: judging packs against one movie with Radarr's
- * parser, and a movie followed from Radarr's wanted list to its import.
- * Radarr, Prowlarr and qBittorrent are stubbed at their API clients; the
- * parse answers have the shapes the live Radarr gave.
+ * Movie Backfill: packs judged against one movie with Radarr's parser, and
+ * a movie tracked from Radarr's wanted list to import. Radarr, Prowlarr and
+ * qBittorrent are stubbed at their API clients, with parse answers shaped
+ * like a live Radarr's.
  */
 
 const GB = 1024 ** 3;
@@ -62,10 +71,10 @@ const PROFILE: SonarrQualityProfile = {
 
 const SECRETS: RadarrMovieDetail = {
   id: 55,
-  title: 'Harry Potter and the Chamber of Secrets',
+  title: 'Milo Thistle and the Vault of Echoes',
   year: 2002,
   tmdbId: 672,
-  path: '/movies/Harry Potter and the Chamber of Secrets (2002)',
+  path: '/movies/Milo Thistle and the Vault of Echoes (2002)',
   qualityProfileId: 6,
   monitored: true,
   isAvailable: true,
@@ -77,10 +86,10 @@ const SECRETS: RadarrMovieDetail = {
 /** Radarr's parser: a name with the year, or one it knows as another movie. */
 const parse = (title: string): RadarrParseResult => {
   const quality = /1080p/i.test(title) ? BLURAY_1080 : WEB_720;
-  if (/Prisoner.of.Azkaban/i.test(title)) {
+  if (/Captive.of.Grimholt/i.test(title)) {
     return {
       title,
-      movie: { id: 99, title: 'Harry Potter and the Prisoner of Azkaban' },
+      movie: { id: 99, title: 'Milo Thistle and the Captive of Grimholt' },
       parsedMovieInfo: { quality },
     };
   }
@@ -125,11 +134,11 @@ describe('Backfill for movies: judging a pack', () => {
   it('takes this movie out of a collection and leaves the others', async () => {
     const { plan, summary } = await judgeMoviePack(
       files(
-        'Harry Potter Collection/Harry.Potter.and.the.Philosophers.Stone.mkv',
-        'Harry Potter Collection/Harry.Potter.and.the.Chamber.of.Secrets.mkv',
-        'Harry Potter Collection/Harry.Potter.and.the.Prisoner.of.Azkaban.2004.mkv'
+        'Milo Thistle Collection/Milo.Thistle.and.the.Alchemists.Key.mkv',
+        'Milo Thistle Collection/Milo.Thistle.and.the.Vault.of.Echoes.mkv',
+        'Milo Thistle Collection/Milo.Thistle.and.the.Captive.of.Grimholt.2004.mkv'
       ),
-      'Harry Potter Complete Collection 1080p BluRay x264-GRP',
+      'Milo Thistle Complete Collection 1080p BluRay x264-GRP',
       context()
     );
     assert.equal(summary.fill, 1);
@@ -139,21 +148,21 @@ describe('Backfill for movies: judging a pack', () => {
     assert.equal(used.quality?.quality.name, 'Bluray-1080p');
     assert.equal(
       used.judgedAs,
-      'Harry Potter and the Chamber of Secrets (2002) 1080p BluRay x264-GRP'
+      'Milo Thistle and the Vault of Echoes (2002) 1080p BluRay x264-GRP'
     );
     const reasons = plan
       .filter((e) => e.action === 'reject')
       .map((e) => e.reason);
     assert.deepEqual(reasons.sort(), [
-      'Named as another movie: Harry Potter and the Prisoner of Azkaban',
+      'Named as another movie: Milo Thistle and the Captive of Grimholt',
       'Not this movie',
     ]);
   });
 
   it('takes a lone file with a bare name from a pack named for the movie', async () => {
     const { summary } = await judgeMoviePack(
-      files('Chamber/movie.mkv', 'Chamber/sample.mkv'),
-      'Harry Potter and the Chamber of Secrets 2002 1080p BluRay x264-GRP',
+      files('Vault/movie.mkv', 'Vault/sample.mkv'),
+      'Milo Thistle and the Vault of Echoes 2002 1080p BluRay x264-GRP',
       context()
     );
     assert.equal(summary.fill, 1);
@@ -163,12 +172,12 @@ describe('Backfill for movies: judging a pack', () => {
     const thing: RadarrMovieDetail = {
       ...SECRETS,
       id: 60,
-      title: 'The Thing',
+      title: 'The Frostling',
       year: 2011,
     };
     const { plan } = await judgeMoviePack(
-      files('The.Thing.1982.1080p.BluRay.x264-GRP.mkv'),
-      'The Thing 1982 1080p BluRay x264-GRP',
+      files('The.Frostling.1982.1080p.BluRay.x264-GRP.mkv'),
+      'The Frostling 1982 1080p BluRay x264-GRP',
       context(null, thing)
     );
     assert.equal(plan[0].action, 'reject');
@@ -186,8 +195,8 @@ describe('Backfill for movies: judging a pack', () => {
       quality,
       customFormatScore,
     });
-    const pack = files('Harry.Potter.and.the.Chamber.of.Secrets.mkv');
-    const title = 'Harry Potter and the Chamber of Secrets 1080p BluRay';
+    const pack = files('Milo.Thistle.and.the.Vault.of.Echoes.mkv');
+    const title = 'Milo Thistle and the Vault of Echoes 1080p BluRay';
     const better = await judgeMoviePack(pack, title, {
       ...context(onDisk(WEB_720)),
       movie: { ...SECRETS, hasFile: true, movieFileId: 900 },
@@ -202,40 +211,40 @@ describe('Backfill for movies: judging a pack', () => {
   });
 
   it('never takes a sequel for the movie, from a collection or alone', async () => {
-    const toyStory: RadarrMovieDetail = {
+    const tinParade: RadarrMovieDetail = {
       ...SECRETS,
       id: 70,
-      title: 'Toy Story',
+      title: 'Tin Parade',
       year: 1995,
     };
-    const ctx = context(null, toyStory);
+    const ctx = context(null, tinParade);
     ctx.radarr = {
       parse: async (title: string) =>
-        title.startsWith('Toy Story (1995)')
+        title.startsWith('Tin Parade (1995)')
           ? {
               title,
-              movie: { id: 70, title: 'Toy Story' },
+              movie: { id: 70, title: 'Tin Parade' },
               parsedMovieInfo: { quality: BLURAY_1080 },
             }
           : parse(title),
     } as unknown as BackfillRadarr;
     const { plan } = await judgeMoviePack(
       files(
-        'Toy Story Collection/Toy Story 2.mkv',
-        'Toy Story Collection/Toy Story.mkv',
-        'Toy Story Collection/Toy Story 3.mkv'
+        'Tin Parade Collection/Tin Parade 2.mkv',
+        'Tin Parade Collection/Tin Parade.mkv',
+        'Tin Parade Collection/Tin Parade 3.mkv'
       ),
-      'Toy Story Collection 1080p BluRay x264-GRP',
+      'Tin Parade Collection 1080p BluRay x264-GRP',
       ctx
     );
     const used = plan.filter((e) => e.action === 'fill');
     assert.deepEqual(
       used.map((e) => e.path),
-      ['Toy Story Collection/Toy Story.mkv']
+      ['Tin Parade Collection/Tin Parade.mkv']
     );
     const alone = await judgeMoviePack(
-      files('Toy Story 2/movie.mkv'),
-      'Toy Story 2 1999 1080p BluRay x264-GRP',
+      files('Tin Parade 2/movie.mkv'),
+      'Tin Parade 2 1999 1080p BluRay x264-GRP',
       ctx
     );
     assert.equal(alone.summary.fill, 0);
@@ -245,12 +254,12 @@ describe('Backfill for movies: judging a pack', () => {
     const thing: RadarrMovieDetail = {
       ...SECRETS,
       id: 60,
-      title: 'The Thing',
+      title: 'The Frostling',
       year: 1982,
     };
     const { plan } = await judgeMoviePack(
-      files('sparks-thething-1080p.mkv'),
-      'The Thing 2011 1080p BluRay x264-SPARKS',
+      files('cinders-thefrostling-1080p.mkv'),
+      'The Frostling 2011 1080p BluRay x264-CINDERS',
       context(null, thing)
     );
     assert.equal(plan[0].action, 'reject');
@@ -258,29 +267,29 @@ describe('Backfill for movies: judging a pack', () => {
 
   it('turns down episodes that come up in a movie search', async () => {
     const { plan } = await judgeMoviePack(
-      files('Harry.Potter.and.the.Chamber.of.Secrets.S01E02.mkv'),
-      'Harry Potter and the Chamber of Secrets S01 1080p',
+      files('Milo.Thistle.and.the.Vault.of.Echoes.S01E02.mkv'),
+      'Milo Thistle and the Vault of Echoes S01 1080p',
       context()
     );
     assert.equal(plan[0].reason, 'An episode, not a movie');
   });
 
   it('finds titles that are only a year', () => {
-    assert.equal(mentionsShow('1917 2019 1080p BluRay x264', ['1917']), true);
-    assert.equal(sameShow('2012', ['1917']), false);
-    assert.equal(sameShow('1917', ['1917']), true);
-    assert.equal(sameShow('Perfect World 2021', ['Perfect World']), true);
+    assert.equal(mentionsShow('1863 2019 1080p BluRay x264', ['1863']), true);
+    assert.equal(sameShow('2034', ['1863']), false);
+    assert.equal(sameShow('1863', ['1863']), true);
+    assert.equal(sameShow('Ninefold Sky 2021', ['Ninefold Sky']), true);
   });
 
   it('names a file the way Radarr reads it', () => {
     assert.equal(
       movieName({
         fileName: 'movie',
-        packTitle: 'WWF Hardcore 2001 DVDRip x264-GROUP',
-        title: 'WWF: Hardcore',
+        packTitle: 'XWL Ironclad 2001 DVDRip x264-GROUP',
+        title: 'XWL: Ironclad',
         year: 2001,
       }),
-      'WWF: Hardcore (2001) DVDRip x264-GROUP'
+      'XWL: Ironclad (2001) DVDRip x264-GROUP'
     );
   });
 });
@@ -311,12 +320,12 @@ const ben = (value: unknown): Buffer => {
 };
 
 const INFO = {
-  name: 'Harry Potter Collection',
+  name: 'Milo Thistle Collection',
   'piece length': 4194304,
   pieces: Buffer.alloc(20),
   files: [
-    { length: 2 * GB, path: ['Harry.Potter.and.the.Philosophers.Stone.mkv'] },
-    { length: 2 * GB, path: ['Harry.Potter.and.the.Chamber.of.Secrets.mkv'] },
+    { length: 2 * GB, path: ['Milo.Thistle.and.the.Alchemists.Key.mkv'] },
+    { length: 2 * GB, path: ['Milo.Thistle.and.the.Vault.of.Echoes.mkv'] },
   ],
 };
 const TORRENT = ben({ announce: 'udp://tracker', info: INFO });
@@ -325,7 +334,7 @@ const HASH = createHash('sha1').update(ben(INFO)).digest('hex');
 const RELEASE: ProwlarrRelease = {
   guid: 'https://indexer/hp',
   title:
-    'Harry Potter and the Chamber of Secrets Collection 1080p BluRay x264-GRP',
+    'Milo Thistle and the Vault of Echoes Collection 1080p BluRay x264-GRP',
   size: 4 * GB,
   indexerId: 3,
   indexer: 'Knaben',
@@ -335,8 +344,8 @@ const RELEASE: ProwlarrRelease = {
 };
 
 /**
- * Radarr's and Sonarr's own wanted lists, kept before any test stands in
- * for them: a method stood in for twice is not always put back as it was.
+ * The real wanted-list methods, saved before any test stubs them: a method
+ * stubbed twice isn't always restored correctly.
  */
 const radarrWanted = BackfillRadarr.prototype.getWanted;
 const sonarrWanted = BackfillSonarr.prototype.getWanted;
@@ -361,7 +370,7 @@ const heldTorrent = (savePath = '/downloads/backfill') => ({
   eta: 60,
   dlspeed: 1000,
   save_path: savePath,
-  content_path: `${savePath}/Harry Potter Collection`,
+  content_path: `${savePath}/Milo Thistle Collection`,
 });
 
 beforeEach(() => {
@@ -420,6 +429,7 @@ beforeEach(() => {
   mock.method(radarr, 'getMovieDetail', async () => movie);
   mock.method(radarr, 'getMovieFile', async () => null);
   mock.method(radarr, 'getQualityProfile', async () => PROFILE);
+  mock.method(radarr, 'getQualityDefinitions', async () => []);
   mock.method(radarr, 'parse', async (title: string) => parse(title));
   mock.method(radarr, 'getRootFoldersNow', async () => [
     { path: '/movies', freeSpace: 50 * 1024 * GB },
@@ -526,7 +536,7 @@ describe('Backfill for movies: from Radarr’s wanted list to the library', () =
     assert.deepEqual(imports, [
       [
         {
-          path: '/data/backfill/Harry Potter Collection/Harry.Potter.and.the.Chamber.of.Secrets.mkv',
+          path: '/data/backfill/Milo Thistle Collection/Milo.Thistle.and.the.Vault.of.Echoes.mkv',
           movieId: 55,
         },
       ],
@@ -548,6 +558,165 @@ describe('Backfill for movies: from Radarr’s wanted list to the library', () =
     );
   });
 
+  it('holds movies to their own limit on downloads at once, not the series’', async () => {
+    const settings = getSettings();
+    settings.backfill = {
+      ...settings.backfill,
+      maxActiveJobs: 1,
+      maxMovieJobs: 1,
+    };
+    await backfill.scan();
+    const row = await getRepository(BackfillSeries).findOneOrFail({
+      where: { kind: 'movie', arrId: 55 },
+    });
+    const candidate = await getRepository(BackfillCandidate).findOneOrFail({
+      where: { seriesId: row.id },
+    });
+    const jobs = getRepository(BackfillJob);
+    // A series download running takes none of the movies' room.
+    const series = await getRepository(BackfillSeries).save(
+      new BackfillSeries({
+        kind: 'series',
+        serverId: 0,
+        arrId: 900,
+        title: 'Harbour Lights',
+        status: 'found',
+        searchTerms: [],
+      })
+    );
+    await jobs.save(
+      new BackfillJob({
+        seriesId: series.id,
+        title: 'Harbour Lights S01',
+        status: 'downloading',
+        mode: 'missing',
+        protocol: 'torrent',
+        clientId: 1,
+        files: [],
+      })
+    );
+    const job = await backfill.approve(candidate.id, { mode: 'missing' });
+    assert.equal(
+      (await jobs.findOneOrFail({ where: { id: job.id } })).status,
+      'downloading'
+    );
+
+    // With none allowed for movies, it waits, saying for what.
+    await jobs.update(job.id, { status: 'queued' });
+    settings.backfill = { ...settings.backfill, maxMovieJobs: 0 };
+    await backfill.tick();
+    const waiting = await jobs.findOneOrFail({ where: { id: job.id } });
+    assert.equal(waiting.status, 'queued');
+    assert.equal(
+      waiting.stage,
+      'Waiting for one of 0 running torrent movie downloads to finish'
+    );
+  });
+
+  it('holds to Radarr’s size limits: outside them is only offered, never taken by itself', async () => {
+    getSettings().backfill = {
+      ...getSettings().backfill,
+      autoApprove: { enabled: true, minScore: -10_000, maxSizeGb: 100 },
+    };
+    // A 100-minute film: Bluray-1080p may be 10 MB a minute, about 1 GB;
+    // the release's file is 2 GB.
+    movie = { ...SECRETS, runtime: 100 };
+    mock.method(BackfillRadarr.prototype, 'getQualityDefinitions', async () => [
+      { quality: { id: 7, name: 'Bluray-1080p' }, minSize: 2, maxSize: 10 },
+    ]);
+    await backfill.scan();
+    const row = await getRepository(BackfillSeries).findOneOrFail({
+      where: { kind: 'movie', arrId: 55 },
+    });
+    while (backfill.isSearching(row.id)) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(await getRepository(BackfillJob).count(), 0, 'not taken');
+    const offered = await getRepository(BackfillCandidate).findOneOrFail({
+      where: { seriesId: row.id },
+    });
+    assert.equal(offered.status, 'ready', 'the best there is, for an admin');
+    assert.equal(offered.summary?.outsideSize, 1);
+    assert.equal(
+      offered.reason,
+      "Outside the size limits: 2.0 GB is over Radarr's Bluray-1080p limit of 1.0 GB"
+    );
+
+    // Another release within them turns up: that one is offered, and taken.
+    mock.method(ProwlarrAPI.prototype, 'search', async () => [
+      RELEASE,
+      {
+        ...RELEASE,
+        guid: 'small',
+        title: 'Milo Thistle and the Vault of Echoes (2002) 1080p BluRay x265',
+        size: GB / 2,
+        infoHash: undefined,
+        downloadUrl: 'http://indexer/small.torrent',
+      },
+    ]);
+    mock.method(
+      ProwlarrAPI.prototype,
+      'fetchRelease',
+      async (r: ProwlarrRelease) =>
+        r.guid === 'small'
+          ? {
+              kind: 'torrent',
+              data: ben({
+                announce: 'udp://tracker',
+                info: {
+                  name: 'Milo Thistle and the Vault of Echoes (2002)',
+                  'piece length': 4194304,
+                  pieces: Buffer.alloc(20),
+                  files: [
+                    {
+                      length: GB / 2,
+                      path: [
+                        'Milo Thistle and the Vault of Echoes (2002) 1080p.mkv',
+                      ],
+                    },
+                  ],
+                },
+              }),
+            }
+          : { kind: 'torrent', data: TORRENT }
+    );
+    await backfill.search(row.id);
+    const all = await getRepository(BackfillCandidate).find({
+      where: { seriesId: row.id },
+    });
+    const big = all.find((c) => c.guid === RELEASE.guid);
+    assert.equal(big?.status, 'rejected', 'passed over for one within them');
+  });
+
+  it('never takes a torrent nobody seeds by itself, but takes it when it is seeded', async () => {
+    getSettings().backfill = {
+      ...getSettings().backfill,
+      autoApprove: { enabled: true, minScore: -10_000, maxSizeGb: 100 },
+    };
+    let seeders = 0;
+    mock.method(ProwlarrAPI.prototype, 'search', async () => [
+      { ...RELEASE, seeders },
+    ]);
+    await backfill.scan();
+    const row = await getRepository(BackfillSeries).findOneOrFail({
+      where: { kind: 'movie', arrId: 55 },
+    });
+    while (backfill.isSearching(row.id)) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(await getRepository(BackfillJob).count(), 0);
+    assert.equal(
+      (await getRepository(BackfillCandidate).findOneOrFail({ where: {} }))
+        .status,
+      'ready',
+      'still offered to an admin'
+    );
+
+    seeders = 5;
+    await backfill.search(row.id);
+    assert.equal(await getRepository(BackfillJob).count(), 1);
+  });
+
   it('replaces a stalled download with the next good pack, searching again, until none is left', async () => {
     getSettings().backfill = {
       ...getSettings().backfill,
@@ -567,7 +736,7 @@ describe('Backfill for movies: from Radarr’s wanted list to the library', () =
     };
     const OTHER = ben({
       announce: 'udp://tracker',
-      info: { ...INFO, name: 'Harry Potter Collection REPACK' },
+      info: { ...INFO, name: 'Milo Thistle Collection REPACK' },
     });
     mock.method(
       ProwlarrAPI.prototype,
@@ -649,6 +818,77 @@ describe('Backfill for movies: from Radarr’s wanted list to the library', () =
       ).status,
       'none'
     );
+  });
+
+  it('gives up on a download part of which no peer has, though the rest trickles in, or one far too slow', async () => {
+    getSettings().backfill = {
+      ...getSettings().backfill,
+      autoApprove: { enabled: false, minScore: -10_000, maxSizeGb: 100 },
+      replaceFailed: false,
+    };
+    mock.method(ProwlarrAPI.prototype, 'search', async () => [RELEASE]);
+    let now = Date.now();
+    mock.timers.enable({ apis: ['Date'], now });
+    let progress = 0;
+    let availability = 0.9;
+    mock.method(QBittorrentAPI.prototype, 'getFiles', async () =>
+      INFO.files.map((f, index) => ({
+        index,
+        name: [INFO.name, ...f.path].join('/'),
+        size: f.length,
+        progress: index === 1 ? progress : 0,
+        priority: index === 1 ? 1 : 0,
+        // Only the file not wanted is whole somewhere for the second run.
+        availability: index === 1 ? availability : 0.5,
+      }))
+    );
+    const jobs = getRepository(BackfillJob);
+    const candidates = getRepository(BackfillCandidate);
+    const run = async (hours: number[]) => {
+      for (const hour of hours) {
+        now += hour * 60 * 60_000;
+        mock.timers.setTime(now);
+        progress += 0.001;
+        await backfill.tick();
+      }
+    };
+
+    await backfill.scan();
+    const row = await getRepository(BackfillSeries).findOneOrFail({
+      where: { kind: 'movie', arrId: 55 },
+    });
+    const candidate = await candidates.findOneOrFail({
+      where: { seriesId: row.id },
+    });
+    const first = await backfill.approve(candidate.id, { mode: 'missing' });
+    await run([0, 6, 7]);
+    const gone = await jobs.findOneOrFail({ where: { id: first.id } });
+    assert.equal(gone.status, 'failed');
+    assert.match(gone.error ?? '', /could never finish/);
+
+    // Whole in the swarm, but at about 1 KB/s.
+    availability = 1;
+    progress = 0;
+    const again = await candidates.save(
+      new BackfillCandidate({
+        ...candidate,
+        id: undefined,
+        guid: 'https://indexer/hp-4',
+        status: 'ready',
+      })
+    );
+    const second = await backfill.approve(again.id, { mode: 'missing' });
+    progress = -0.001;
+    await run([0, 2, 1]);
+    assert.equal(
+      (await jobs.findOneOrFail({ where: { id: second.id } })).status,
+      'downloading',
+      'not judged before two whole windows'
+    );
+    await run([1, 2]);
+    const slow = await jobs.findOneOrFail({ where: { id: second.id } });
+    assert.equal(slow.status, 'failed');
+    assert.match(slow.error ?? '', /^Too slow: at 1 KB\/s, the 2\.0 GB left/);
   });
 
   it('leaves a failed download for an admin when replacing is off, or after too many fail', async () => {
@@ -742,6 +982,101 @@ describe('Backfill for movies: from Radarr’s wanted list to the library', () =
       where: { kind: 'movie', arrId: 55 },
     });
     assert.equal(row.status, 'found');
+  });
+
+  it('leaves a film to Radarr for its first hours out', async () => {
+    const hour = 60 * 60 * 1000;
+    // Searched long ago, before it came out, and released two hours ago.
+    movie = {
+      ...SECRETS,
+      minimumAvailability: 'released',
+      releaseDate: new Date(Date.now() - 2 * hour).toISOString(),
+      lastSearchTime: new Date(Date.now() - 72 * hour).toISOString(),
+    };
+    await backfill.scan();
+    assert.equal(
+      await getRepository(BackfillSeries).count(),
+      0,
+      'out 2 hours: still Radarr’s'
+    );
+
+    movie = {
+      ...movie,
+      releaseDate: new Date(Date.now() - 13 * hour).toISOString(),
+    };
+    await backfill.scan();
+    const row = await getRepository(BackfillSeries).findOneOrFail({
+      where: { kind: 'movie', arrId: 55 },
+    });
+    assert.equal(row.status, 'found');
+  });
+
+  describe('searching right after Radarr finds nothing', () => {
+    const minute = 60 * 1000;
+    const askFor = async () => {
+      const user = await getRepository(User).save(
+        new User({
+          email: `asker-${Math.random()}@test.local`,
+          avatar: '',
+          permissions: Permission.REQUEST,
+        })
+      );
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: SECRETS.tmdbId!,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.PROCESSING,
+        })
+      );
+      // As approved, without the hooks that would send it to Radarr.
+      await getRepository(MediaRequest)
+        .createQueryBuilder()
+        .insert()
+        .values({
+          type: MediaType.MOVIE,
+          media,
+          requestedBy: user,
+          status: MediaRequestStatus.APPROVED,
+          is4k: false,
+        })
+        .callListeners(false)
+        .execute();
+    };
+
+    it('searches a movie just asked for once Radarr’s own search has had a while', async () => {
+      await askFor();
+      // Radarr searched a moment ago: it may still grab something.
+      movie = {
+        ...SECRETS,
+        lastSearchTime: new Date(Date.now() - 5 * minute).toISOString(),
+      };
+      await backfill.scan({ quick: true });
+      assert.equal(await getRepository(BackfillSeries).count(), 0);
+
+      movie = {
+        ...SECRETS,
+        lastSearchTime: new Date(Date.now() - 30 * minute).toISOString(),
+      };
+      await backfill.scan({ quick: true });
+      const row = await getRepository(BackfillSeries).findOneOrFail({
+        where: { kind: 'movie', arrId: 55 },
+      });
+      assert.equal(row.status, 'found');
+    });
+
+    it('leaves a movie nobody asked for to the usual scan', async () => {
+      movie = {
+        ...SECRETS,
+        lastSearchTime: new Date(Date.now() - 48 * 60 * minute).toISOString(),
+      };
+      await backfill.scan({ quick: true });
+      const row = await getRepository(BackfillSeries).findOneOrFail({
+        where: { kind: 'movie', arrId: 55 },
+      });
+      // Followed, but not searched until a scan's turn comes.
+      assert.equal(row.status, 'stuck');
+      assert.equal(row.lastSearchedAt, null);
+    });
   });
 
   describe('searching everything stuck', () => {
@@ -929,12 +1264,12 @@ describe('Backfill: searching for what a series is missing', () => {
     const sonarr = BackfillSonarr.prototype;
     mock.method(sonarr, 'getSeriesDetail', async () => ({
       id: 891,
-      title: 'Expedition Unknown',
+      title: 'Wayfarer Ledger',
       year: 2015,
-      tvdbId: 280316,
+      tvdbId: 391427,
       seriesType: 'standard',
       qualityProfileId: 6,
-      path: '/tv/Expedition Unknown',
+      path: '/tv/Wayfarer Ledger',
     }));
     mock.method(sonarr, 'getSeriesEpisodes', async () => [
       {
@@ -950,6 +1285,7 @@ describe('Backfill: searching for what a series is missing', () => {
     ]);
     mock.method(sonarr, 'getEpisodeFiles', async () => []);
     mock.method(sonarr, 'getQualityProfile', async () => PROFILE);
+    mock.method(sonarr, 'getQualityDefinitions', async () => []);
     mock.method(sonarr, 'parse', async (title: string) => ({ title }));
     const queries: string[] = [];
     mock.method(ProwlarrAPI.prototype, 'search', async (query: string) => {
@@ -958,14 +1294,13 @@ describe('Backfill: searching for what a series is missing', () => {
         {
           ...RELEASE,
           guid: 'old-pack',
-          title: 'Expedition Unknown Season 4 Complete 720p HDTV x264',
+          title: 'Wayfarer Ledger Season 4 Complete 720p HDTV x264',
           seeders: 90,
         },
         {
           ...RELEASE,
           guid: 'the-episode',
-          title:
-            'Expedition.Unknown.2018.S17E07.1080p.WEB-DL.DDP2.0.H.264-FUZEER',
+          title: 'Wayfarer.Ledger.2018.S17E07.1080p.WEB-DL.DDP2.0.H.264-FIZZLR',
           seeders: 2,
         },
       ];
@@ -984,13 +1319,132 @@ describe('Backfill: searching for what a series is missing', () => {
         kind: 'series',
         serverId: 0,
         arrId: 891,
-        title: 'Expedition Unknown',
+        title: 'Wayfarer Ledger',
         status: 'stuck',
       })
     );
     await backfill.search(row.id);
-    assert.deepEqual(queries, ['Expedition Unknown', 'Expedition Unknown S17']);
+    assert.deepEqual(queries, ['Wayfarer Ledger', 'Wayfarer Ledger S17']);
     assert.equal(opened[0], 'the-episode');
+  });
+
+  it('searches for specials and renumbered episodes by title, and opens what names them first', async () => {
+    getSettings().sonarr = [
+      {
+        id: 0,
+        name: 'Sonarr',
+        hostname: 'sonarr',
+        port: 8989,
+        apiKey: 'x',
+        useSsl: false,
+      } as unknown as SonarrSettings,
+    ];
+    const includeSpecials = getSettings().backfill.includeSpecials;
+    getSettings().backfill = {
+      ...getSettings().backfill,
+      includeSpecials: true,
+    };
+    const sonarr = BackfillSonarr.prototype;
+    mock.method(sonarr, 'getSeriesDetail', async () => ({
+      id: 892,
+      title: 'Wayfarer Ledger',
+      year: 2015,
+      tvdbId: 391427,
+      seriesType: 'standard',
+      qualityProfileId: 6,
+      path: '/tv/Wayfarer Ledger',
+    }));
+    const ep = (
+      id: number,
+      season: number,
+      episode: number,
+      title: string,
+      hasFile: boolean,
+      scene?: [number, number]
+    ) => ({
+      id,
+      seriesId: 892,
+      seasonNumber: season,
+      episodeNumber: episode,
+      title,
+      hasFile,
+      monitored: true,
+      episodeFileId: 0,
+      airDateUtc: '2020-09-01T00:00:00Z',
+      ...(scene
+        ? { sceneSeasonNumber: scene[0], sceneEpisodeNumber: scene[1] }
+        : {}),
+    });
+    mock.method(sonarr, 'getSeriesEpisodes', async () => [
+      ep(1, 0, 1, 'Beyond the Map', false),
+      ep(2, 0, 2, 'Special', false),
+      // The scene's S06E15.
+      ep(3, 8, 1, 'Atoll Exile', false, [6, 15]),
+      ep(4, 9, 1, 'River Bend', true, [8, 1]),
+    ]);
+    mock.method(sonarr, 'getEpisodeFiles', async () => []);
+    mock.method(sonarr, 'getQualityProfile', async () => PROFILE);
+    mock.method(sonarr, 'getQualityDefinitions', async () => []);
+    mock.method(sonarr, 'parse', async (title: string) => ({ title }));
+    const queries: string[] = [];
+    mock.method(ProwlarrAPI.prototype, 'search', async (query: string) => {
+      queries.push(query);
+      return [
+        {
+          ...RELEASE,
+          guid: 'old-pack',
+          title: 'Wayfarer Ledger Season 4 Complete 720p HDTV x264',
+          seeders: 90,
+        },
+        {
+          ...RELEASE,
+          guid: 'the-special',
+          title: 'Wayfarer.Ledger.Beyond.the.Map.1080p.WEB-DL-GRP',
+          seeders: 1,
+        },
+        {
+          ...RELEASE,
+          guid: 'by-the-scene',
+          title: 'Wayfarer.Ledger.S06E15.720p.HDTV.x264-GRP',
+          seeders: 2,
+        },
+      ];
+    });
+    const opened: string[] = [];
+    mock.method(
+      ProwlarrAPI.prototype,
+      'fetchRelease',
+      async (release: ProwlarrRelease) => {
+        opened.push(release.guid);
+        throw new Error('not needed');
+      }
+    );
+    const row = await getRepository(BackfillSeries).save(
+      new BackfillSeries({
+        kind: 'series',
+        serverId: 0,
+        arrId: 892,
+        title: 'Wayfarer Ledger',
+        status: 'stuck',
+      })
+    );
+    try {
+      await backfill.search(row.id);
+    } finally {
+      getSettings().backfill = { ...getSettings().backfill, includeSpecials };
+    }
+    // Not by "Special": a title that says nothing.
+    assert.deepEqual(queries, [
+      'Wayfarer Ledger',
+      'Wayfarer Ledger S08',
+      'Wayfarer Ledger Beyond the Map',
+      'Wayfarer Ledger Atoll Exile',
+    ]);
+    assert.deepEqual(
+      [...opened.slice(0, 2)].sort(),
+      ['by-the-scene', 'the-special'],
+      'what names a missing episode is opened before the popular pack'
+    );
   });
 });
 
@@ -1019,7 +1473,7 @@ describe('Backfill when something goes wrong', () => {
   const IMPORTED = [
     [
       {
-        path: '/data/backfill/Harry Potter Collection/Harry.Potter.and.the.Chamber.of.Secrets.mkv',
+        path: '/data/backfill/Milo Thistle Collection/Milo.Thistle.and.the.Vault.of.Echoes.mkv',
         movieId: 55,
       },
     ],
@@ -1039,7 +1493,9 @@ describe('Backfill when something goes wrong', () => {
     assert.equal(waiting.status, 'downloading', logOf(waiting));
     assert.deepEqual(removed, [], 'the download is kept');
     assert.equal(
-      waiting.log.filter((l) => l.message.startsWith('No answer')).length,
+      waiting.log.filter((l) =>
+        l.message.endsWith('did not answer; trying again each minute')
+      ).length,
       1,
       'said once, not every minute'
     );
@@ -1053,7 +1509,7 @@ describe('Backfill when something goes wrong', () => {
     done = true;
     await backfill.tick();
     assert.equal((await jobNow(job.id)).status, 'importing');
-    // Radarr's own calls wrap what went wrong.
+    // Radarr API wrappers put the original error in `cause`.
     const radarrDown = mock.method(
       BackfillRadarr.prototype,
       'getCommand',
@@ -1101,7 +1557,7 @@ describe('Backfill when something goes wrong', () => {
       'found'
     );
 
-    // Put right, and approved again: the torrent kept is taken on.
+    // Fixed and re-approved: the kept torrent is reused.
     mappings.mock.restore();
     listsCategory();
     const adds = mock.method(
@@ -1300,7 +1756,7 @@ describe('Backfill when something goes wrong', () => {
         kind: 'movie',
         serverId: 0,
         arrId: 56,
-        title: 'Harry Potter and the Goblet of Fire',
+        title: 'Milo Thistle and the Lantern of Ash',
         status: 'found',
         lastSearchedAt: new Date(),
       })
@@ -1315,7 +1771,7 @@ describe('Backfill when something goes wrong', () => {
       ) {
         await repo.update(wanted.id, {
           status: 'downloading',
-          searchTerms: ['Chamber of Secrets'],
+          searchTerms: ['Vault of Echoes'],
         });
         await repo.update(gone.id, { status: 'downloading' });
       }
@@ -1324,7 +1780,7 @@ describe('Backfill when something goes wrong', () => {
     await backfill.scan();
     const kept = await repo.findOneOrFail({ where: { id: wanted.id } });
     assert.equal(kept.status, 'downloading');
-    assert.deepEqual(kept.searchTerms, ['Chamber of Secrets']);
+    assert.deepEqual(kept.searchTerms, ['Vault of Echoes']);
     assert.equal(kept.missing, 1, 'what the scan read is still saved');
     assert.equal(
       (await repo.findOneOrFail({ where: { id: gone.id } })).status,
@@ -1350,13 +1806,33 @@ describe('Backfill when something goes wrong', () => {
     );
   });
 
+  it('shows a title left mid-search as stuck, and resets it at startup', async () => {
+    const row = await titles().save(
+      new BackfillSeries({
+        kind: 'movie',
+        serverId: 0,
+        arrId: 57,
+        title: SECRETS.title,
+        status: 'searching',
+      })
+    );
+    assert.equal(backfill.isSearching(row.id), false);
+    assert.equal(backfill.statusOf(row), 'stuck', 'nothing is searching');
+    await backfill.unstickSearches();
+    assert.equal(
+      (await titles().findOneOrFail({ where: { id: row.id } })).status,
+      'stuck'
+    );
+    assert.equal(backfill.statusOf({ id: row.id, status: 'found' }), 'found');
+  });
+
   it('takes nothing for done when Radarr’s wanted list was too long to read whole', async () => {
     const row = await titles().save(
       new BackfillSeries({
         kind: 'movie',
         serverId: 0,
         arrId: 56,
-        title: 'Harry Potter and the Goblet of Fire',
+        title: 'Milo Thistle and the Lantern of Ash',
         status: 'found',
         missing: 1,
         lastSearchedAt: new Date(),

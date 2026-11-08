@@ -9,12 +9,11 @@ import { useIntl } from 'react-intl';
 const messages = defineMessages('components.Common.VoiceInput', {
   speak: 'Speak instead of typing',
   stop: 'Stop listening',
-  unsupported:
-    'This browser can’t listen. Speaking a search works in Chrome, Edge and Safari.',
+  unsupported: 'This browser can’t listen. Try Chrome, Edge or Safari.',
   blocked:
-    'The microphone is blocked for this site. Allow it in the browser’s site settings to speak your search.',
+    'The microphone is blocked. Allow it in your browser’s site settings.',
   unavailable:
-    'This browser can’t listen right now. On a Mac, Dictation needs to be turned on in System Settings.',
+    'This browser can’t listen right now. On a Mac, turn on Dictation in System Settings.',
   noSpeech:
     'Didn’t hear anything. Try again a little closer to the microphone.',
   noMicrophone: 'No microphone was found.',
@@ -22,8 +21,8 @@ const messages = defineMessages('components.Common.VoiceInput', {
 });
 
 /**
- * Speech for a text field: what is heard is passed to `onText` as it comes,
- * and any trouble is shown as a toast.
+ * Speech input for a text field: passes text to `onText` as heard; errors
+ * show as toasts.
  */
 export const useVoiceInput = (
   onText: (text: string, final: boolean) => void
@@ -73,7 +72,7 @@ const VoiceInputButton = ({
     <button
       type="button"
       onClick={onToggle}
-      // Keeps focus, and the caret, in the field being spoken into.
+      // Keeps focus and the caret in the field.
       onMouseDown={(e) => e.preventDefault()}
       aria-label={label}
       aria-pressed={listening}
@@ -81,7 +80,7 @@ const VoiceInputButton = ({
       className={`flex flex-none items-center justify-center rounded-full transition focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
         listening
           ? 'animate-pulse bg-red-600 text-white'
-          : 'text-gray-400 hover:text-white'
+          : 'text-gray-400 hover:text-strong'
       } ${className}`}
     >
       <MicrophoneIcon className="h-5 w-5" />

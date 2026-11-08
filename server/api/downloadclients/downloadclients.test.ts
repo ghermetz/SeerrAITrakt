@@ -12,7 +12,7 @@ import type { AddressInfo } from 'node:net';
 import { after, afterEach, before, describe, it, mock } from 'node:test';
 
 const MB = 1024 * 1024;
-/** How SABnzbd 4.2 and later name a job, as Radarr records it here. */
+/** A SABnzbd 4.2+ job id, as Radarr records it. */
 const UUID_JOB = 'a0390606-07de-47d6-8877-46f3ceed243c';
 
 describe('SABnzbd, read directly', () => {
@@ -111,8 +111,13 @@ describe('talking to them', () => {
   let qbitPort = 0;
   let logins = 0;
   let session = 'first';
+  let qbitAnswersByStatus = false;
   const servers: http.Server[] = [];
-  /** SABnzbd's whole queue, as asked for without nzo_ids. */
+  /** Ids deleted from SABnzbd. */
+  let deleted: string[] = [];
+  const queuedJobs = ['SABnzbd_nzo_one'];
+  const historyJobs = ['SABnzbd_nzo_two'];
+  /** SABnzbd's whole queue, as returned without nzo_ids. */
   let wholeQueue: { kbpersec: string; slots: Record<string, string>[] } = {
     kbpersec: '0',
     slots: [],
@@ -137,6 +142,18 @@ describe('talking to them', () => {
       if (url.searchParams.get('apikey') !== 'right') {
         return res.end(
           JSON.stringify({ status: false, error: 'API Key Incorrect' })
+        );
+      }
+      // Like SABnzbd 4.2: status false, no error, for a job not in the
+      // queue.
+      if (url.searchParams.get('name') === 'delete') {
+        const id = url.searchParams.get('value') ?? '';
+        const mode = url.searchParams.get('mode');
+        deleted.push(`${mode} ${id}`);
+        const there =
+          mode === 'queue' ? queuedJobs.includes(id) : historyJobs.includes(id);
+        return res.end(
+          JSON.stringify({ status: there, nzo_ids: there ? [id] : [] })
         );
       }
       const ids = (url.searchParams.get('nzo_ids') ?? '').split(',');
@@ -185,12 +202,15 @@ describe('talking to them', () => {
         req.on('data', (chunk) => (body += chunk));
         req.on('end', () => {
           const form = new URLSearchParams(body);
+          // qBittorrent 5.2+ answers with a status code, not text.
           if (form.get('password') !== 'secret') {
-            return res.end('Fails.');
+            res.statusCode = qbitAnswersByStatus ? 401 : 200;
+            return res.end(qbitAnswersByStatus ? '' : 'Fails.');
           }
           logins++;
           res.setHeader('Set-Cookie', `QBT_SID_8080=${session}; HttpOnly`);
-          res.end('Ok.');
+          res.statusCode = qbitAnswersByStatus ? 204 : 200;
+          res.end(qbitAnswersByStatus ? '' : 'Ok.');
         });
         return;
       }
@@ -203,7 +223,7 @@ describe('talking to them', () => {
       }
       res.setHeader('Content-Type', 'application/json');
       const hashes = (url.searchParams.get('hashes') ?? '').split('|');
-      // Like a client that ignores the filter: every torrent it has.
+      // Like a client that ignores the filter: return every torrent.
       if (hashes.includes('b'.repeat(40))) {
         return res.end(
           JSON.stringify(
@@ -269,6 +289,47 @@ describe('talking to them', () => {
     assert.equal(found.get('sabnzbd_nzo_two')?.step, 'script');
   });
 
+  it('deletes a SABnzbd job from its queue, or from its history once it has finished', async () => {
+    deleted = [];
+    await sab('right').deleteJob('SABnzbd_nzo_one');
+    assert.deepEqual(deleted, ['queue SABnzbd_nzo_one']);
+    deleted = [];
+    await sab('right').deleteJob('SABnzbd_nzo_two');
+    assert.deepEqual(deleted, [
+      'queue SABnzbd_nzo_two',
+      'history SABnzbd_nzo_two',
+    ]);
+    await assert.rejects(
+      sab('right').deleteJob('SABnzbd_nzo_gone'),
+      /neither its queue nor its history/
+    );
+    await assert.rejects(
+      sab('wrong').deleteJob('SABnzbd_nzo_one'),
+      /API Key Incorrect/
+    );
+  });
+
+  it('gives a queued SABnzbd job its size in whole bytes', async () => {
+    // SABnzbd gives fractional megabytes; Postgres stores whole bytes.
+    wholeQueue = {
+      kbpersec: '0',
+      slots: [
+        {
+          nzo_id: 'one',
+          status: 'Downloading',
+          mb: '19510.95',
+          mbleft: '2525.67',
+          percentage: '87',
+          timeleft: '0:05:00',
+        },
+      ],
+    };
+    const job = await sab('right').getJob('one');
+    assert.equal(job?.size, Math.round(19510.95 * 1024 * 1024));
+    assert.equal(job?.sizeLeft, Math.round(2525.67 * 1024 * 1024));
+    assert.ok(Number.isInteger(job?.size) && Number.isInteger(job?.sizeLeft));
+  });
+
   it("gives a SABnzbd job the queue's speed only when it is the one downloading", async () => {
     const slot = (nzo_id: string, status: string) => ({
       nzo_id,
@@ -284,7 +345,7 @@ describe('talking to them', () => {
     };
     assert.equal((await sab('right').getJob('one'))?.speed, 10240 * 1024);
     assert.equal((await sab('right').getJob('two'))?.speed, 0, 'waiting');
-    // Two at once: the one figure is both of theirs, so it is neither's.
+    // Two downloading: the single speed can't be attributed to either.
     wholeQueue = {
       kbpersec: '10240',
       slots: [slot('one', 'Downloading'), slot('two', 'Downloading')],
@@ -311,7 +372,7 @@ describe('talking to them', () => {
     assert.equal(found.get('a'.repeat(40))?.stage, 'stalled');
     assert.equal(logins, 1, 'the session is kept between passes');
 
-    session = 'second'; // qBittorrent restarted: the old session is gone
+    session = 'second'; // qBittorrent restarted, dropping the old session
     await qbit('secret').getVersion();
     assert.equal(logins, 2);
   });
@@ -320,6 +381,27 @@ describe('talking to them', () => {
     const torrent = await qbit('secret').getTorrent('B'.repeat(40));
     assert.equal(torrent?.hash, 'b'.repeat(40));
     assert.equal(torrent?.dlspeed, 2000);
+  });
+
+  it('signs in to qBittorrent 5.2, which answers with a status', async () => {
+    qbitAnswersByStatus = true;
+    session = 'five-two';
+    try {
+      assert.equal(await qbit('secret').getVersion(), 'v5.0.4');
+      await assert.rejects(
+        new QBittorrentAPI({
+          hostname: '127.0.0.1',
+          port: qbitPort,
+          useSsl: false,
+          urlBase: '',
+          username: 'someone-else',
+          password: 'nope',
+        }).getVersion(),
+        /did not accept/
+      );
+    } finally {
+      qbitAnswersByStatus = false;
+    }
   });
 
   it('says so when the qBittorrent password is wrong', async () => {
@@ -334,6 +416,11 @@ describe('talking to them', () => {
       }).getVersion(),
       /did not accept/
     );
+  });
+
+  it('tests a wrong qBittorrent password as wrong, though the right one is signed in', async () => {
+    assert.equal(await qbit('secret').getVersion(), 'v5.0.4');
+    await assert.rejects(qbit('nope').getVersion(), /did not accept/);
   });
 });
 
@@ -352,6 +439,9 @@ describe('adding a torrent to qBittorrent for Backfill', () => {
         return { data: 'Ok.' };
       }
     );
+    mock.method(QBittorrentAPI.prototype, 'findTorrent', async () => ({
+      hash: 'ab'.repeat(20),
+    }));
     await new QBittorrentAPI({
       hostname: '127.0.0.1',
       port: 1,
@@ -359,11 +449,164 @@ describe('adding a torrent to qBittorrent for Backfill', () => {
       urlBase: '',
       username: '',
       password: '',
-    }).addTorrent({ torrent: Buffer.from('torrent'), category: 'backfill' });
-    // A limit of 0 is reached at once, and qBittorrent is often set to
-    // remove a torrent and its files when it is: before Radarr imports it.
+    }).addTorrent({
+      torrent: Buffer.from('torrent'),
+      hash: 'ab'.repeat(20),
+      category: 'backfill',
+    });
+    // A limit of 0 is hit at once, and qBittorrent is often set to remove
+    // the torrent and files then, before Radarr imports.
     assert.equal(form?.get('ratioLimit'), '-1');
     assert.equal(form?.get('seedingTimeLimit'), '-1');
     assert.equal(form?.get('inactiveSeedingTimeLimit'), '-1');
+  });
+  const qbit = () =>
+    new QBittorrentAPI({
+      hostname: '127.0.0.1',
+      port: 1,
+      useSsl: false,
+      urlBase: '',
+      username: '',
+      password: '',
+    });
+
+  it('refuses a torrent qBittorrent does not list under the hash read', async () => {
+    mock.method(
+      QBittorrentAPI.prototype as unknown as {
+        post: (path: string) => Promise<unknown>;
+      },
+      'post',
+      async () => ({ data: 'Ok.' })
+    );
+    let asked = 0;
+    mock.method(QBittorrentAPI.prototype, 'findTorrent', async () => {
+      asked++;
+      return undefined;
+    });
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const added = assert.rejects(
+        qbit().addTorrent({
+          magnet: `magnet:?xt=urn:btih:${'ab'.repeat(20)}`,
+          hash: 'ab'.repeat(20),
+          category: 'backfill',
+        }),
+        /did not list the torrent/
+      );
+      // A busy client gets about 20 seconds to list it.
+      for (let second = 0; second < 25; second++) {
+        await new Promise((resolve) => setImmediate(resolve));
+        mock.timers.tick(1_000);
+      }
+      await added;
+      assert.ok(asked >= 15, String(asked));
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
+  it('removes a torrent with its data, unless another torrent shares the files', async () => {
+    const own = 'ab'.repeat(20);
+    let listed: Record<string, string>[] = [];
+    const deletes: unknown[] = [];
+    const api = QBittorrentAPI.prototype as unknown as {
+      get: (path: string) => Promise<unknown>;
+      post: (path: string, body: unknown) => Promise<unknown>;
+    };
+    mock.method(api, 'get', async () => ({ data: listed }));
+    mock.method(api, 'post', async (_path: string, body: unknown) => {
+      deletes.push(body);
+      return { data: '' };
+    });
+    const torrent = (hash: string, content: string) => ({
+      hash,
+      name: content.split('/').pop()!,
+      save_path: '/downloads',
+      content_path: content,
+    });
+
+    listed = [
+      torrent(own, '/downloads/Glasswing.S01'),
+      torrent('cd'.repeat(20), '/downloads/Glasswing.S02'),
+    ];
+    await qbit().deleteTorrent(own);
+    listed = [
+      torrent(own, '/downloads/Glasswing.S01'),
+      torrent('cd'.repeat(20), '/downloads/Glasswing.S01'),
+    ];
+    await qbit().deleteTorrent(own);
+    listed = [
+      torrent(own, '/downloads/Glasswing.S01'),
+      torrent('ef'.repeat(20), '/downloads/Glasswing.S01/Glasswing.S01E01.mkv'),
+    ];
+    await qbit().deleteTorrent(own);
+    // Another torrent added without its own folder (its content is the save
+    // folder) doesn't hold every torrent kept there.
+    listed = [
+      torrent(own, '/downloads/Glasswing.S01'),
+      torrent('ef'.repeat(20), '/downloads'),
+    ];
+    await qbit().deleteTorrent(own);
+    assert.deepEqual(deletes, [
+      { hashes: own, deleteFiles: 'true' },
+      { hashes: own, deleteFiles: 'false' },
+      { hashes: own, deleteFiles: 'false' },
+      { hashes: own, deleteFiles: 'true' },
+    ]);
+  });
+
+  it('reads how much of each file the swarm has, unknown as unknown', async () => {
+    mock.method(
+      QBittorrentAPI.prototype as unknown as {
+        get: (path: string) => Promise<unknown>;
+      },
+      'get',
+      async () => ({
+        data: [
+          {
+            index: 0,
+            name: 'a.mkv',
+            size: 10,
+            progress: 0,
+            priority: 1,
+            availability: 0.98,
+          },
+          {
+            index: 1,
+            name: 'b.mkv',
+            size: 10,
+            progress: 0,
+            priority: 1,
+            availability: -1,
+          },
+          {
+            index: 2,
+            name: 'c.mkv',
+            size: 10,
+            progress: 0,
+            priority: 1,
+            availability: 3,
+          },
+          { name: 'd.mkv', size: 10, progress: 0, priority: 0 },
+        ],
+      })
+    );
+    const files = await new QBittorrentAPI({
+      hostname: '127.0.0.1',
+      port: 1,
+      useSsl: false,
+      urlBase: '',
+      username: '',
+      password: '',
+    }).getFiles('ABC');
+    assert.deepEqual(
+      files.map((f) => [f.index, f.availability]),
+      [
+        [0, 0.98],
+        [1, undefined],
+        [2, 1],
+        [3, undefined],
+      ]
+    );
   });
 });

@@ -1,3 +1,4 @@
+import { AiSearchingBadge } from '@app/components/Backfill/shared';
 import type { SeriesView } from '@app/components/Backfill/types';
 import Badge from '@app/components/Common/Badge';
 import defineMessages from '@app/utils/defineMessages';
@@ -19,11 +20,12 @@ const messages = defineMessages('components.Backfill.RequestChip', {
 
 export type BackfillLookup = SeriesView & {
   readyCount: number;
+  workingRunId?: number | null;
   job?: { id: number; progress: number };
   jobs?: { id: number; progress: number }[];
 };
 
-/** On a stuck request, for admins: where Backfill is with it. */
+/** Admin chip on a stuck request showing its Backfill status. */
 const BackfillRequestChip = ({ backfill }: { backfill: BackfillLookup }) => {
   const intl = useIntl();
   const [type, text, href] = backfill.job
@@ -58,17 +60,21 @@ const BackfillRequestChip = ({ backfill }: { backfill: BackfillLookup }) => {
       <span className="card-field-name">
         {intl.formatMessage(messages.backfill)}
       </span>
-      <Badge badgeType={type} href={href}>
-        {text}
-      </Badge>
+      <div className="flex min-w-0 flex-wrap gap-1">
+        {/* A running agent overrides Backfill's last search result. */}
+        {backfill.workingRunId ? (
+          <AiSearchingBadge runId={backfill.workingRunId} />
+        ) : (
+          <Badge badgeType={type} href={href}>
+            {text}
+          </Badge>
+        )}
+      </div>
     </div>
   );
 };
 
-/**
- * On someone's own request: that Backfill is looking beyond the usual
- * search for it, or downloading what it found. Nothing more.
- */
+/** Requester-facing line: Backfill is searching or downloading. */
 export const BackfillStatusLine = ({ status }: { status: BackfillStatus }) => {
   const intl = useIntl();
   return (
@@ -76,13 +82,21 @@ export const BackfillStatusLine = ({ status }: { status: BackfillStatus }) => {
       <span className="card-field-name">
         {intl.formatMessage(messages.lookingLabel)}
       </span>
-      <Badge badgeType={status.state === 'downloading' ? 'primary' : 'default'}>
-        {status.state === 'downloading'
-          ? intl.formatMessage(messages.foundElsewhere, {
-              progress: status.progress ?? 0,
-            })
-          : intl.formatMessage(messages.looking)}
-      </Badge>
+      <div className="flex min-w-0 flex-wrap gap-1">
+        {status.agent ? (
+          <AiSearchingBadge />
+        ) : (
+          <Badge
+            badgeType={status.state === 'downloading' ? 'primary' : 'default'}
+          >
+            {status.state === 'downloading'
+              ? intl.formatMessage(messages.foundElsewhere, {
+                  progress: status.progress ?? 0,
+                })
+              : intl.formatMessage(messages.looking)}
+          </Badge>
+        )}
+      </div>
     </div>
   );
 };

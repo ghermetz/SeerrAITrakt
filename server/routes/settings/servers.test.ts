@@ -11,13 +11,14 @@ import path from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
 /*
- * Radarr, Sonarr and Maintainerr servers in settings, behind the real
- * OpenAPI validator and an error handler like the app's.
+ * Radarr, Sonarr and Maintainerr settings, behind the real OpenAPI validator
+ * and an error handler like the app's.
  */
 
 setupTestDb();
 
 let maintainerrPort = 0;
+let radarr7Port = 0;
 let port = 0;
 const servers: Server[] = [];
 
@@ -30,10 +31,39 @@ before(async () => {
       servers.push(server);
     });
 
-  // Maintainerr answering its version.
+  // Maintainerr answering with its version.
   maintainerrPort = await listen((_req, res) => {
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify('2.14.0'));
+  });
+
+  // Radarr 7 with Allowed Hosts set to localhost: any other hostname gets
+  // ASP.NET's error page.
+  radarr7Port = await listen((req, res) => {
+    if ((req.headers.host ?? '').split(':')[0] !== 'localhost') {
+      res.statusCode = 400;
+      res.setHeader('Content-Type', 'text/html');
+      res.end(
+        '<HTML><HEAD><TITLE>Bad Request</TITLE></HEAD>\r\n' +
+          '<BODY><h2>Bad Request - Invalid Hostname</h2>\r\n' +
+          '<hr><p>HTTP Error 400. The request hostname is invalid.</p>\r\n' +
+          '</BODY></HTML>'
+      );
+      return;
+    }
+    res.setHeader('Content-Type', 'application/json');
+    const route = (req.url ?? '').split('?')[0];
+    res.end(
+      JSON.stringify(
+        route.endsWith('/system/status')
+          ? { version: '7.0.0.10815', urlBase: '' }
+          : route.endsWith('/qualityProfile')
+            ? [{ id: 1, name: 'Any' }]
+            : route.endsWith('/rootfolder')
+              ? [{ id: 1, path: '/movies' }]
+              : []
+      )
+    );
   });
 
   const app = express();
@@ -51,7 +81,7 @@ before(async () => {
       err: { status?: number; message: string },
       _req: express.Request,
       res: express.Response,
-      // Express tells an error handler by its four parameters.
+      // Express detects an error handler by its four parameters.
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       _next: express.NextFunction
     ) => res.status(err.status || 500).json({ message: err.message })
@@ -129,13 +159,46 @@ describe('Radarr, Sonarr and Maintainerr servers in settings', () => {
       const second = await call('POST', `/${list}`, body('Second'));
       const id = Number(second.body.id);
 
-      // Removing the newest server, and then every server.
+      // Remove the newest server, then every server.
       assert.equal((await call('DELETE', `/${list}/${id}`)).status, 200);
       const third = await call('POST', `/${list}`, body('Third'));
       assert.deepEqual([third.status, third.body.id], [201, id + 1]);
       getSettings()[list] = [];
       const fourth = await call('POST', `/${list}`, body('Fourth'));
       assert.equal(fourth.body.id, id + 2);
+    });
+  }
+
+  for (const [list, body] of [
+    ['radarr', radarr],
+    ['sonarr', sonarr],
+  ] as const) {
+    it(`keeps a ${list} server's folders by quality profile, cleaned`, async () => {
+      const created = await call('POST', `/${list}`, {
+        ...body('Main'),
+        profileFolders: [
+          { profileId: 7, rootFolder: ' /anime ' },
+          { profileId: 0, rootFolder: '/nowhere' },
+          { profileId: 8, rootFolder: '' },
+          { profileId: 7, rootFolder: '/anime-uhd' },
+        ],
+      });
+      assert.equal(created.status, 201);
+      const id = Number(created.body.id);
+      assert.deepEqual(getSettings()[list][0].profileFolders, [
+        { profileId: 7, rootFolder: '/anime-uhd' },
+      ]);
+
+      // Left out of an update, they stay; an empty list clears them.
+      await call('PUT', `/${list}/${id}`, body('Main'));
+      assert.deepEqual(getSettings()[list][0].profileFolders, [
+        { profileId: 7, rootFolder: '/anime-uhd' },
+      ]);
+      await call('PUT', `/${list}/${id}`, {
+        ...body('Main'),
+        profileFolders: [],
+      });
+      assert.deepEqual(getSettings()[list][0].profileFolders, []);
     });
   }
 
@@ -154,6 +217,33 @@ describe('Radarr, Sonarr and Maintainerr servers in settings', () => {
     await call('DELETE', `/maintainerr/${id}`);
     const third = await call('POST', '/maintainerr', server('Third'));
     assert.deepEqual([third.status, third.body.id], [201, id + 1]);
+  });
+
+  it('says how to let Seerr AI into a Radarr that doesn’t answer to its name', async () => {
+    const test = (hostname: string) =>
+      call<{ message?: string; hostRefused?: string; profiles?: unknown[] }>(
+        'POST',
+        '/radarr/test',
+        {
+          hostname,
+          port: radarr7Port,
+          apiKey: 'key',
+          useSsl: false,
+        }
+      );
+
+    const refused = await test('127.0.0.1');
+    assert.equal(refused.status, 502);
+    assert.equal(refused.body.hostRefused, '127.0.0.1');
+    assert.match(
+      refused.body.message ?? '',
+      /add 127\.0\.0\.1 to Allowed Hosts in Radarr/
+    );
+
+    // An allowed hostname connects.
+    const allowed = await test('localhost');
+    assert.equal(allowed.status, 200);
+    assert.deepEqual(allowed.body.profiles, [{ id: 1, name: 'Any' }]);
   });
 
   it('answers 404 for a Radarr server that is not set up', async () => {

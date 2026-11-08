@@ -1,13 +1,17 @@
 import PlexTvAPI from '@server/api/plextv';
 import { getRepository } from '@server/datasource';
 import { User } from '@server/entity/User';
+import { isConnected } from '@server/lib/mediaServers';
 import logger from '@server/logger';
 
 class RefreshToken {
   public async run() {
-    const userRepository = getRepository(User);
+    // Plex sign-ins only matter while Seerr is connected to Plex.
+    if (!isConnected('plex')) {
+      return;
+    }
 
-    const users = await userRepository
+    const users = await getRepository(User)
       .createQueryBuilder('user')
       .addSelect('user.plexToken')
       .where("user.plexToken != ''")
@@ -27,8 +31,7 @@ class RefreshToken {
       return;
     }
 
-    const plexTvApi = new PlexTvAPI(user.plexToken);
-    plexTvApi.pingToken();
+    new PlexTvAPI(user.plexToken).pingToken();
   }
 }
 

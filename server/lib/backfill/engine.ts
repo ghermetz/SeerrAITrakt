@@ -1,7 +1,5 @@
-import type { TorrentClient, TorrentState } from '@server/api/downloadclients';
+import type { TorrentClient } from '@server/api/downloadclients';
 import {
-  CLIENT_PRODUCTS,
-  TORRENT_CLIENT_TYPES,
   downloadClientFor,
   isTorrentClient,
   torrentClientFor,
@@ -9,10 +7,12 @@ import {
 } from '@server/api/downloadclients';
 import type { FetchedRelease, ProwlarrRelease } from '@server/api/prowlarr';
 import ProwlarrAPI, {
+  AUDIO_CATEGORIES,
   MOVIE_CATEGORIES,
   TV_CATEGORIES,
+  isUnusableLink,
 } from '@server/api/prowlarr';
-import { MediaRequestStatus, MediaType } from '@server/constants/media';
+import type { LidarrAlbum } from '@server/api/servarr/lidarr';
 import { getRepository } from '@server/datasource';
 import BackfillCandidate from '@server/entity/BackfillCandidate';
 import type {
@@ -22,9 +22,25 @@ import type {
 import BackfillJob from '@server/entity/BackfillJob';
 import type { BackfillKind } from '@server/entity/BackfillSeries';
 import BackfillSeries from '@server/entity/BackfillSeries';
-import { MediaRequest } from '@server/entity/MediaRequest';
+import SongFetch from '@server/entity/SongFetch';
 import type { User } from '@server/entity/User';
+import {
+  episodeNamedIn,
+  episodeTitled,
+  ownTitle,
+  sceneDiffers,
+} from '@server/lib/agent/numbering';
+import type { AlbumContext } from '@server/lib/backfill/albums';
+import { judgeAlbumPack } from '@server/lib/backfill/albums';
 import { magnetHash, parseTorrent } from '@server/lib/backfill/bencode';
+import {
+  IndexerLimitReached,
+  PROWLARR,
+  indexerLimits,
+} from '@server/lib/backfill/indexerLimit';
+import { arrIndexerOrigins } from '@server/lib/backfill/indexerOrigins';
+import type { AlbumTrack } from '@server/lib/backfill/lidarr';
+import BackfillLidarr from '@server/lib/backfill/lidarr';
 import type { PackFile, SeriesContext } from '@server/lib/backfill/matcher';
 import {
   judgePack,
@@ -38,27 +54,70 @@ import { judgeMoviePack } from '@server/lib/backfill/movies';
 import { baseName, isExtra, isVideo } from '@server/lib/backfill/naming';
 import backfillNotices from '@server/lib/backfill/notices';
 import { packingOf, readNzb } from '@server/lib/backfill/nzb';
+import {
+  escapesFolder,
+  mapRemotePath,
+  placeFiles,
+} from '@server/lib/backfill/paths';
 import type { PlanEntry, PlanSummary } from '@server/lib/backfill/plan';
 import {
+  airedAWhile,
+  filmOutAWhile,
   multiMustWait,
   rankCandidates,
   selectEntries,
+  unseeded,
 } from '@server/lib/backfill/plan';
+import {
+  PackedRelease,
+  ReleaseProblem,
+  SaidPlainly,
+  isUnreachable,
+  message,
+  plainProblem,
+  requestOf,
+} from '@server/lib/backfill/problems';
+import type { Progress } from '@server/lib/backfill/progress';
+import {
+  TORRENT_STAGES,
+  backfillDownloadsOf,
+  backfillImportsOf,
+  measureNzb,
+  measureTorrent,
+  torrentStage,
+  usenetStage,
+} from '@server/lib/backfill/progress';
 import type { RadarrMovieDetail } from '@server/lib/backfill/radarr';
 import BackfillRadarr from '@server/lib/backfill/radarr';
+import {
+  albumsAskedSince,
+  freshRequests,
+  pickSearches,
+  requestedSince,
+} from '@server/lib/backfill/schedule';
 import type { OpinionRequest } from '@server/lib/backfill/secondOpinion';
 import { aiSecondOpinion } from '@server/lib/backfill/secondOpinion';
-import type { SonarrCommand, SonarrEpisode } from '@server/lib/backfill/sonarr';
-import BackfillSonarr, { commandFinished } from '@server/lib/backfill/sonarr';
-import { blockedGroupOf, blockedGroups } from '@server/lib/blockedGroups';
+import type { SizeProblem } from '@server/lib/backfill/sizeLimits';
+import {
+  limitsOf,
+  sizeNote,
+  sizeProblems,
+} from '@server/lib/backfill/sizeLimits';
 import type {
-  BackfillDownload,
-  DownloadStage,
-} from '@server/lib/downloadtracker';
+  SonarrCommand,
+  SonarrEpisode,
+  SonarrQualityProfile,
+} from '@server/lib/backfill/sonarr';
+import BackfillSonarr, { commandFinished } from '@server/lib/backfill/sonarr';
+import { TorrentWatch, swarmLacks } from '@server/lib/backfill/watchdog';
+import { blockedGroupOf, blockedGroups } from '@server/lib/blockedGroups';
 import downloadTracker from '@server/lib/downloadtracker';
+import { musicReady } from '@server/lib/music/access';
+import { namesAlbum } from '@server/lib/music/albumRelease';
 import { owner } from '@server/lib/owner';
 import type {
   DownloadClientSettings,
+  LidarrSettings,
   RadarrSettings,
   SonarrSettings,
 } from '@server/lib/settings';
@@ -70,268 +129,89 @@ import { In, IsNull, MoreThan, Not } from 'typeorm';
 /*
  * Backfill's engine.
  *
- * Scan: find series with monitored, aired episodes Sonarr has searched for
- * and not found, and movies Radarr has searched for and not found, with
- * nothing on its way in the queue.
- * Search: search Prowlarr directly under every name the title goes by, open
- * the most pack-like results, and judge every file inside with Sonarr or
- * Radarr.
- * Approve (an admin, or the auto-approve rule): add the pack to the download
- * client with only the needed files picked.
- * Monitor (every minute): follow the download; once it is in, hand the files
- * to Sonarr's or Radarr's manual import, check what landed, then remove the
- * download.
+ * Scan: find series with monitored, aired episodes and movies the arr has
+ * searched for and not found, with nothing in its queue.
+ * Search: search Prowlarr under every name the title has, open the most
+ * pack-like results, and judge every file with Sonarr or Radarr.
+ * Approve (admin or auto-approve rule): add the pack to the download client
+ * with only the needed files selected.
+ * Monitor (every minute): follow the download; when done, manually import
+ * the files into Sonarr or Radarr, verify what landed, remove the download.
  */
 
 const LABEL = 'Backfill';
 
-const STAGE: Record<string, DownloadStage> = {
-  queued: 'queued',
-  downloading: 'downloading',
-  paused: 'paused',
-  importing: 'importing',
-};
-
-const clock = (seconds: number) =>
-  [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60]
-    .map((n) => String(Math.floor(n)).padStart(2, '0'))
-    .join(':');
-
-/**
- * A job as the download tracker shows downloads: what it has still to
- * bring, or (imported) what it has brought.
- */
-const downloadsOf = (
-  job: BackfillJob,
-  imported: boolean,
-  now: number
-): BackfillDownload[] => {
-  const row = job.series;
-  if (!row) return [];
-  const stage = STAGE[job.status] ?? 'queued';
-  const base = {
-    status: job.status,
-    stage,
-    timeLeft: job.secondsLeft ? clock(job.secondsLeft) : '',
-    ...(job.secondsLeft && stage === 'downloading'
-      ? { estimatedCompletionTime: new Date(now + job.secondsLeft * 1000) }
-      : {}),
-    title: `Backfill: ${job.title}`,
-    downloadId: job.downloadId ?? `backfill-${job.id}`,
-  };
-  if (row.kind === 'movie') {
-    if (imported && !(job.status === 'done' && job.imported > 0)) return [];
-    return [
-      {
-        kind: 'movie',
-        serverId: row.serverId,
-        jobId: job.id,
-        item: {
-          ...base,
-          mediaType: MediaType.MOVIE,
-          externalId: row.arrId,
-          size: job.size,
-          sizeLeft: job.sizeLeft,
-        },
-      },
-    ];
-  }
-  // Each episode its own item, its share of what is left.
-  const left = job.size ? job.sizeLeft / job.size : 1;
-  return job.files
-    .filter(
-      (file) =>
-        (file.state === 'imported') === imported &&
-        file.episodeIds.length &&
-        file.season !== undefined &&
-        file.episode !== undefined
-    )
-    .map((file) => ({
-      kind: 'series' as const,
-      serverId: row.serverId,
-      jobId: job.id,
-      item: {
-        ...base,
-        mediaType: MediaType.TV,
-        externalId: row.arrId,
-        size: file.size,
-        sizeLeft: Math.round(file.size * left),
-        episode: {
-          seasonNumber: file.season!,
-          episodeNumber: file.episode!,
-          absoluteEpisodeNumber: file.absolute ?? 0,
-          id: file.episodeIds[0],
-        },
-      },
-    }));
-};
-
-/** A running job as the download tracker shows downloads. */
-export const backfillDownloadsOf = (
-  job: BackfillJob,
-  now = Date.now()
-): BackfillDownload[] => downloadsOf(job, false, now);
-
-/** What a job has imported: each episode, or the movie once it is done. */
-export const backfillImportsOf = (
-  job: BackfillJob,
-  now = Date.now()
-): BackfillDownload[] => downloadsOf(job, true, now);
-
-/** How long after a job finishes its imports are still told of. */
+/** How long a finished job's imports stay reported. */
 const RECENTLY_DONE_MS = 10 * 60_000;
 
 const MAX_TERMS = 5;
-/** Seasons with missing episodes searched for by number, most missing first. */
+/** Seasons with missing episodes searched by number, most missing first. */
 const MAX_SEASON_TERMS = 3;
-/** Packs opened per search: opening one fetches it and parses every file. */
+/**
+ * Missing specials and scene-renumbered episodes searched by title: releases
+ * seldom use the library's number for them.
+ */
+const MAX_TITLE_TERMS = 3;
+/** Packs opened per search; each open fetches it and parses every file. */
 const MAX_INSPECT = 10;
 /** Packs per search the AI second opinion is asked about. */
 const MAX_AI_PACKS = 3;
-/** Packs opened at the same time during a search. */
+/** Packs opened concurrently during a search. */
 const OPEN_AT_ONCE = 3;
-/** How long a magnet link gets to produce its file list. */
+/** Time a magnet link gets to produce its file list. */
 const METADATA_WAIT_MS = 60_000;
-/**
- * What a Usenet download is doing, in words: the client's own status names
- * ("Running", "Extracting") mean little on their own, and after the
- * download its post-processing can take a while.
- */
-export const usenetStage = (
-  job: { place: string; status: string },
-  product: string
-): string => {
-  const status = job.status.toLowerCase();
-  const words: Record<string, string> =
-    job.place === 'queue'
-      ? {
-          downloading: 'Downloading',
-          queued: `Waiting its turn in ${product}`,
-          paused: `Paused in ${product}`,
-          grabbing: `${product} is fetching the NZB`,
-          fetching: `${product} is fetching the NZB`,
-          propagating: 'Waiting for the post to reach your Usenet server',
-          checking: `${product} is checking the post`,
-        }
-      : {
-          queued: `Downloaded; waiting for ${product} to unpack it`,
-          verifying: `${product} is checking the download`,
-          quickcheck: `${product} is checking the download`,
-          repairing: `${product} is repairing the download`,
-          fetching: `${product} is fetching repair blocks`,
-          renaming: `${product} is renaming its files`,
-          extracting: `${product} is unpacking it`,
-          moving: `${product} is moving it to its folder`,
-          running: `${product} is running its post-processing script`,
-          completed: 'Downloaded',
-          failed: `${product} could not finish it`,
-        };
-  return words[status] ?? job.status;
-};
-
-/**
- * What a torrent is doing, in words, and whether the client is holding it
- * back (paused, queued behind its own download limit, or checking): time
- * held back is not time without progress.
- */
-export const torrentStage = (
-  torrent: { state: TorrentState; speed: number },
-  product: string
-): { stage: string; held: boolean } => {
-  switch (torrent.state) {
-    case 'paused':
-      return { stage: `Paused in ${product}`, held: true };
-    case 'queued':
-      return { stage: `Queued in ${product}`, held: true };
-    case 'checking':
-      return { stage: `${product} is checking it`, held: true };
-    case 'moving':
-      return { stage: `${product} is moving it`, held: true };
-    default:
-      return {
-        stage: torrent.speed > 0 ? 'Downloading' : 'Waiting for peers',
-        held: false,
-      };
-  }
-};
-
-/** The torrent stages above, which a live reading may update. */
-const TORRENT_STAGES = new Set([
-  'Downloading',
-  'Waiting for peers',
-  ...TORRENT_CLIENT_TYPES.flatMap((type) => {
-    const product = CLIENT_PRODUCTS[type];
-    return [
-      `Paused in ${product}`,
-      `Queued in ${product}`,
-      `${product} is checking it`,
-      `${product} is moving it`,
-    ];
-  }),
-]);
-
-/** The least time between two readings a Usenet job's speed is taken from. */
+/** Minimum time between two readings used for a Usenet job's speed. */
 const PACE_MIN_MS = 5_000;
-/** How often the torrent client is checked for magnet probes left behind. */
+/** How often the torrent client is swept for leftover magnet probes. */
 const PROBE_SWEEP_EVERY_MS = 10 * 60_000;
-/** A probe this old is no one's: they are read within a minute. */
+/** A probe this old is orphaned; probes are read within a minute. */
 const PROBE_LEFT_AFTER_MS = 10 * 60_000;
 const METADATA_GIVE_UP_MS = 30 * 60_000;
 const IMPORT_GIVE_UP_MS = 3 * 60 * 60_000;
 const MAX_LOG_LINES = 300;
 const IMPORT_BATCH = 50;
-const ACTIVE: BackfillJob['status'][] = ['queued', 'downloading', 'importing'];
-
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
-
-/** Failures of the network itself: nothing answered, or not in time. */
-const UNREACHABLE = new Set([
-  'ECONNREFUSED',
-  'ECONNRESET',
-  'ECONNABORTED',
-  'ETIMEDOUT',
-  'ENOTFOUND',
-  'EAI_AGAIN',
-  'EHOSTUNREACH',
-  'ENETUNREACH',
-  'EPIPE',
-  'ERR_NETWORK',
-]);
-
+/** How long a job waits on its indexer's download limit before failing. */
+const LIMIT_GIVE_UP_MS = 24 * 60 * 60_000;
 /**
- * Whether an error says only that Sonarr, Radarr or the download client
- * could not be reached for now: no answer at all, or a proxy in front of it
- * saying it is down. A job waits that out rather than counting it towards
- * giving up, since nothing is wrong with the download itself.
+ * After a pack's download fails to start, only an admin can take it for
+ * this long: the cause will likely recur, and auto-retrying would loop.
  */
-export const isUnreachable = (e: unknown, depth = 0): boolean => {
-  if (!e || typeof e !== 'object' || depth > 3) return false;
-  if (isAxiosError(e) && e.response) {
-    return [502, 503, 504].includes(e.response.status);
-  }
-  const { code, cause } = e as { code?: unknown; cause?: unknown };
-  // Sonarr's and Radarr's own calls wrap what went wrong as the cause.
-  return UNREACHABLE.has(String(code ?? '')) || isUnreachable(cause, depth + 1);
+const START_FAILED_HOLD_MS = 24 * 60 * 60_000;
+/** Why a pack is held for an admin after its download didn't start. */
+const heldReason = (error: string | null): string => {
+  // Short enough to fit whole in the pack's reason.
+  const why = error ? ` (${error.replace(/\.$/, '').slice(0, 100)})` : '';
+  return `Its last download did not start${why}, so Backfill will not take it by itself for a day: approve it by hand once that is put right`;
 };
-
-/**
- * Something wrong with the release itself rather than with Seerr, the apps
- * or the download client: only then is it marked dead when its job gives up.
- */
-class ReleaseProblem extends Error {}
+/** Approver name for packs taken by the auto-approve rule. */
+const AUTO_APPROVED = 'Backfill (auto-approve)';
+const ACTIVE: BackfillJob['status'][] = ['queued', 'downloading', 'importing'];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const titleWithoutYear = (title: string) =>
   title.replace(/\s*\((19|20)\d{2}\)\s*$/, '').trim();
 
+/** Trimmed, non-empty, de-duplicated names in order. */
+const uniqueNames = (names: string[]): string[] => [
+  ...new Set(names.map((n) => n.trim()).filter(Boolean)),
+];
+
 export const posterOf = (
   images?: { coverType: string; remoteUrl?: string }[]
 ): string | null =>
-  images?.find((i) => i.coverType === 'poster')?.remoteUrl ?? null;
+  images?.find((i) => i.coverType === 'poster' || i.coverType === 'cover')
+    ?.remoteUrl ?? null;
 
-const aired = (ep: { airDateUtc?: string }) =>
-  !!ep.airDateUtc && new Date(ep.airDateUtc).getTime() < Date.now();
+/** Tracks an album is missing, per Lidarr; 1 when unknown. */
+const tracksMissing = (album: LidarrAlbum): number => {
+  const stats = album.statistics;
+  if (!stats) return 1;
+  return Math.max(0, (stats.trackCount ?? 0) - (stats.trackFileCount ?? 0));
+};
+
+// Missing once a new episode has had its wait with Sonarr.
+const aired = airedAWhile;
 
 export const isMissing = (ep: SonarrEpisode, includeSpecials: boolean) =>
   ep.monitored &&
@@ -346,12 +226,24 @@ export interface BackfillReadiness {
   torrentClient?: string;
   usenetClient?: string;
   problem?: string;
+  /** Albums are searched too. */
+  music: boolean;
 }
 
-/** What Sonarr and Radarr both answer, for downloads and imports. */
-type Arr = BackfillSonarr | BackfillRadarr;
+/** The title kinds Backfill searches, per Settings → Backfill. */
+const followedKinds = (): BackfillKind[] => {
+  const settings = getSettings().backfill;
+  return [
+    'series',
+    ...(settings.includeMovies ? (['movie'] as const) : []),
+    ...(settings.includeMusic && musicReady() ? (['album'] as const) : []),
+  ];
+};
 
-/** One title, ready to search for: its names and how to judge a pack. */
+/** The shared arr API surface for downloads and imports. */
+type Arr = BackfillSonarr | BackfillRadarr | BackfillLidarr;
+
+/** A title ready to search: its names and how to judge a pack. */
 interface Target {
   title: string;
   poster: string | null;
@@ -359,27 +251,33 @@ interface Target {
   missing: number;
   categories: number[];
   /**
-   * Searches beyond the names: a season's own ("Expedition Unknown S17"),
-   * since a name alone brings back the most popular releases, which are
-   * often old season packs.
+   * Searches beyond the names, e.g. a season ("Wayfarer Ledger S17"): a
+   * name alone returns the most popular releases, often old season packs.
    */
   extraTerms: string[];
-  /** How many of the missing items a release's title names. */
+  /** How many missing items a release title names. */
   wants(title: string): number;
-  /** Whether the app reads a release's title as another title, or this one. */
+  /** Whether the app reads a release title as another title or this one. */
   readTitle(title: string): Promise<{ other: boolean; sees: boolean }>;
   judge(
     files: PackFile[],
     packTitle: string,
     secondOpinion?: SeriesContext['secondOpinion']
   ): Promise<{ plan: PlanEntry[]; summary: PlanSummary }>;
+  /** Files to take that are outside the app's size limits. */
+  sizeCheck?(plan: PlanEntry[]): SizeProblem[];
 }
 
-const appOf = (kind: BackfillKind) => (kind === 'movie' ? 'Radarr' : 'Sonarr');
+const appOf = (kind: BackfillKind) =>
+  kind === 'album' ? 'Lidarr' : kind === 'movie' ? 'Radarr' : 'Sonarr';
 
-/** What a download was for, as a notice names it: "S17E02, S17E03". */
+/** What a download was for, as notices name it: "S17E02, S17E03". */
 const jobWhat = (row: BackfillSeries, job: BackfillJob): string => {
   if (row.kind === 'movie') return 'the movie';
+  if (row.kind === 'album') {
+    const tracks = job.files.filter((f) => f.episodeIds.length).length;
+    return `${tracks} track${tracks === 1 ? '' : 's'} of ${row.title}`;
+  }
   const labels = [
     ...new Set(
       job.files
@@ -396,286 +294,84 @@ const jobWhat = (row: BackfillSeries, job: BackfillJob): string => {
     : labels.join(', ');
 };
 
-/** Below this, a video in a release grabbed whole is a sample. */
+/** Below this, a video in a whole-grabbed release is a sample. */
 const WHOLE_MIN_BYTES = 20 * 1024 * 1024;
 
-/** A path inside a torrent without its top folder, which clients may rename. */
-const insidePath = (path: string): string => {
-  const parts = path.replace(/\\/g, '/').split('/');
-  return parts.length > 1 ? parts.slice(1).join('/') : parts[0];
-};
-
-/**
- * Where each chosen file is in the client's own list, in the order given;
- * undefined for one that is not there.
- *
- * Backfill numbers a .torrent's files leaving out its padding files (BEP
- * 47), as qBittorrent does. rTorrent, Transmission before 4, and Deluge on
- * some versions list them, which moves every file after one along. So a
- * file numbered the same in the client is taken when it is the same file;
- * otherwise it is looked for by its path inside the torrent and its size,
- * and last by its name and size.
- */
-export const placeFiles = (
-  chosen: { index: number; path: string; size: number }[],
-  files: { index: number; name: string; size: number }[]
-): (number | undefined)[] =>
-  chosen.map((file) => {
-    const inside = insidePath(file.path);
-    const same = files.find((f) => f.index === file.index);
-    if (same && insidePath(same.name) === inside) return same.index;
-    const byPath = files.filter(
-      (f) => insidePath(f.name) === inside && f.size === file.size
-    );
-    if (byPath.length === 1) return byPath[0].index;
-    const name = baseName(file.path.replace(/\\/g, '/'));
-    if (same && baseName(same.name.replace(/\\/g, '/')) === name) {
-      return same.index;
-    }
-    const byName = files.filter(
-      (f) =>
-        baseName(f.name.replace(/\\/g, '/')) === name && f.size === file.size
-    );
-    return byName.length === 1 ? byName[0].index : undefined;
-  });
-
-/**
- * A path the download client gave, as Sonarr or Radarr sees it, by the
- * remote path mapping that fits it best. What follows the mapped folder is
- * written with the app's own separators: a Windows client's
- * "D:\dl\Show\ep.mkv" mapped to "/data/" is "/data/Show/ep.mkv".
- */
-export const mapRemotePath = (
-  path: string,
-  host: string,
-  mappings: { host: string; remotePath: string; localPath: string }[]
-): string => {
-  const windows = /^[a-z]:\\|^\\\\/i.test(path);
-  const norm = (p: string) =>
-    windows ? p.replace(/\//g, '\\').toLowerCase() : p;
-  const mapping = mappings
-    .filter(
-      (m) =>
-        m.host.toLowerCase() === host.toLowerCase() &&
-        norm(path).startsWith(norm(m.remotePath))
-    )
-    .sort((a, b) => b.remotePath.length - a.remotePath.length)[0];
-  if (!mapping) return path;
-  const local = mapping.localPath;
-  // A backslash is a separator only in a Windows path; elsewhere it can be
-  // part of a file's name.
-  const theirs = windows ? /[\\/]+/g : /\/+/g;
-  const rest = path.slice(mapping.remotePath.length).replace(/^[\\/]+/, '');
-  if (!rest) return local;
-  const sep = /^[a-z]:[\\/]|^\\\\/i.test(local) ? '\\' : '/';
-  return `${local.replace(/[\\/]+$/, '')}${sep}${rest.replace(theirs, sep)}`;
-};
-
-/**
- * A Usenet post in archives, or with scrambled file names: its files
- * cannot be listed before it is downloaded.
- */
-export class PackedRelease extends Error {
-  constructor(public readonly packing: 'archives' | 'scrambled') {
-    super(
-      packing === 'archives'
-        ? 'Packed in archives, so its files cannot be checked'
-        : 'Its file names are scrambled (only its repair files are named), so its files cannot be checked'
-    );
-  }
-}
-
 export interface SearchOptions {
-  /** False keeps auto-approve out of it, for searches people asked for. */
+  /** False disables auto-approve, for user-requested searches. */
   autoApprove?: boolean;
   /**
-   * Lets the AI place files named only by their title. Only for a search
-   * an admin starts for one title: searches Backfill runs by itself never
-   * spend tokens.
+   * Lets the AI place files named only by title. Only for admin-started
+   * single-title searches; Backfill's own searches never spend tokens.
    */
   ai?: boolean;
   /**
-   * The episodes (or movie) of a download that failed: a good pack for any
-   * of them is taken on its own, auto-approve on or not.
+   * Episodes (or movie) of a failed download: a good pack for any of them
+   * is taken automatically, regardless of auto-approve.
    */
   replacing?: number[];
-  /** The download being replaced, to say what became of it. */
+  /** The download being replaced, to report what became of it. */
   failedJob?: { id: number; what: string; reason: string };
   /**
-   * Whether the run the search belongs to (a scan) was cancelled: the
-   * search then stops, and leaves what an earlier search found as it was.
+   * Whether the owning run (a scan) was cancelled: the search then stops
+   * and leaves earlier findings unchanged.
    */
   cancelled?: () => boolean;
 }
 
 /**
- * Failed downloads of one title in a day after which Backfill stops
- * replacing them on its own: past this, something other than the releases
- * is likely wrong, and an admin should look.
+ * What the admin agent does with a failed download it started: look for
+ * another release (`look` starts it once the job says so), or stop, with
+ * why. Null when it can't (off, or the conversation is gone): Backfill then
+ * searches as for any download.
+ */
+export type AgentHandBack =
+  | { look: () => Promise<void> }
+  | { stopped: 'gaveUp' | 'limit'; why: string }
+  | null;
+
+/** Whether the admin agent, not Backfill or an admin, started a download. */
+export const startedByAgent = (job: BackfillJob): boolean =>
+  (job.agentRunId ?? null) !== null ||
+  // Older jobs have no agentRunId; check the approver name.
+  /^AI agent\b/.test(job.approvedByName ?? '');
+
+/** Episode (or movie) ids a download was for. */
+export const jobEpisodes = (job: Pick<BackfillJob, 'files'>): number[] => [
+  ...new Set(job.files.flatMap((f) => f.episodeIds)),
+];
+
+/**
+ * Failed downloads of one title per day before Backfill stops replacing
+ * them automatically: past this, something besides the releases is likely
+ * wrong.
  */
 export const MAX_FAILED_PER_DAY = 6;
 
-/** Where a download stands, as its page shows it. */
-export interface Progress {
-  progress: number;
-  size: number;
-  sizeLeft: number;
-  speed: number;
-  secondsLeft: number | null;
-  /** What it is doing, read live: downloading, or waiting for peers. */
-  stage?: string;
-}
-
-/** A torrent's progress over the chosen files only, not the whole pack. */
-const measureTorrent = (
-  job: BackfillJob,
-  torrent: { speed: number; secondsLeft?: number },
-  files: { index: number; size: number; progress: number }[]
-): Progress & { have: number; complete: boolean } => {
-  const wanted = new Set(job.files.map((f) => f.index));
-  const chosen = files.filter((f) => wanted.has(f.index));
-  const size = chosen.reduce((n, f) => n + f.size, 0);
-  const have = chosen.reduce((n, f) => n + f.size * f.progress, 0);
-  const sizeLeft = Math.max(0, Math.round(size - have));
-  const speed = torrent.speed ?? 0;
-  return {
-    have,
-    complete: chosen.length > 0 && chosen.every((f) => f.progress >= 1),
-    size,
-    sizeLeft,
-    progress: size ? Math.floor((have / size) * 100) : 0,
-    speed,
-    // The client's own estimate, else what is left at today's speed.
-    secondsLeft:
-      torrent.secondsLeft ??
-      (speed > 0 && sizeLeft > 0 ? Math.round(sizeLeft / speed) : null),
-  };
-};
-
-const measureNzb = (nzbJob: {
-  size: number;
-  sizeLeft: number;
-  percentage: number;
-  secondsLeft?: number;
-  speed?: number;
-}): Progress => ({
-  size: nzbJob.size,
-  sizeLeft: nzbJob.sizeLeft,
-  progress: Math.floor(nzbJob.percentage),
-  speed: nzbJob.speed ?? 0,
-  secondsLeft: nzbJob.secondsLeft ?? null,
-});
-
-/** A date from a raw query: SQLite gives UTC text with no zone on it. */
-const utcDate = (value: string | Date) =>
-  value instanceof Date
-    ? value
-    : new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : `${value}Z`);
-
-/** Whether a date Sonarr or Radarr gave is set and earlier than `when`. */
+/** Whether an arr date is set and earlier than `when`. */
 const before = (date: string | undefined, when: number) =>
   !!date && new Date(date).getTime() < when;
 
-/**
- * How long a title whose last search failed (Prowlarr down, say) waits
- * before it is tried again, so it never holds a place in every scan.
- */
-const RETRY_FAILED_AFTER_MS = 24 * 60 * 60 * 1000;
-
-/**
- * When each title someone asked for was first asked for: the oldest request
- * approved and still open, by TMDB id. Titles nobody asked for are absent.
- */
-export const requestedSince = async (
-  rows: BackfillSeries[]
-): Promise<Map<number, Date>> => {
-  const since = new Map<number, Date>();
-  const byKind = (kind: BackfillKind) =>
-    rows
-      .filter((row) => row.kind === kind && row.tmdbId)
-      .map((row) => row.tmdbId!);
-  for (const kind of ['series', 'movie'] as const) {
-    const tmdbIds = byKind(kind);
-    if (!tmdbIds.length) continue;
-    const requests = await getRepository(MediaRequest)
-      .createQueryBuilder('request')
-      .innerJoin('request.media', 'media')
-      .select('media.tmdbId', 'tmdbId')
-      .addSelect('MIN(request.createdAt)', 'first')
-      .where('request.status = :status', {
-        status: MediaRequestStatus.APPROVED,
-      })
-      .andWhere('request.is4k = :is4k', { is4k: false })
-      .andWhere('media.mediaType = :type', {
-        type: kind === 'movie' ? MediaType.MOVIE : MediaType.TV,
-      })
-      .andWhere('media.tmdbId IN (:...tmdbIds)', { tmdbIds })
-      .groupBy('media.tmdbId')
-      .getRawMany<{ tmdbId: number | string; first: string | Date }>();
-    const firstById = new Map(
-      requests.map((r) => [Number(r.tmdbId), utcDate(r.first)])
-    );
-    for (const row of rows) {
-      const first =
-        row.kind === kind && row.tmdbId ? firstById.get(row.tmdbId) : undefined;
-      if (first) since.set(row.id, first);
-    }
-  }
-  return since;
-};
-
-/**
- * Which titles this scan searches, at most `searchesPerScan`. A title is
- * due when Backfill has never searched for it; when its last search failed
- * a day ago or more; or when nothing was found and `researchAfterDays` have
- * passed. Every search, found or not, restarts that wait, so the same few
- * titles never take every scan: each in turn goes to the back.
- *
- * Of those due, titles never searched come first, then ones searched
- * before. Within each, a title someone asked for goes ahead of one nobody
- * did (the oldest request first); then, of titles never searched, the one
- * missing most, and of the rest, the one that has waited longest.
- */
-export const pickSearches = (
-  due: BackfillSeries[],
-  requested: Map<number, Date>,
-  settings: { searchesPerScan: number; researchAfterDays: number },
-  now = Date.now()
-): BackfillSeries[] => {
-  const waitFor = (row: BackfillSeries) =>
-    row.status === 'stuck'
-      ? RETRY_FAILED_AFTER_MS
-      : settings.researchAfterDays * 86_400_000;
-  const eligible = due.filter(
-    (row) =>
-      !row.lastSearchedAt || now - row.lastSearchedAt.getTime() >= waitFor(row)
-  );
-  const asked = (row: BackfillSeries) =>
-    requested.get(row.id)?.getTime() ?? Infinity;
-  return eligible
-    .sort(
-      (a, b) =>
-        Number(!!a.lastSearchedAt) - Number(!!b.lastSearchedAt) ||
-        asked(a) - asked(b) ||
-        (a.lastSearchedAt?.getTime() ?? 0) -
-          (b.lastSearchedAt?.getTime() ?? 0) ||
-        b.missing - a.missing ||
-        a.id - b.id
-    )
-    .slice(0, settings.searchesPerScan);
-};
-
-/** Between one title and the next when searching everything stuck. */
+/** Pause between titles when searching everything stuck. */
 const SEARCH_ALL_PAUSE_MS = 30_000;
-/** Searches failing for want of Prowlarr in a row before giving up. */
+/** Consecutive Prowlarr failures before Search All stops. */
 const SEARCH_ALL_FAILURES_TO_STOP = 3;
+/**
+ * For Search Right After: how long after the arr's own search a requested
+ * title still missing, with nothing queued, counts as not found.
+ */
+const ARR_SETTLE_MS = 20 * 60_000;
+/** How often requested titles are checked for Search Right After. */
+const QUICK_SCAN_EVERY_MS = 15 * 60_000;
+/** Requests newer than this are searched right after; older wait their turn. */
+const FRESH_REQUEST_MS = 3 * 24 * 60 * 60_000;
 
 interface SearchAllProgress {
   total: number;
   done: number;
   /** Titles a pack was found for. */
   found: number;
-  /** The title being searched, or what is being done before the first. */
+  /** The title being searched, or the setup step before the first. */
   current?: string;
   startedAt: Date;
 }
@@ -693,54 +389,51 @@ interface SearchAllEnd {
   stoppedBecause?: string;
 }
 
-/** The least time between ticks run early for a finished download. */
+/** Minimum time between early ticks for finished downloads. */
 const KICK_EVERY_MS = 30_000;
 
 class Backfill {
   private scanning = false;
+  /** When requested titles were last checked for Search Right After. */
+  private quickScannedAt = 0;
   /**
-   * The scan under way, if any. Cancelling it ends that scan and its
-   * searches only: a search started later, by an admin or the next scan,
-   * is not touched by it.
+   * The running scan, if any. Cancelling ends only that scan and its
+   * searches, not ones started later by an admin or the next scan.
    */
   private scanRun: { cancelled: boolean } | null = null;
   /**
-   * Held by a tick, and by anything else that changes a job (pausing,
-   * ending, adding files): a tick loads every job as it starts and saves
-   * each as it goes, so a change made meanwhile would be saved over.
+   * Held by a tick and by anything else that changes a job (pausing,
+   * ending, adding files): a tick loads every job at start and saves each
+   * as it goes, so a concurrent change would be overwritten.
    */
   private ticking = false;
   private searching = new Set<number>();
   private failures = new Map<number, number>();
   private starting = new Set<number>();
-  /** Magnet links being read for their file lists, by hash. */
+  /** Hashes of magnet links being read for their file lists. */
   private probing = new Set<string>();
-  // The first look waits a while after start, like the ones after it.
+  // The first sweep waits a full interval after start too.
   private sweptAt = Date.now();
-  /** Settles when the tick under way, if any, is over. */
+  /** Settles when the running tick, if any, ends. */
   private ticked: Promise<void> = Promise.resolve();
-  /**
-   * The bytes each torrent had when it last gained any, and when. Kept in
-   * memory: a restart gives a stalled torrent a fresh allowance.
-   */
-  private lastGain = new Map<number, { have: number; at: number }>();
-  /** When a page last had a tick run early. */
+  /** Gives up on torrents that stall, can't finish or crawl. */
+  private watch = new TorrentWatch();
+  /** When a page last triggered an early tick. */
   private kickedAt = 0;
   /**
-   * What each Usenet download had left, and when, to work out its own
-   * speed when the client's (one figure for its whole queue) is not its own.
+   * Each Usenet download's last remaining bytes and time, to derive its own
+   * speed when the client reports only one figure for the whole queue.
    */
   private nzbPace = new Map<
     number,
     { left: number; at: number; speed: number }
   >();
-  /** Live readings under way, so pages asking at once share one. */
+  /** In-flight live readings, shared by concurrent page requests. */
   private readings = new Map<number, Promise<Progress | null>>();
 
   /**
-   * A downloading job's progress as the client has it right now, rather
-   * than as of the last minute's tick. Null when it cannot be read; the
-   * page then shows what was saved.
+   * A downloading job's current progress from the client, not the last
+   * tick's. Null when unreadable; the page then shows the saved values.
    */
   public liveProgress(job: BackfillJob): Promise<Progress | null> {
     if (job.status !== 'downloading' || !job.downloadId) {
@@ -755,7 +448,7 @@ class Backfill {
     return reading;
   }
 
-  /** Jobs as the page shows them, with live readings over the saved ones. */
+  /** Jobs with live readings applied over the saved ones. */
   public async withLiveProgress<T extends BackfillJob>(
     jobs: T[]
   ): Promise<T[]> {
@@ -775,7 +468,7 @@ class Backfill {
       ]);
       if (!torrent || !files.length) return null;
       const measured = measureTorrent(job, torrent, files);
-      // Finished: imported now rather than at the next minute's tick.
+      // Finished: import now rather than at the next tick.
       if (measured.complete) this.tickSoon();
       const moving = TORRENT_STAGES.has(job.stage ?? '');
       return {
@@ -800,7 +493,7 @@ class Backfill {
         stage: usenetStage(nzbJob, usenet.product),
       };
     }
-    // Downloaded, and the client still unpacking or running its script.
+    // Downloaded; the client is still unpacking or running its script.
     if (nzbJob && !/^(completed|failed)$/i.test(nzbJob.status)) {
       return {
         ...measureNzb(nzbJob),
@@ -812,9 +505,8 @@ class Backfill {
   }
 
   /**
-   * A Usenet download's speed: the client's own when it is this job's, and
-   * otherwise what it gained since the last reading, at least a few
-   * seconds back. Until there is one to compare with, the last known.
+   * A Usenet download's speed: the client's figure when it is per job, else
+   * progress since a reading at least PACE_MIN_MS old, else the last known.
    */
   private paced(
     jobId: number,
@@ -849,9 +541,9 @@ class Backfill {
   }
 
   /**
-   * A tick now, for a download a page saw finish, unless one is under way
-   * or one was asked for lately: a failing import must not be retried at
-   * the pace pages poll, each try counting towards giving up.
+   * Ticks now for a download a page saw finish, unless a tick is running or
+   * was triggered recently: a failing import must not retry at the page's
+   * poll rate, since each try counts toward giving up.
    */
   private tickSoon(): void {
     if (this.ticking || Date.now() - this.kickedAt < KICK_EVERY_MS) return;
@@ -859,7 +551,7 @@ class Backfill {
     this.tick().catch(() => undefined);
   }
 
-  /** Settles once the tick under way, if any, is over. */
+  /** Settles when the running tick, if any, ends. */
   public tickDone(): Promise<void> {
     return this.ticked;
   }
@@ -870,7 +562,7 @@ class Backfill {
 
   /* ------------------------ searching everything ------------------------ */
 
-  /** The search of everything stuck under way, if one is. */
+  /** The running Search All, if any. */
   private searchAllRun: SearchAllRun | null = null;
   /** How the last one ended, until another starts. */
   private searchAllLast: SearchAllEnd | null = null;
@@ -895,11 +587,10 @@ class Backfill {
   }
 
   /**
-   * Searches every stuck title, one at a time with a pause between, rather
-   * than a few each scan: titles someone asked for first, then the rest.
-   * What Sonarr or Radarr searched for lately counts too. A title Backfill
-   * searched within the last day is left out. Auto-approve applies as it
-   * does to the scan. Kept in memory: a restart ends it.
+   * Searches every stuck title one at a time with a pause between, not a
+   * few per scan: requested titles first. Recent arr searches count too.
+   * Titles Backfill searched within a day are skipped. Auto-approve applies
+   * as in a scan. In memory only: a restart ends it.
    */
   public startSearchAll(
     user?: User,
@@ -943,11 +634,8 @@ class Backfill {
     let stoppedBecause: string | undefined;
     try {
       await this.scan({ everything: true, searches: false });
-      const settings = getSettings().backfill;
       const repo = getRepository(BackfillSeries);
-      const kinds: BackfillKind[] = settings.includeMovies
-        ? ['series', 'movie']
-        : ['series'];
+      const kinds = followedKinds();
       const due = await repo.find({
         where: [
           { status: 'stuck', kind: In(kinds) },
@@ -966,8 +654,7 @@ class Backfill {
           break;
         }
         run.current = row.title;
-        // One title failing (its app not answering, say) is recorded on
-        // it by the search; the rest are still searched.
+        // The search records a title's own failure on it; the rest go on.
         await this.search(row.id, user).catch((e) =>
           logger.warn('Backfill could not search a title', {
             label: LABEL,
@@ -980,8 +667,7 @@ class Backfill {
         if (after && ['found', 'downloading'].includes(after.status)) {
           run.found += 1;
         }
-        // Prowlarr not answering fails every search alike: stop rather
-        // than run through the rest for nothing.
+        // Prowlarr down fails every search alike, so stop.
         failedInARow = after?.searchError?.startsWith('Prowlarr')
           ? failedInARow + 1
           : 0;
@@ -1012,7 +698,7 @@ class Backfill {
     }
   }
 
-  /** Waits, ending early once `stop` says so. */
+  /** Waits `ms`, ending early once `stop` returns true. */
   private async waitFor(ms: number, stop: () => boolean): Promise<void> {
     const until = Date.now() + ms;
     while (Date.now() < until && !stop()) {
@@ -1026,16 +712,24 @@ class Backfill {
     return { running: this.ticking };
   }
 
-  /** Cancels the scan under way, if there is one. */
+  /** Cancels the running scan, if any. */
   public cancel() {
     if (this.scanRun) this.scanRun.cancelled = true;
   }
 
   /**
-   * Told of each title a search found nothing usable for, so something else
-   * (the admin agent) can look further. Set once at startup.
+   * Called for each title a search found nothing usable for, so the admin
+   * agent can look further. Set once at startup.
    */
   public onNothingFound: ((row: BackfillSeries) => void) | null = null;
+
+  /**
+   * Called for each agent-started download that failed for its release, so
+   * the agent can look for another. Set by the agent.
+   */
+  public onAgentDownloadFailed:
+    | ((job: BackfillJob) => Promise<AgentHandBack>)
+    | null = null;
 
   private nothingFound(row: BackfillSeries) {
     try {
@@ -1051,6 +745,17 @@ class Backfill {
 
   public isSearching(id: number) {
     return this.searching.has(id);
+  }
+
+  /**
+   * A title's current status. One saved as searching with no running search
+   * was left by a restart, and is stuck.
+   */
+  public statusOf(
+    row: Pick<BackfillSeries, 'id' | 'status'>
+  ): BackfillSeries['status'] {
+    if (this.searching.has(row.id)) return 'searching';
+    return row.status === 'searching' ? 'stuck' : row.status;
   }
 
   /* ----------------------------- settings ----------------------------- */
@@ -1069,12 +774,13 @@ class Backfill {
     const problem = !backfill.enabled
       ? 'Backfill is turned off in Settings → Backfill.'
       : !prowlarr
-        ? 'Prowlarr is not set up in Settings → Backfill.'
+        ? 'Prowlarr is not set up in Settings → Services.'
         : !torrent && !usenet
           ? 'No download client is chosen in Settings → Backfill.'
           : !settings.sonarr.length &&
-              !(backfill.includeMovies && settings.radarr.length)
-            ? 'No Sonarr or Radarr server is set up.'
+              !(backfill.includeMovies && settings.radarr.length) &&
+              !(backfill.includeMusic && musicReady())
+            ? 'No Sonarr, Radarr or Lidarr server is set up.'
             : undefined;
     return {
       ready: !problem,
@@ -1083,6 +789,7 @@ class Backfill {
       torrentClient: torrent?.name,
       usenetClient: usenet?.name,
       problem,
+      music: backfill.includeMusic && musicReady(),
     };
   }
 
@@ -1127,14 +834,71 @@ class Backfill {
     return BackfillRadarr.forServer(server);
   }
 
+  /**
+   * Plan files outside Sonarr's or Radarr's size limits for a series or
+   * movie; the admin agent checks this before a grab.
+   */
+  public async sizeProblemsFor(
+    title: { kind: BackfillKind; serverId: number; arrId: number },
+    plan: PlanEntry[]
+  ): Promise<SizeProblem[]> {
+    if (title.kind === 'movie') {
+      const radarr = this.radarrFor(title.serverId);
+      const movie = await radarr.getMovieDetail(title.arrId);
+      const profile = await radarr.getQualityProfile(movie.qualityProfileId);
+      return (await this.sizeChecker(radarr, profile, movie.runtime, 'Radarr'))(
+        plan
+      );
+    }
+    if (title.kind === 'series') {
+      const sonarr = this.sonarrFor(title.serverId);
+      const series = await sonarr.getSeriesDetail(title.arrId);
+      const profile = await sonarr.getQualityProfile(series.qualityProfileId);
+      return (
+        await this.sizeChecker(sonarr, profile, series.runtime, 'Sonarr')
+      )(plan);
+    }
+    return [];
+  }
+
+  public lidarrFor(serverId: number): BackfillLidarr {
+    const server = getSettings().lidarr.find((s) => s.id === serverId);
+    if (!server) throw new Error('That Lidarr server is no longer set up.');
+    return BackfillLidarr.forServer(server);
+  }
+
+  /**
+   * Finds an album in Lidarr by MusicBrainz id, trying the given server
+   * first. Undefined when no Lidarr has it.
+   */
+  public async findAlbum(
+    mbId: string,
+    serverId?: number
+  ): Promise<{ serverId: number; arrId: number; title: string } | undefined> {
+    const servers = this.distinct(getSettings().lidarr).sort(
+      (a, b) => Number(b.id === serverId) - Number(a.id === serverId)
+    );
+    for (const server of servers) {
+      const album = await BackfillLidarr.forServer(server)
+        .getAlbumByMbid(mbId)
+        .catch(() => undefined);
+      if (album) {
+        return { serverId: server.id, arrId: album.id, title: album.title };
+      }
+    }
+    return undefined;
+  }
+
   public arrFor(row: BackfillSeries): Arr {
-    return row.kind === 'movie'
-      ? this.radarrFor(row.serverId)
-      : this.sonarrFor(row.serverId);
+    return row.kind === 'album'
+      ? this.lidarrFor(row.serverId)
+      : row.kind === 'movie'
+        ? this.radarrFor(row.serverId)
+        : this.sonarrFor(row.serverId);
   }
 
   /** One per instance: two entries for one host (a 4K one) are one app. */
-  private distinct<T extends SonarrSettings | RadarrSettings>(
+  private distinct<T extends SonarrSettings | RadarrSettings | LidarrSettings>(
     servers: T[]
   ): T[] {
     const seen = new Set<string>();
@@ -1149,14 +913,23 @@ class Backfill {
   /* ------------------------------- scan ------------------------------- */
 
   /**
-   * Reads what Sonarr and Radarr are missing, follows what is stuck, and
-   * searches the titles due. `everything` follows whatever is missing now,
-   * however lately Sonarr or Radarr searched; `searches` false only reads.
+   * Reads what the arrs are missing, tracks what is stuck, and searches the
+   * titles due. `everything` tracks all that is missing regardless of recent
+   * arr searches; `searches: false` only reads.
    */
   public async scan({
     everything = false,
     searches = true,
-  }: { everything?: boolean; searches?: boolean } = {}): Promise<void> {
+    quick = false,
+  }: {
+    everything?: boolean;
+    searches?: boolean;
+    /**
+     * Search Right After: search only recently requested titles the arr
+     * searched for and didn't find.
+     */
+    quick?: boolean;
+  } = {}): Promise<void> {
     if (this.scanning || !this.readiness().ready) {
       return;
     }
@@ -1170,6 +943,12 @@ class Backfill {
       const stuckBefore = everything
         ? Date.now()
         : Date.now() - settings.stuckAfterHours * 3_600_000;
+      // For fresh requests under Search Right After, a recent arr search is
+      // enough to count as stuck.
+      const askedBefore = Date.now() - ARR_SETTLE_MS;
+      const freshlyAsked = quick
+        ? await freshRequests(Date.now() - FRESH_REQUEST_MS)
+        : { movie: new Set<number>(), tv: new Set<number>() };
       for (const server of this.distinct(getSettings().sonarr)) {
         if (run.cancelled) return;
         const sonarr = BackfillSonarr.forServer(server);
@@ -1207,13 +986,17 @@ class Backfill {
             const searched = record.lastSearchTime
               ? new Date(record.lastSearchTime).getTime()
               : 0;
-            // Searched a while ago and still missing; or never searched at
-            // all (added without a search), aired and in Sonarr a while.
+            // Searched a while ago and still missing, or never searched
+            // (added without search) but aired and in Sonarr a while.
+            const after =
+              record.series.tmdbId && freshlyAsked.tv.has(record.series.tmdbId)
+                ? Math.max(stuckBefore, askedBefore)
+                : stuckBefore;
             if (
               searched
-                ? searched < stuckBefore
-                : before(record.airDateUtc, stuckBefore) &&
-                  before(record.series.added, stuckBefore)
+                ? searched < after
+                : before(record.airDateUtc, after) &&
+                  before(record.series.added, after)
             ) {
               entry.stuck++;
             }
@@ -1240,7 +1023,7 @@ class Backfill {
           const row = byId.get(seriesId);
           const gap = entry.stuck > 0 || entry.belowCutoff > 0;
           if (!row && !gap) continue;
-          // Something already on its way in means Sonarr is still working.
+          // Anything queued means Sonarr is still working on it.
           if (!row && (await sonarr.getSeriesQueueCount(seriesId)) > 0) {
             continue;
           }
@@ -1272,8 +1055,8 @@ class Backfill {
             await this.refresh(row.id, read);
           }
         }
-        // Anything no longer missing is done. A list cut short leaves out
-        // what is still missing, so then nothing is taken for done.
+        // Anything no longer missing is done, unless the list was cut short
+        // and may have left it out.
         if (missingList.complete && cutoffList.complete) {
           await this.markDone(known.filter((row) => !bySeries.has(row.arrId)));
         } else {
@@ -1286,8 +1069,15 @@ class Backfill {
       if (settings.includeMovies) {
         for (const server of this.distinct(getSettings().radarr)) {
           if (run.cancelled) return;
-          // One Radarr down must not stop the series being searched.
-          await this.scanMovies(server, stuckBefore, run).catch((e) =>
+          // One Radarr down must not block the series searches.
+          await this.scanMovies(
+            server,
+            (tmdbId) =>
+              tmdbId && freshlyAsked.movie.has(tmdbId)
+                ? Math.max(stuckBefore, askedBefore)
+                : stuckBefore,
+            run
+          ).catch((e) =>
             logger.error('Backfill could not read Radarr', {
               label: LABEL,
               server: server.name,
@@ -1296,25 +1086,61 @@ class Backfill {
           );
         }
       }
+      if (settings.includeMusic && musicReady()) {
+        for (const server of this.distinct(getSettings().lidarr)) {
+          if (run.cancelled) return;
+          await this.scanAlbums(
+            server,
+            quick ? Math.max(stuckBefore, askedBefore) : stuckBefore,
+            run
+          ).catch((e) =>
+            logger.error('Backfill could not read Lidarr', {
+              label: LABEL,
+              server: server.name,
+              errorMessage: message(e),
+            })
+          );
+        }
+      }
       await this.dropStaleOffers();
-      // A search of everything stuck does the searching while it runs.
+      // A running Search All does the searching itself.
       if (!searches || this.searchAllRun) return;
 
-      const kinds: BackfillKind[] = settings.includeMovies
-        ? ['series', 'movie']
-        : ['series'];
+      const kinds = followedKinds();
       const due = await repo.find({
         where: [
           { status: 'stuck', kind: In(kinds) },
           { status: 'none', kind: In(kinds) },
         ],
       });
-      const toSearch = pickSearches(due, await requestedSince(due), settings);
+      const requested = await requestedSince(due);
+      const toSearch = quick
+        ? // Only recent requests Backfill hasn't searched yet.
+          pickSearches(
+            due.filter(
+              (row) =>
+                !row.lastSearchedAt &&
+                (requested.get(row.id)?.getTime() ?? 0) >=
+                  Date.now() - FRESH_REQUEST_MS
+            ),
+            requested,
+            settings
+          )
+        : pickSearches(due, requested, settings);
+      if (quick && toSearch.length) {
+        logger.info(
+          'Searching titles Sonarr, Radarr or Lidarr found nothing for',
+          {
+            label: LABEL,
+            titles: toSearch.map((row) => row.title),
+          }
+        );
+      }
       let prowlarrFailed = 0;
       for (const row of toSearch) {
         if (run.cancelled) return;
-        // One title failing is recorded on it; the rest are still searched,
-        // unless it is Prowlarr not answering, which fails every one alike.
+        // A title's failure is recorded on it and the rest go on, unless
+        // Prowlarr is down, which fails every search alike.
         const failed = await this.search(row.id, undefined, {
           cancelled: () => run.cancelled,
         }).then(
@@ -1351,11 +1177,10 @@ class Backfill {
   }
 
   /**
-   * Titles left "searching" by a search that never finished, because Seerr
-   * stopped while it ran: no scan picks a title in that state, so each goes
-   * back to stuck, to be searched again.
+   * Resets titles left "searching" by a restart mid-search to stuck. Runs at
+   * startup and before each scan.
    */
-  private async unstickSearches(): Promise<void> {
+  public async unstickSearches(): Promise<void> {
     const repo = getRepository(BackfillSeries);
     const left = await repo.find({
       where: { status: 'searching' },
@@ -1371,10 +1196,9 @@ class Backfill {
   }
 
   /**
-   * What a scan read for a title it already follows. Only these columns are
-   * the scan's: its status, search terms and the rest are changed meanwhile
-   * by searches, approvals and admins, and are left as they are. One done
-   * but missing something again is stuck again.
+   * Saves what a scan read for a tracked title. Only these columns belong
+   * to the scan; status, search terms and the rest are owned by searches,
+   * approvals and admins. A done title missing something again is stuck.
    */
   private async refresh(
     id: number,
@@ -1385,12 +1209,12 @@ class Backfill {
     await repo.update({ id, status: 'done' }, { status: 'stuck' });
   }
 
-  /** Titles no longer missing anything, unless something else holds them. */
+  /** Marks titles no longer missing anything done, unless otherwise held. */
   private async markDone(rows: BackfillSeries[]): Promise<void> {
     for (const row of rows) {
       if (!['stuck', 'none', 'found'].includes(row.status)) continue;
-      // Only from where the scan saw it: a title approved or ignored since
-      // it was read is left as it is now.
+      // Conditional on status, so a title approved or ignored since it was
+      // read is left alone.
       await getRepository(BackfillSeries).update(
         { id: row.id, status: In(['stuck', 'none', 'found']) },
         { status: 'done', missing: 0, belowCutoff: 0 }
@@ -1399,8 +1223,8 @@ class Backfill {
   }
 
   /**
-   * Packs found for titles no longer missing anything: judged against the
-   * files as they were, and offering nothing now.
+   * Deletes ready packs for titles no longer missing anything: they were
+   * judged against old files and offer nothing now.
    */
   private async dropStaleOffers(): Promise<void> {
     const done = await getRepository(BackfillSeries).find({
@@ -1415,12 +1239,12 @@ class Backfill {
   }
 
   /**
-   * Movies Radarr has searched for and not found since `stuckBefore`, or
-   * whose file is below the cutoff, with nothing in Radarr's queue.
+   * Tracks movies Radarr searched for and didn't find before `stuckBefore`,
+   * or whose file is below cutoff, with nothing in Radarr's queue.
    */
   private async scanMovies(
     server: RadarrSettings,
-    stuckBefore: number,
+    stuckBeforeFor: (tmdbId?: number | null) => number,
     run: { cancelled: boolean }
   ) {
     const settings = getSettings().backfill;
@@ -1430,7 +1254,10 @@ class Backfill {
     const cutoffList = settings.includeCutoffUnmet
       ? await radarr.getWanted('cutoff')
       : { records: [], complete: true };
-    const missing = missingList.records.filter((movie) => movie.isAvailable);
+    // Radarr's to fetch for its first hours out, as a new episode is Sonarr's.
+    const missing = missingList.records.filter(
+      (movie) => movie.isAvailable && filmOutAWhile(movie)
+    );
     const wanted = new Map<
       number,
       { movie: RadarrMovieDetail; missing: boolean }
@@ -1450,8 +1277,9 @@ class Backfill {
       const searched = entry.movie.lastSearchTime
         ? new Date(entry.movie.lastSearchTime).getTime()
         : 0;
-      // Searched a while ago and still missing, or never searched at all
-      // and in Radarr a while.
+      const stuckBefore = stuckBeforeFor(entry.movie.tmdbId);
+      // Searched a while ago and still missing, or never searched but in
+      // Radarr a while.
       const stuck =
         entry.missing &&
         (searched > 0
@@ -1489,6 +1317,164 @@ class Backfill {
     }
   }
 
+  /**
+   * Tracks requested albums Lidarr is missing (or has below cutoff) and has
+   * had its chance at, with nothing queued. Lidarr lists every album of an
+   * added artist as wanted, so only requested or admin-chosen albums are
+   * tracked. Lidarr doesn't report its last search, so an album is stuck
+   * once it was released, its artist added, and its request approved, all
+   * before `stuckBefore`.
+   */
+  private async scanAlbums(
+    server: LidarrSettings,
+    stuckBefore: number,
+    run: { cancelled: boolean }
+  ) {
+    const settings = getSettings().backfill;
+    const repo = getRepository(BackfillSeries);
+    const lidarr = BackfillLidarr.forServer(server);
+    const missingList = await lidarr.getWanted('missing');
+    const cutoffList = settings.includeCutoffUnmet
+      ? await lidarr.getWanted('cutoff')
+      : { records: [], complete: true };
+    const wanted = new Map<number, { album: LidarrAlbum; missing: boolean }>();
+    for (const album of cutoffList.records) {
+      wanted.set(album.id, { album, missing: false });
+    }
+    for (const album of missingList.records) {
+      wanted.set(album.id, { album, missing: true });
+    }
+
+    const asked = await albumsAskedSince(
+      [...wanted.values()].map((w) => w.album.foreignAlbumId)
+    );
+    const known = await repo.find({
+      where: { kind: 'album', serverId: server.id },
+    });
+    const byId = new Map(known.map((row) => [row.arrId, row]));
+    for (const [albumId, entry] of wanted) {
+      if (run.cancelled) return;
+      const { album } = entry;
+      const row = byId.get(albumId);
+      const askedAt = asked.get(album.foreignAlbumId);
+      if (!askedAt && !row?.byHand) continue;
+      const stuck =
+        entry.missing &&
+        before(album.releaseDate, stuckBefore) &&
+        before(album.artist?.added, stuckBefore) &&
+        !!askedAt &&
+        askedAt.getTime() < stuckBefore;
+      if (!row && !stuck && entry.missing) continue;
+      if (!row && (await lidarr.getAlbumQueueCount(albumId)) > 0) continue;
+      const read = {
+        title: album.title,
+        year: album.releaseDate
+          ? new Date(album.releaseDate).getUTCFullYear()
+          : null,
+        poster: posterOf(album.images) ?? row?.poster ?? null,
+        missing: entry.missing ? Math.max(1, tracksMissing(album)) : 0,
+        belowCutoff: entry.missing ? 0 : 1,
+        artistName: album.artist?.artistName ?? row?.artistName ?? null,
+        artistArrId: album.artistId,
+        foreignId: album.foreignAlbumId,
+      };
+      if (!row) {
+        await repo.save(
+          new BackfillSeries({ ...this.albumRow(server.id, album), ...read })
+        );
+      } else {
+        await this.refresh(row.id, read);
+      }
+    }
+    // Drop albums no longer requested and not admin-chosen, with their
+    // waiting packs, unless Backfill downloaded for them (history stays).
+    await this.letGo(
+      known.filter(
+        (row) =>
+          !row.byHand &&
+          !(row.foreignId && asked.has(row.foreignId)) &&
+          wanted.has(row.arrId)
+      )
+    );
+    if (missingList.complete && cutoffList.complete) {
+      await this.markDone(known.filter((row) => !wanted.has(row.arrId)));
+    } else {
+      logger.warn(
+        `Lidarr's wanted list is too long to read whole; albums not in the part read are left as they are`,
+        { label: LABEL, server: server.name }
+      );
+    }
+  }
+
+  /**
+   * Stops tracking titles a scan shouldn't have: each is deleted with its
+   * packs, unless Backfill downloaded anything for it.
+   */
+  private async letGo(rows: BackfillSeries[]): Promise<void> {
+    // One being searched is left to the next scan.
+    const idle = rows.filter((row) => !this.isSearching(row.id));
+    if (!idle.length) return;
+    const jobs = await getRepository(BackfillJob).find({
+      select: { seriesId: true, status: true },
+      where: { seriesId: In(idle.map((r) => r.id)) },
+    });
+    const repo = getRepository(BackfillSeries);
+    // With past downloads: kept as done for its history, so it isn't
+    // searched; a new request tracks it again. One with a running download
+    // is left alone.
+    const kept = idle.filter(
+      (row) =>
+        jobs.some((job) => job.seriesId === row.id) &&
+        !jobs.some(
+          (job) =>
+            job.seriesId === row.id &&
+            [...ACTIVE, 'paused'].includes(job.status)
+        )
+    );
+    if (kept.length) {
+      await repo.update(
+        {
+          id: In(kept.map((row) => row.id)),
+          byHand: false,
+          status: In(['stuck', 'none', 'found']),
+        },
+        { status: 'done', missing: 0, belowCutoff: 0 }
+      );
+    }
+    const gone = idle.filter(
+      (row) => !jobs.some((job) => job.seriesId === row.id)
+    );
+    if (!gone.length) return;
+    // `byHand: false` keeps any an admin chose since the scan read it.
+    await repo.delete({ id: In(gone.map((row) => row.id)), byHand: false });
+    logger.info(
+      `Backfill no longer follows ${gone.length} album${gone.length === 1 ? '' : 's'} nobody requested`,
+      { label: LABEL }
+    );
+  }
+
+  private albumRow(serverId: number, album: LidarrAlbum) {
+    return new BackfillSeries({
+      kind: 'album',
+      serverId,
+      arrId: album.id,
+      title: album.title,
+      year: album.releaseDate
+        ? new Date(album.releaseDate).getUTCFullYear()
+        : null,
+      tvdbId: null,
+      tmdbId: null,
+      foreignId: album.foreignAlbumId,
+      artistName: album.artist?.artistName ?? null,
+      artistArrId: album.artistId,
+      seriesType: 'standard',
+      poster: posterOf(album.images),
+      status: 'stuck',
+      missing: Math.max(1, tracksMissing(album)),
+      searchTerms: [],
+    });
+  }
+
   private movieRow(serverId: number, movie: RadarrMovieDetail) {
     return new BackfillSeries({
       kind: 'movie',
@@ -1506,15 +1492,35 @@ class Backfill {
     });
   }
 
-  /** Follows a series or movie by its app's id, as from a title page. */
+  /** Tracks a title by its arr id, as from a title page. */
   public async track(
     kind: BackfillKind,
     serverId: number,
-    arrId: number
+    arrId: number,
+    /** Admin-chosen: kept whether or not anyone requested it. */
+    byHand = false
   ): Promise<BackfillSeries> {
     const repo = getRepository(BackfillSeries);
     const existing = await repo.findOne({ where: { kind, serverId, arrId } });
-    if (existing) return existing;
+    if (existing) {
+      if (byHand && !existing.byHand) {
+        await repo.update(existing.id, { byHand: true });
+        existing.byHand = true;
+      }
+      return existing;
+    }
+    if (kind === 'album') {
+      const lidarr = this.lidarrFor(serverId);
+      const album = await lidarr.getAlbumDetail(arrId);
+      const artist =
+        album.artist ?? (await lidarr.getArtistDetail(album.artistId));
+      return repo.save(
+        new BackfillSeries({
+          ...this.albumRow(serverId, { ...album, artist }),
+          byHand,
+        })
+      );
+    }
     if (kind === 'movie') {
       const movie = await this.radarrFor(serverId).getMovieDetail(arrId);
       return repo.save(this.movieRow(serverId, movie));
@@ -1553,23 +1559,17 @@ class Backfill {
       sonarr.getEpisodeFiles(series.id),
       sonarr.getQualityProfile(series.qualityProfileId),
     ]);
-    const names = [
-      ...new Set(
-        [
-          titleWithoutYear(series.title),
-          series.title,
-          // Sonarr v5 can show a series under a translated title; releases
-          // usually carry the original one, when it is in Latin letters.
-          ...(series.originalTitle && /[a-z]/i.test(series.originalTitle)
-            ? [series.originalTitle]
-            : []),
-          ...(series.alternateTitles ?? []).map((alt) => alt.title),
-          ...(row.searchTerms ?? []),
-        ]
-          .map((n) => n.trim())
-          .filter(Boolean)
-      ),
-    ];
+    const names = uniqueNames([
+      titleWithoutYear(series.title),
+      series.title,
+      // Sonarr v5 may show a translated title; releases usually use the
+      // original one, if it's in Latin letters.
+      ...(series.originalTitle && /[a-z]/i.test(series.originalTitle)
+        ? [series.originalTitle]
+        : []),
+      ...(series.alternateTitles ?? []).map((alt) => alt.title),
+      ...(row.searchTerms ?? []),
+    ]);
     return { series, episodes, files, profile, names, sonarr };
   }
 
@@ -1580,30 +1580,87 @@ class Backfill {
       movie.hasFile ? radarr.getMovieFile(movie.id) : null,
       radarr.getQualityProfile(movie.qualityProfileId),
     ]);
-    const names = [
-      ...new Set(
-        [
-          movie.title,
-          movie.originalTitle ?? '',
-          ...(movie.alternateTitles ?? []).map((alt) => alt.title),
-          ...(row.searchTerms ?? []),
-        ]
-          .map((n) => n.trim())
-          .filter(Boolean)
-      ),
-    ];
+    const names = uniqueNames([
+      movie.title,
+      movie.originalTitle ?? '',
+      ...(movie.alternateTitles ?? []).map((alt) => alt.title),
+      ...(row.searchTerms ?? []),
+    ]);
     return { movie, file, profile, names, radarr };
   }
 
-  /** What a search needs to know about a series or a movie. */
+  public async albumContext(row: BackfillSeries): Promise<AlbumContext> {
+    const lidarr = this.lidarrFor(row.serverId);
+    const album = await lidarr.getAlbumDetail(row.arrId);
+    const artist = await lidarr.getArtistDetail(album.artistId);
+    const [tracks, files, profile] = await Promise.all([
+      lidarr.getAlbumTracks(album.id),
+      lidarr.getAlbumTrackFiles(album.id),
+      lidarr.getQualityProfile(artist.qualityProfileId),
+    ]);
+    const editions = new Map<number, Promise<AlbumTrack[]>>();
+    const names = uniqueNames([
+      `${artist.artistName} ${album.title}`,
+      album.title,
+      ...(row.searchTerms ?? []),
+    ]);
+    return {
+      album,
+      artist,
+      tracks,
+      files,
+      profile,
+      names,
+      lidarr,
+      editionTracks: (releaseId) => {
+        if (!editions.has(releaseId)) {
+          editions.set(releaseId, lidarr.getEditionTracks(releaseId));
+        }
+        return editions.get(releaseId)!;
+      },
+    };
+  }
+
+  /** What a search needs to know about a series, movie or album. */
   private async target(row: BackfillSeries): Promise<Target> {
+    if (row.kind === 'album') {
+      const ctx = await this.albumContext(row);
+      const named = (title: string) =>
+        namesAlbum(title, ctx.album.title, ctx.artist.artistName);
+      return {
+        title: `${ctx.artist.artistName}: ${ctx.album.title}`,
+        poster: posterOf(ctx.album.images),
+        names: ctx.names,
+        missing: ctx.tracks.filter((t) => !t.hasFile).length,
+        categories: AUDIO_CATEGORIES,
+        extraTerms: [],
+        wants: (title) => Number(named(title)),
+        // Skip another Lidarr album, or a name that isn't this album by
+        // this artist (someone else's "Greatest Hits").
+        readTitle: async (title) => {
+          const parsed = await ctx.lidarr.parse(title).catch(() => null);
+          const albums = parsed?.albums ?? [];
+          const sees = albums.some((a) => a.id === ctx.album.id);
+          return {
+            other: !named(title) || (!!albums.length && !sees),
+            sees,
+          };
+        },
+        judge: (files, packTitle) => judgeAlbumPack(files, packTitle, ctx),
+      };
+    }
     if (row.kind === 'movie') {
       const ctx = await this.movieContext(row);
       return {
         title: ctx.movie.title,
         poster: posterOf(ctx.movie.images),
         names: ctx.names,
-        missing: !ctx.movie.hasFile && ctx.movie.isAvailable ? 1 : 0,
+        missing:
+          !ctx.movie.hasFile &&
+          ctx.movie.isAvailable &&
+          filmOutAWhile(ctx.movie)
+            ? 1
+            : 0,
         categories: MOVIE_CATEGORIES,
         extraTerms: [],
         wants: () => 0,
@@ -1615,6 +1672,12 @@ class Backfill {
           };
         },
         judge: (files, packTitle) => judgeMoviePack(files, packTitle, ctx),
+        sizeCheck: await this.sizeChecker(
+          ctx.radarr,
+          ctx.profile,
+          ctx.movie.runtime,
+          'Radarr'
+        ),
       };
     }
     const ctx = await this.context(row);
@@ -1627,7 +1690,7 @@ class Backfill {
         bySeason.set(ep.seasonNumber, (bySeason.get(ep.seasonNumber) ?? 0) + 1);
       }
     }
-    // Anime packs go by absolute numbers, so a season search finds little.
+    // Anime packs use absolute numbers, so season searches find little.
     const seasons =
       ctx.series.seriesType === 'anime'
         ? []
@@ -1635,13 +1698,32 @@ class Backfill {
             .sort((a, b) => b[1] - a[1])
             .slice(0, MAX_SEASON_TERMS)
             .map(([season]) => season);
-    const wanted = missing.map(
-      (ep) =>
-        new RegExp(
-          `\\bS${pad(ep.seasonNumber)}E${pad(ep.episodeNumber)}\\b`,
-          'i'
-        )
+    const wanted = missing.flatMap((ep) =>
+      [
+        [ep.seasonNumber, ep.episodeNumber],
+        // Also by scene numbers, as Sonarr searches.
+        ...(sceneDiffers(ep)
+          ? [[ep.sceneSeasonNumber!, ep.sceneEpisodeNumber!]]
+          : []),
+      ].map(
+        ([season, episode]) =>
+          new RegExp(`\\bS${pad(season)}E${pad(episode)}\\b`, 'i')
+      )
     );
+    const missingIds = new Set(missing.map((ep) => ep.id));
+    /** Whether a title names a missing episode by its title, numbered or not. */
+    const namesMissing = (title: string) => {
+      const ep =
+        episodeTitled(title, ctx.episodes) ??
+        episodeNamedIn(title, ctx.episodes, ctx.names);
+      return !!ep && missingIds.has(ep.id);
+    };
+    const byTitle = [
+      ...missing.filter((ep) => ep.seasonNumber === 0),
+      ...missing.filter((ep) => ep.seasonNumber > 0 && sceneDiffers(ep)),
+    ]
+      .filter(ownTitle)
+      .slice(0, MAX_TITLE_TERMS);
     const wantedSeasons = [...bySeason.keys()].map(
       (season) => new RegExp(`\\bS${pad(season)}\\b(?!E)`, 'i')
     );
@@ -1651,14 +1733,20 @@ class Backfill {
       names: ctx.names,
       missing: missing.length,
       categories: TV_CATEGORIES,
-      extraTerms: seasons.map(
-        (season) => `${titleWithoutYear(ctx.series.title)} S${pad(season)}`
-      ),
+      extraTerms: [
+        ...seasons.map(
+          (season) => `${titleWithoutYear(ctx.series.title)} S${pad(season)}`
+        ),
+        ...byTitle.map(
+          (ep) => `${titleWithoutYear(ctx.series.title)} ${ep.title}`
+        ),
+      ],
       wants: (title) =>
         wanted.filter((rx) => rx.test(title)).length +
-        wantedSeasons.filter((rx) => rx.test(title)).length,
-      // A title Sonarr matches to another show it has (Shippuden, for
-      // Naruto) is that show's.
+        wantedSeasons.filter((rx) => rx.test(title)).length +
+        Number(namesMissing(title)),
+      // A title Sonarr matches to another of its shows (Tsumuden, for
+      // Kitsuraga) belongs to that show.
       readTitle: async (title) => {
         const parsed = await ctx.sonarr.parse(title).catch(() => null);
         return {
@@ -1668,10 +1756,31 @@ class Backfill {
       },
       judge: (files, packTitle, secondOpinion) =>
         judgePack(files, packTitle, { ...ctx, secondOpinion }),
+      sizeCheck: await this.sizeChecker(
+        ctx.sonarr,
+        ctx.profile,
+        ctx.series.runtime,
+        'Sonarr'
+      ),
     };
   }
 
-  /** Starts a search and returns at once; the page follows its status. */
+  /**
+   * A checker for plan files against the app's size limits for the
+   * profile. Unreadable limits don't block the search.
+   */
+  private async sizeChecker(
+    arr: BackfillSonarr | BackfillRadarr,
+    profile: SonarrQualityProfile,
+    runtime: number | undefined,
+    app: 'Sonarr' | 'Radarr'
+  ): Promise<(plan: PlanEntry[]) => SizeProblem[]> {
+    const definitions = await arr.getQualityDefinitions().catch(() => []);
+    const limits = limitsOf(profile, definitions);
+    return (plan) => sizeProblems(plan, limits, runtime, app);
+  }
+
+  /** Starts a search without waiting; the page polls its status. */
   public startSearch(id: number, user?: User, options?: SearchOptions): void {
     if (this.searching.has(id)) return;
     this.search(id, user, options).catch((e) =>
@@ -1684,8 +1793,8 @@ class Backfill {
   }
 
   /**
-   * Searches for packs for one series. The AI second opinion is asked as
-   * `user`, or the owner for a scheduled search.
+   * Searches for packs for one title. The AI second opinion runs as `user`,
+   * or as the owner for scheduled searches.
    */
   public async search(
     id: number,
@@ -1709,8 +1818,8 @@ class Backfill {
           : null;
       const { missing } = target;
 
-      // Search under each name, in the app's order, skipping a name another
-      // already covers ("Perfect World" covers "Perfect World (2021)").
+      // Search each name in the app's order, skipping names another already
+      // covers ("Ninefold Sky" covers "Ninefold Sky (2021)").
       const terms: string[] = [];
       for (const name of target.names) {
         const n = name.toLowerCase();
@@ -1725,9 +1834,11 @@ class Backfill {
       ];
       for (const term of queries) {
         try {
-          for (const release of await prowlarr.search(term, {
-            categories: target.categories,
-          })) {
+          for (const release of await indexerLimits.guard(
+            PROWLARR,
+            'search',
+            () => prowlarr.search(term, { categories: target.categories })
+          )) {
             const key =
               release.infoHash?.toLowerCase() ||
               `${release.title.toLowerCase()}|${Math.round(release.size / 1e6)}`;
@@ -1737,7 +1848,17 @@ class Backfill {
             }
           }
         } catch (e) {
-          errors.push(`${term}: ${message(e)}`);
+          errors.push(`${term}: ${plainProblem(e)}`);
+          if (!(e instanceof IndexerLimitReached) || e.asked) {
+            logger.warn('Prowlarr could not search', {
+              label: LABEL,
+              seriesId: id,
+              term,
+              errorMessage: message(e),
+            });
+          }
+          // Further names would only spend searches against the limit.
+          if (e instanceof IndexerLimitReached) break;
         }
       }
       if (!found.size && errors.length) {
@@ -1755,7 +1876,6 @@ class Backfill {
         (release) =>
           !!this.clientFor(release.protocol) &&
           mentionsShow(release.title, target.names) &&
-          // A release group an admin blocked is never taken.
           !blockedGroupOf(release.title, null, blocked) &&
           !passedOver.has(release.guid) &&
           !passedOver.has(release.infoHash?.toLowerCase() ?? '')
@@ -1767,22 +1887,22 @@ class Backfill {
           ...(await target.readTitle(release.title)),
         }))
       );
-      // What names a missing episode is opened first, then the likeliest
-      // packs.
+      // Open releases naming a missing item first, then the likeliest packs.
+      const wanting = new Map(
+        titled.map((t) => [t.release, target.wants(t.release.title) > 0])
+      );
       const toOpen = titled
         .filter((t) => !t.other)
         .sort(
           (a, b) =>
-            Number(target.wants(b.release.title) > 0) -
-              Number(target.wants(a.release.title) > 0) ||
+            Number(wanting.get(b.release)) - Number(wanting.get(a.release)) ||
             packScore(b.release) - packScore(a.release) ||
             (b.release.seeders ?? 0) - (a.release.seeders ?? 0)
         )
         .slice(0, MAX_INSPECT);
 
-      // Packs are opened a few at a time: a magnet's file list can take
-      // a minute to come from the swarm. The second opinion is asked about
-      // the first few only, so one search cannot run up a bill.
+      // Open a few at a time: a magnet's file list can take a minute. Only
+      // the first few packs get the second opinion, capping AI cost.
       const opened = await mapLimit(
         toOpen.map((entry, i) => ({ ...entry, i })),
         OPEN_AT_ONCE,
@@ -1807,8 +1927,8 @@ class Backfill {
           });
           try {
             const files = await this.packFiles(release, candidate);
-            // The same torrent from another indexer, under another name:
-            // what was turned down or died once is not offered again.
+            // The same torrent under another name or indexer: don't offer
+            // what was skipped or died before.
             if (candidate.infoHash && passedOver.has(candidate.infoHash)) {
               return null;
             }
@@ -1822,7 +1942,14 @@ class Backfill {
               secondOpinion
             );
             candidate.plan = plan;
-            candidate.summary = { ...summary, sonarrSeesTitle: sees };
+            const outside = target.sizeCheck?.(plan) ?? [];
+            candidate.summary = {
+              ...summary,
+              sonarrSeesTitle: sees,
+              ...(outside.length
+                ? { outsideSize: outside.length, sizeNote: sizeNote(outside) }
+                : {}),
+            };
             const useful =
               summary.fill > 0 ||
               (summary.upgrade > 0 &&
@@ -1831,21 +1958,23 @@ class Backfill {
             candidate.reason = useful
               ? null
               : (mainReason(plan) ??
-                (row.kind === 'movie'
-                  ? 'The movie is not in it'
-                  : plan.length
-                    ? 'Nothing in it the series needs'
-                    : 'No episodes in it'));
+                (row.kind === 'album'
+                  ? 'No track the album needs is in it'
+                  : row.kind === 'movie'
+                    ? 'The movie is not in it'
+                    : plan.length
+                      ? 'Nothing in it the series needs'
+                      : 'No episodes in it'));
           } catch (e) {
             candidate.status = 'failed';
-            candidate.reason = message(e).slice(0, 250);
+            candidate.reason = plainProblem(e, release.indexer).slice(0, 250);
           }
           return candidate;
         }
       );
       const results = opened.filter((c): c is BackfillCandidate => c !== null);
-      // Cancelled part way: what was opened is not the whole picture, so
-      // what the last search found stays, and the title is as it was.
+      // Cancelled midway: results are partial, so keep the last search's
+      // findings and restore the title's status.
       if (options.cancelled?.()) {
         await repo.update(
           { id, status: 'searching' },
@@ -1854,12 +1983,28 @@ class Backfill {
         return;
       }
 
-      // A new search replaces what the last one found, except what an
-      // admin already acted on.
+      // Replace the last search's findings, except those an admin acted on.
       await candidates.delete({
         seriesId: id,
         status: In(['ready', 'rejected', 'failed']),
       });
+      // A pack whose download recently failed to start still waits for an
+      // admin, with the reason.
+      const startFailed = await this.startFailures(id);
+      for (const c of results) {
+        const held = c.status === 'ready' ? startFailed(c) : undefined;
+        if (held) c.reason = held;
+      }
+      // Size limits hold: a pack outside them is rejected if another within
+      // them was found, else offered to an admin, never taken automatically.
+      const withinLimits = results.some(
+        (c) => c.status === 'ready' && !c.summary?.outsideSize
+      );
+      for (const c of results) {
+        if (c.status !== 'ready' || !c.summary?.outsideSize) continue;
+        if (withinLimits) c.status = 'rejected';
+        c.reason ??= c.summary.sizeNote ?? null;
+      }
       await candidates.save(results);
 
       const ready = rankCandidates(
@@ -1888,17 +2033,22 @@ class Backfill {
         options.replacing && settings.replaceFailed
           ? new Set(options.replacing)
           : null;
-      // In place of a failed download, the best good pack for what it was
-      // fetching, even beside other downloads for the title.
+      // Replacing a failed download: the best good pack for its items, even
+      // beside other downloads for the title. Never one that recently failed
+      // to start.
       const pick = replacing
         ? ready.find(
-            (c) => this.takesItself(c, replacing) && !multiMustWait(c, ready)
+            (c) =>
+              this.takesItself(c, replacing) &&
+              !multiMustWait(c, ready) &&
+              !startFailed(c)
           )
         : best &&
             !busy &&
             settings.autoApprove.enabled &&
             options.autoApprove !== false &&
-            this.takesItself(best)
+            this.takesItself(best) &&
+            !startFailed(best)
           ? best
           : undefined;
       let taken = false;
@@ -1921,6 +2071,14 @@ class Backfill {
         }
       }
       if (options.failedJob) {
+        // Approving a pack already linked it; otherwise record on the
+        // failed download what was offered instead, or that nothing was.
+        if (!taken) {
+          await this.settleFailed(
+            options.failedJob.id,
+            best && !busy ? 'offered' : 'none'
+          );
+        }
         backfillNotices.add({
           kind: taken ? 'replaced' : 'failed',
           seriesId: id,
@@ -1939,6 +2097,11 @@ class Backfill {
         );
       }
     } catch (e) {
+      if (options.failedJob) {
+        await this.settleFailed(options.failedJob.id, 'none').catch(
+          () => undefined
+        );
+      }
       await repo.update(id, {
         status: previous === 'searching' ? 'stuck' : previous,
         searchError: message(e).slice(0, 250),
@@ -1951,8 +2114,8 @@ class Backfill {
   }
 
   /**
-   * The files in a release found anywhere (Prowlarr, or Sonarr's or Radarr's
-   * own search), as a search reads them, with the torrent's hash once known.
+   * A release's files (from Prowlarr or an arr's search), as a search reads
+   * them, with the torrent hash once known.
    */
   public async filesOf(release: ProwlarrRelease): Promise<{
     files: PackFile[];
@@ -1974,8 +2137,7 @@ class Backfill {
       const files = await this.packFiles(release, candidate);
       return { files, infoHash: candidate.infoHash };
     } catch (e) {
-      // A Usenet post in RAR parts, or with scrambled names: its files
-      // are only known once the client has downloaded and unpacked it.
+      // RAR or scrambled Usenet posts: files are known only after download.
       if (e instanceof PackedRelease) {
         return { files: [], infoHash: null, packed: e.packing };
       }
@@ -1983,7 +2145,7 @@ class Backfill {
     }
   }
 
-  /** The files in a result, from its .torrent, its NZB, or the swarm. */
+  /** A result's files, from its .torrent, its NZB, or the swarm. */
   private async packFiles(
     release: ProwlarrRelease,
     candidate: BackfillCandidate
@@ -2010,25 +2172,41 @@ class Backfill {
     return this.probeMagnet(fetched.uri, hash, release.title);
   }
 
+  /**
+   * Fetches a release's .torrent or .nzb via Prowlarr; skipped while the
+   * indexer waits out its download limit.
+   */
   private fetch(candidate: BackfillCandidate): Promise<FetchedRelease> {
-    return this.prowlarr().fetchRelease({
-      guid: candidate.guid,
-      title: candidate.title,
-      size: candidate.size,
-      indexerId: candidate.indexerId,
-      indexer: candidate.indexer,
-      protocol: candidate.protocol,
-      downloadUrl: candidate.downloadUrl ?? undefined,
-      magnetUrl: candidate.magnetUrl ?? undefined,
-      infoHash: candidate.infoHash ?? undefined,
-    });
+    return indexerLimits.guard(
+      { id: candidate.indexerId, name: candidate.indexer },
+      'download',
+      async () => {
+        try {
+          return await this.prowlarr().fetchRelease(
+            {
+              guid: candidate.guid,
+              title: candidate.title,
+              size: candidate.size,
+              indexerId: candidate.indexerId,
+              indexer: candidate.indexer,
+              protocol: candidate.protocol,
+              downloadUrl: candidate.downloadUrl ?? undefined,
+              magnetUrl: candidate.magnetUrl ?? undefined,
+              infoHash: candidate.infoHash ?? undefined,
+            },
+            { indexerOrigins: arrIndexerOrigins }
+          );
+        } catch (e) {
+          throw isUnusableLink(e) ? new ReleaseProblem(message(e)) : e;
+        }
+      }
+    );
   }
 
   /**
-   * A magnet link carries no file list. The torrent client fetches it from
-   * the swarm (qBittorrent stops there by itself; the others are held to a
-   * crawl, where they allow it, and removed within seconds of having it),
-   * and the torrent is removed again once the list is read.
+   * Gets a magnet's file list via the torrent client, which fetches it from
+   * the swarm (qBittorrent stops there itself; others are throttled where
+   * possible and removed within seconds), then removes the torrent.
    */
   private async probeMagnet(
     uri: string,
@@ -2041,11 +2219,16 @@ class Backfill {
     const category = getSettings().backfill.category;
     const already = await torrents.findTorrent(hash);
     this.probing.add(hash);
-    if (!already) {
-      await torrents.ensureCategory(category);
-      await torrents.addTorrent({ magnet: uri, category, metadataOnly: true });
-    }
     try {
+      if (!already) {
+        await torrents.ensureCategory(category);
+        await torrents.addTorrent({
+          magnet: uri,
+          hash,
+          category,
+          metadataOnly: true,
+        });
+      }
       const files = await this.fileListOf(torrents, hash);
       if (files.length) {
         return files.map((f) => ({
@@ -2063,7 +2246,7 @@ class Backfill {
     }
   }
 
-  /** A magnet's file list, once the swarm sends it; empty after a minute. */
+  /** A magnet's file list once the swarm sends it; empty after a timeout. */
   private async fileListOf(torrents: TorrentClient, hash: string) {
     const until = Date.now() + METADATA_WAIT_MS;
     for (;;) {
@@ -2074,10 +2257,9 @@ class Backfill {
   }
 
   /**
-   * Magnet probes left behind in the torrent client: one under way when Seerr
-   * stopped is never removed by it. Only Backfill's own category, only
-   * torrents that downloaded nothing, belong to no download and are not
-   * being read now, and only once they are old enough to be no one's.
+   * Removes magnet probes orphaned by a restart. Only torrents in Backfill's
+   * category that downloaded nothing, belong to no download, aren't being
+   * read now, and are old enough to be orphaned.
    */
   private async sweepProbes(now = Date.now()): Promise<number> {
     // A clock set back counts as due rather than waiting out the gap.
@@ -2090,12 +2272,17 @@ class Backfill {
     const api = torrentClientFor(client);
     const torrents = await api.listCategory(getSettings().backfill.category);
     const owned = new Set(
-      (
-        await getRepository(BackfillJob).find({
+      [
+        ...(await getRepository(BackfillJob).find({
           select: { downloadId: true },
           where: { protocol: 'torrent', downloadId: Not(IsNull()) },
-        })
-      ).map((j) => j.downloadId!.toLowerCase())
+        })),
+        // Album song fetches share the category (lib/music/songFetch).
+        ...(await getRepository(SongFetch).find({
+          select: { id: true, downloadId: true },
+          where: { downloadId: Not(IsNull()) },
+        })),
+      ].map((j) => j.downloadId!.toLowerCase())
     );
     let removed = 0;
     for (const t of torrents) {
@@ -2104,7 +2291,7 @@ class Backfill {
         owned.has(hash) ||
         this.probing.has(hash) ||
         t.progress > 0 ||
-        // When it was added unknown: never taken for a probe.
+        // Unknown add time: never treated as a probe.
         t.addedAt === undefined ||
         now - t.addedAt < PROBE_LEFT_AFTER_MS
       ) {
@@ -2124,8 +2311,8 @@ class Backfill {
   /* ----------------------------- approve ------------------------------ */
 
   /**
-   * Runs `fn` with the jobs to itself: no tick, and no other change to a
-   * job, runs meanwhile; a tick due then is skipped, and runs next minute.
+   * Runs `fn` with exclusive access to jobs: no tick or other job change
+   * runs meanwhile; a tick due then is skipped until next minute.
    */
   private async exclusive<T>(fn: () => Promise<T>): Promise<T> {
     while (this.ticking) await this.ticked;
@@ -2141,10 +2328,9 @@ class Backfill {
   }
 
   /**
-   * More files from a release a download under way is already fetching:
-   * the same torrent cannot be added twice, so the job takes them on.
-   * Only while it is waiting or downloading; once it imports, the release
-   * can be taken again as a new download.
+   * Adds files to a running download of the same release, since a torrent
+   * can't be added twice. Only while queued or downloading; once importing,
+   * the release can be taken again as a new download.
    */
   public async extendJob(
     jobId: number,
@@ -2152,7 +2338,7 @@ class Backfill {
     by: string
   ): Promise<BackfillJob> {
     try {
-      // A tick saving the job meanwhile would drop the files added here.
+      // A concurrent tick save would drop the files added here.
       return await this.exclusive(async () => {
         const jobs = getRepository(BackfillJob);
         const job = await jobs.findOneOrFail({ where: { id: jobId } });
@@ -2161,14 +2347,14 @@ class Backfill {
             `Backfill #${job.id} is ${job.status} now; once it is done, this release can be taken again.`
           );
         }
-        // By path: once its files are chosen, a job's files carry the
-        // client's numbering, which can differ from the pack's.
+        // By path: once chosen, a job's file indexes are the client's,
+        // which can differ from the pack's.
         const have = new Set(job.files.map((f) => f.path));
         let added = entries.filter((e) => !have.has(e.path));
         if (!added.length) {
           throw new Error(`Backfill #${job.id} already has these files.`);
         }
-        // A torrent whose files are chosen already: fetch these too. One
+        // If the torrent's files are already chosen, select these too; one
         // still choosing picks them up from the job's files.
         const chosen =
           job.status === 'downloading' &&
@@ -2230,8 +2416,10 @@ class Backfill {
       mode: 'missing' | 'all';
       user?: User;
       includeAi?: boolean;
-      /** Who approved it, when not a person: "AI agent". */
+      /** Approver name when not a person: "AI agent". */
       by?: string;
+      /** The admin agent conversation taking it. */
+      agentRunId?: number;
     }
   ): Promise<BackfillJob> {
     const candidates = getRepository(BackfillCandidate);
@@ -2252,8 +2440,8 @@ class Backfill {
     if (!selected.length) {
       throw new Error('Nothing in this pack would be imported.');
     }
-    // The plan is as old as the search: what it fills may have arrived since,
-    // and importing over it would replace a file nobody agreed to replace.
+    // The plan is as old as the search: a file may have arrived since, and
+    // importing over it would replace a file nobody agreed to replace.
     const row = await getRepository(BackfillSeries).findOneOrFail({
       where: { id: candidate.seriesId },
     });
@@ -2271,8 +2459,23 @@ class Backfill {
         `${appOf(row.kind)} has a file for this now. Search again for an up-to-date plan.`
       );
     }
-    // Several downloads may run for one series, for different episodes; a
-    // movie has only the one.
+    // An album plan is for one edition. If Lidarr has since imported files
+    // into another, importing here would switch editions and unlink them.
+    if (row.kind === 'album' && [...now.values()].some(Boolean)) {
+      const monitored = (
+        await this.lidarrFor(row.serverId).getAlbumDetail(row.arrId)
+      ).releases?.find((r) => r.monitored)?.id;
+      if (
+        monitored != null &&
+        selected.some((e) => e.releaseId != null && e.releaseId !== monitored)
+      ) {
+        throw new Error(
+          'Lidarr has files in another edition of this album now. Search again for an up-to-date plan.'
+        );
+      }
+    }
+    // A series may run several downloads for different episodes; a movie
+    // only one.
     const jobs = getRepository(BackfillJob);
     let leftOut = '';
     const running = await jobs.find({
@@ -2281,7 +2484,8 @@ class Backfill {
         status: In([...ACTIVE, 'paused']),
       },
     });
-    if (running.length && row.kind === 'movie') {
+    // Albums too: two at once could target different editions.
+    if (running.length && (row.kind === 'movie' || row.kind === 'album')) {
       throw new Error('This title already has a backfill running.');
     }
     const taken = new Map<number, BackfillJob>();
@@ -2290,7 +2494,7 @@ class Backfill {
         for (const id of file.episodeIds) taken.set(id, other);
       }
     }
-    // What another download is already fetching is left out of this one.
+    // Leave out what another download is already fetching.
     const clashing = selected.filter((e) =>
       e.episodeIds.some((id) => taken.has(id))
     );
@@ -2314,14 +2518,15 @@ class Backfill {
       }
       leftOut = `; left out ${clashing.length} already downloading in ${others}`;
     }
-    const who = options.user
-      ? options.user.displayName
-      : (options.by ?? 'Auto-approve');
-    // Taken only if still waiting: of two approvals at once (two admins,
-    // or an admin and auto-approve), only one starts a download.
+    // The approver: the person, what approved for them ("Sam (API key)",
+    // "AI agent"), or Backfill itself.
+    const who = options.by ?? options.user?.displayName ?? AUTO_APPROVED;
+    // Claim only if still ready, so of two concurrent approvals (two
+    // admins, or an admin and auto-approve) only one starts a download.
     const claimed = await candidates.update(
       { id: candidate.id, status: 'ready' },
-      { status: 'approved' }
+      // The reason it waited for an admin no longer applies.
+      { status: 'approved', reason: null }
     );
     if (!claimed.affected) {
       throw new Error('This pack is not waiting for approval.');
@@ -2357,21 +2562,29 @@ class Backfill {
           ],
           approvedById: options.user?.id ?? null,
           approvedByName: who,
+          agentRunId: options.agentRunId ?? null,
         })
       )
       .catch(async (e) => {
         await candidates.update(candidate.id, { status: 'ready' });
         throw e;
       });
+    await this.linkReplacement(job);
     await getRepository(BackfillSeries).update(candidate.seriesId, {
       status: 'downloading',
     });
     try {
       await this.start(job);
     } catch (e) {
-      this.note(job, 'warn', `Not started yet: ${message(e)}`);
-      // Only while it is still waiting to start: a tick may have started
-      // it, or an admin ended it, since.
+      // Same wording as the tick, so later retries collapse into one line.
+      logger.warn('Backfill could not start a download yet', {
+        label: LABEL,
+        jobId: job.id,
+        errorMessage: message(e),
+      });
+      this.note(job, 'warn', plainProblem(e));
+      // Only if still queued: a tick may have started it, or an admin ended
+      // it, since.
       await jobs.update(
         { id: job.id, status: 'queued' },
         { log: job.log, stage: job.stage }
@@ -2379,6 +2592,34 @@ class Backfill {
     }
     await this.publishDownloads();
     return job;
+  }
+
+  /**
+   * Marks failed downloads of the same title from the last week, still
+   * awaiting follow-up, as replaced by this job if it covers any of their
+   * episodes, whoever started it (Backfill, an admin, the admin agent).
+   */
+  private async linkReplacement(job: BackfillJob): Promise<void> {
+    const jobs = getRepository(BackfillJob);
+    const wanted = new Set(jobEpisodes(job));
+    const failed = await jobs.find({
+      select: { id: true, files: true },
+      where: {
+        seriesId: job.seriesId,
+        status: 'failed',
+        id: Not(job.id),
+        replacedById: IsNull(),
+        followUp: Not(IsNull()),
+        finishedAt: MoreThan(new Date(Date.now() - 7 * 24 * 60 * 60_000)),
+      },
+    });
+    for (const old of failed) {
+      if (!jobEpisodes(old).some((id) => wanted.has(id))) continue;
+      await jobs.update(
+        { id: old.id, replacedById: IsNull() },
+        { followUp: 'replaced', replacedById: job.id }
+      );
+    }
   }
 
   public async skip(candidateId: number): Promise<void> {
@@ -2403,20 +2644,38 @@ class Backfill {
 
   /* ------------------------------- jobs ------------------------------- */
 
-  /** Where the title's files go, for the free-space check. */
+  /** The title's destination folder, for the free-space check. */
   private async pathOf(row: BackfillSeries): Promise<string> {
+    if (row.kind === 'album') {
+      const lidarr = this.lidarrFor(row.serverId);
+      const album = await lidarr.getAlbumDetail(row.arrId);
+      return (await lidarr.getArtistDetail(album.artistId)).path ?? '';
+    }
     return row.kind === 'movie'
       ? (await this.radarrFor(row.serverId).getMovieDetail(row.arrId)).path
       : (await this.sonarrFor(row.serverId).getSeriesDetail(row.arrId)).path;
   }
 
   /**
-   * The file each episode (or the movie) has now, 0 for none, and how many
-   * are still missing.
+   * Each episode's (or the movie's) current file id, 0 for none, and how
+   * many are still missing.
    */
   private async onDisk(
     row: BackfillSeries
   ): Promise<{ files: Map<number, number>; missing: number }> {
+    if (row.kind === 'album') {
+      // Tracks of the monitored edition; importing into another edition
+      // makes that one monitored.
+      const tracks = await this.lidarrFor(row.serverId).getAlbumTracks(
+        row.arrId
+      );
+      return {
+        files: new Map(
+          tracks.map((t) => [t.id, t.hasFile ? (t.trackFileId ?? 0) : 0])
+        ),
+        missing: tracks.filter((t) => !t.hasFile).length,
+      };
+    }
     if (row.kind === 'movie') {
       const movie = await this.radarrFor(row.serverId).getMovieDetail(
         row.arrId
@@ -2424,7 +2683,7 @@ class Backfill {
       const fileId = movie.hasFile ? movie.movieFileId : 0;
       return {
         files: new Map([[movie.id, fileId]]),
-        missing: !fileId && movie.isAvailable ? 1 : 0,
+        missing: !fileId && movie.isAvailable && filmOutAWhile(movie) ? 1 : 0,
       };
     }
     const includeSpecials = getSettings().backfill.includeSpecials;
@@ -2439,16 +2698,28 @@ class Backfill {
     };
   }
 
+  /**
+   * Adds a line to a job's activity. A repeat of the last line bumps its
+   * count and lastAt instead.
+   */
   private note(job: BackfillJob, kind: BackfillLogLine['kind'], text: string) {
-    job.log = [
-      ...(job.log ?? []),
-      { at: new Date().toISOString(), kind, message: text },
-    ].slice(-MAX_LOG_LINES);
+    const at = new Date().toISOString();
+    const last = job.log?.at(-1);
+    if (last && last.message === text && last.kind === kind) {
+      job.log = [
+        ...job.log.slice(0, -1),
+        { ...last, count: (last.count ?? 1) + 1, lastAt: at },
+      ];
+      return;
+    }
+    job.log = [...(job.log ?? []), { at, kind, message: text }].slice(
+      -MAX_LOG_LINES
+    );
   }
 
   /** Adds an approved job's download, if there is room for it. */
   private async start(job: BackfillJob): Promise<void> {
-    // Approving starts a job while a tick may be starting it too.
+    // Approval and a tick may start the same job at once.
     if (this.starting.has(job.id)) return;
     this.starting.add(job.id);
     try {
@@ -2463,25 +2734,58 @@ class Backfill {
     const current = await jobs.findOne({ where: { id: job.id } });
     if (current?.status !== 'queued') return;
     const settings = getSettings().backfill;
-    // The limit is per client: torrents and Usenet do not share bandwidth,
-    // and an import is Sonarr's or Radarr's work, not a download.
-    const running = await jobs.count({
-      where: {
-        id: Not(job.id),
-        status: 'downloading',
-        protocol: job.protocol,
-      },
+    const candidate = await getRepository(BackfillCandidate).findOneOrFail({
+      where: { id: job.candidateId ?? -1 },
     });
-    if (running >= settings.maxActiveJobs) {
-      job.stage = `Waiting for one of ${settings.maxActiveJobs} running ${
-        job.protocol === 'torrent' ? 'torrent' : 'Usenet'
-      } downloads to finish`;
-      await jobs.save(job);
+    const indexer = { id: candidate.indexerId, name: candidate.indexer };
+    // A limit wait saved on the job survives restarts.
+    const kept = job.indexerWait;
+    if (kept && Date.parse(kept.until) > Date.now()) {
+      indexerLimits.restore(
+        indexer,
+        'download',
+        Date.parse(kept.until),
+        kept.strikes
+      );
+    }
+    // While the indexer waits out its limit, so does the job.
+    const waiting = indexerLimits.waiting(indexer);
+    if (waiting) {
+      await this.waitOutLimit(job, waiting, candidate.indexerId);
       return;
     }
     const row = await getRepository(BackfillSeries).findOneOrFail({
       where: { id: job.seriesId },
     });
+    // The limit is per protocol (torrent and Usenet don't share bandwidth)
+    // and per kind; imports are the arr's work and don't count.
+    const limit =
+      row.kind === 'movie'
+        ? settings.maxMovieJobs
+        : row.kind === 'album'
+          ? settings.maxMusicJobs
+          : settings.maxActiveJobs;
+    const running = await jobs.count({
+      where: {
+        id: Not(job.id),
+        status: 'downloading',
+        protocol: job.protocol,
+        series: { kind: row.kind },
+      },
+    });
+    if (running >= limit) {
+      job.stage = `Waiting for one of ${limit} running ${
+        job.protocol === 'torrent' ? 'torrent' : 'Usenet'
+      } ${
+        row.kind === 'movie'
+          ? 'movie'
+          : row.kind === 'album'
+            ? 'music'
+            : 'series'
+      } downloads to finish`;
+      await jobs.save(job);
+      return;
+    }
     const arr = this.arrFor(row);
     const path = await this.pathOf(row);
     const roots = await arr.getRootFoldersNow();
@@ -2497,16 +2801,31 @@ class Backfill {
       return;
     }
 
-    const candidate = await getRepository(BackfillCandidate).findOneOrFail({
-      where: { id: job.candidateId ?? -1 },
-    });
     const client = this.clientById(job.clientId);
-    const fetched = await this.fetch(candidate).catch((e) => {
-      // The indexer no longer has it: the release is gone, not Prowlarr.
-      throw isAxiosError(e) && [404, 410].includes(e.response?.status ?? 0)
-        ? new ReleaseProblem(`The indexer no longer has it (${message(e)}).`)
+    let fetched: FetchedRelease;
+    try {
+      fetched = await this.fetch(candidate);
+    } catch (e) {
+      if (e instanceof IndexerLimitReached) {
+        await this.waitOutLimit(job, e, candidate.indexerId);
+        return;
+      }
+      logger.warn('Backfill could not fetch a release from its indexer', {
+        label: LABEL,
+        jobId: job.id,
+        indexer: candidate.indexer,
+        errorMessage: message(e),
+      });
+      // 404/410: the release is gone, not Prowlarr.
+      const status = requestOf(e)?.status ?? 0;
+      if ([404, 410].includes(status)) {
+        throw new ReleaseProblem(`${candidate.indexer} no longer has it.`);
+      }
+      throw status === 401 || status === 403
+        ? new SaidPlainly(plainProblem(e, candidate.indexer), { cause: e })
         : e;
-    });
+    }
+    if (job.indexerWait) job.indexerWait = null;
     let torrents: TorrentClient | undefined;
     if (job.protocol === 'torrent') {
       torrents = torrentClientFor(client);
@@ -2525,10 +2844,9 @@ class Backfill {
       }
       if (!hash) throw new ReleaseProblem('The torrent has no info hash.');
       if (await torrents.findTorrent(hash)) {
-        // Backfill's own, left by an earlier try at starting this job (the
-        // client took it, then its answer was lost) or a magnet probe left
-        // behind: taken on. Anything else is someone else's, and removing
-        // it at the end would take their files.
+        // Take over Backfill's own torrent (from an earlier start attempt
+        // whose answer was lost, or a leftover probe). Anything else is
+        // someone else's; removing it later would delete their files.
         if (!(await this.unowned(torrents, hash, settings.category, job.id))) {
           throw new Error(`The torrent is already in ${client.name}.`);
         }
@@ -2536,10 +2854,11 @@ class Backfill {
       } else {
         await torrents.addTorrent(
           fetched.kind === 'torrent'
-            ? { torrent: fetched.data, category: settings.category }
-            : // A magnet must reach the swarm to get its file list, then stops.
+            ? { torrent: fetched.data, hash, category: settings.category }
+            : // A magnet fetches its file list from the swarm, then stops.
               {
                 magnet: fetched.uri,
+                hash,
                 category: settings.category,
                 metadataOnly: true,
               }
@@ -2563,8 +2882,8 @@ class Backfill {
     job.startedAt = new Date();
     await jobs.save(job);
     if (torrents) {
-      // A client that does not stop a magnet once it has its file list is
-      // watched for it now, so its files are chosen within seconds.
+      // A client that doesn't stop at metadata is watched now, so files are
+      // chosen within seconds.
       if (fetched.kind === 'magnet' && !torrents.stopsAtMetadata) {
         await this.fileListOf(torrents, job.downloadId!);
       }
@@ -2573,12 +2892,52 @@ class Backfill {
   }
 
   /**
-   * Whether a torrent in the client with this hash is Backfill's and no
-   * one's now: in Backfill's category, not a magnet being read this
-   * moment, and no other download Backfill has had, running or finished,
-   * is it. The one exception is a download of this release that gave up
-   * and kept what it had fetched: approving the release again takes that
-   * on, rather than fetching it all again.
+   * The indexer hit its download limit: the job stays queued, says so, and
+   * isn't retried before the reset (see indexerLimit). After a day it gives
+   * up, leaving the pack for an admin.
+   */
+  private async waitOutLimit(
+    job: BackfillJob,
+    limit: IndexerLimitReached,
+    indexerId: number
+  ): Promise<void> {
+    const now = Date.now();
+    const since = job.indexerWait ? Date.parse(job.indexerWait.since) : now;
+    if (now - since > LIMIT_GIVE_UP_MS) {
+      job.indexerWait = null;
+      await this.fail(
+        job,
+        `${limit.indexer} has been at its download limit for over a day, so Backfill stopped trying`,
+        { releaseAtFault: false }
+      );
+      return;
+    }
+    job.indexerWait = {
+      indexer: limit.indexer,
+      indexerId,
+      since: new Date(since).toISOString(),
+      until: limit.until.toISOString(),
+      strikes: limit.strikes,
+    };
+    job.stage = limit.message;
+    // Log only actual tries; the stage shows the waiting.
+    if (limit.asked) {
+      this.note(job, 'warn', limit.message);
+      logger.info('An indexer has reached its download limit', {
+        label: LABEL,
+        jobId: job.id,
+        indexer: limit.indexer,
+        until: limit.until.toISOString(),
+      });
+    }
+    await getRepository(BackfillJob).save(job);
+  }
+
+  /**
+   * Whether a torrent with this hash is Backfill's and unclaimed: in
+   * Backfill's category, not a magnet being probed, and no other Backfill
+   * download, running or finished, uses it. A failed download of it doesn't
+   * count, so re-approving the release reuses what it fetched.
    */
   private async unowned(
     torrents: TorrentClient,
@@ -2600,13 +2959,27 @@ class Backfill {
         downloadId: Not(IsNull()),
       },
     });
-    return !owners.some(
-      (other) =>
-        other.downloadId!.toLowerCase() === id && other.status !== 'failed'
-    );
+    if (
+      owners.some(
+        (other) =>
+          other.downloadId!.toLowerCase() === id && other.status !== 'failed'
+      )
+    ) {
+      return false;
+    }
+    // Album song fetches share the category (lib/music/songFetch); a
+    // running fetch owns its torrent.
+    const songFetches = await getRepository(SongFetch).find({
+      select: { id: true, downloadId: true },
+      where: {
+        downloadId: Not(IsNull()),
+        status: In(['queued', 'searching', 'downloading', 'importing']),
+      },
+    });
+    return !songFetches.some((f) => f.downloadId!.toLowerCase() === id);
   }
 
-  /** Skips every file but the chosen ones, then starts the torrent. */
+  /** Skips all but the chosen files, then starts the torrent. */
   private async pickFiles(job: BackfillJob): Promise<boolean> {
     const torrents = torrentClientFor(this.clientById(job.clientId));
     const files = await torrents.getFiles(job.downloadId!);
@@ -2615,7 +2988,7 @@ class Backfill {
       await getRepository(BackfillJob).save(job);
       return false;
     }
-    // From here on the job's files carry the client's own numbering.
+    // From here on the job's file indexes are the client's.
     const at = placeFiles(job.files, files);
     const mismatch = job.files.find((_, i) => at[i] === undefined);
     if (mismatch) {
@@ -2642,10 +3015,19 @@ class Backfill {
     return true;
   }
 
-  /** Every minute: moves each running job along. */
+  /** Runs every minute: advances each active job. */
   public async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
+    // Search Right After: requested titles the arrs found nothing for.
+    if (
+      getSettings().backfill.searchAfterArr &&
+      Date.now() - this.quickScannedAt >= QUICK_SCAN_EVERY_MS &&
+      !this.scanning
+    ) {
+      this.quickScannedAt = Date.now();
+      void this.scan({ quick: true });
+    }
     let settle!: () => void;
     this.ticked = new Promise<void>((resolve) => (settle = resolve));
     try {
@@ -2678,7 +3060,7 @@ class Backfill {
         )
       );
     } catch (e) {
-      // The database not answering, say: tried again next minute.
+      // E.g. the database not answering; retried next minute.
       logger.error('Backfill could not follow its downloads', {
         label: LABEL,
         errorMessage: message(e),
@@ -2691,25 +3073,34 @@ class Backfill {
   }
 
   /**
-   * A job's tick went wrong. Sonarr, Radarr or the download client out of
-   * reach is waited out, however long, and said once in its log. Anything
-   * else counts, and ten in a row give the job up.
+   * Handles a failed tick for a job. An unreachable arr or download client
+   * is waited out indefinitely and logged once on the job. Anything else
+   * counts; ten in a row fail the job.
    */
   private async stumbled(job: BackfillJob, e: unknown): Promise<void> {
+    // Plain words on the job, the raw error in the server log. Unreachable
+    // apps retry each minute, so they log at debug only.
+    const said = plainProblem(e);
+    logger[isUnreachable(e) ? 'debug' : 'warn'](
+      'Backfill ran into a problem with a download',
+      { label: LABEL, jobId: job.id, errorMessage: message(e) }
+    );
     if (isUnreachable(e)) {
-      const said = `No answer (${message(e)}); trying again each minute`;
-      if (job.log?.at(-1)?.message !== said) this.note(job, 'warn', said);
-      // Time out of reach is not time without progress.
-      this.lastGain.delete(job.id);
+      const waiting = `${said}; trying again each minute`;
+      if (job.log?.at(-1)?.message !== waiting) {
+        this.note(job, 'warn', waiting);
+      }
+      // Unreachable time doesn't count as stalled.
+      this.watch.forget(job.id);
       await getRepository(BackfillJob).save(job);
       return;
     }
     const count = (this.failures.get(job.id) ?? 0) + 1;
     this.failures.set(job.id, count);
-    this.note(job, 'warn', message(e));
+    this.note(job, 'warn', said);
     if (count >= 10) {
       this.failures.delete(job.id);
-      await this.fail(job, message(e), {
+      await this.fail(job, said, {
         releaseAtFault: e instanceof ReleaseProblem,
       });
     } else {
@@ -2718,9 +3109,8 @@ class Backfill {
   }
 
   /**
-   * Tells the download tracker what Backfill is downloading, and what it
-   * has just imported, so title pages and cards show it like any download
-   * Radarr or Sonarr runs: each episode of a series as its own item.
+   * Publishes Backfill's downloads and recent imports to the download
+   * tracker, so pages show them like arr downloads, one item per episode.
    */
   public async publishDownloads(): Promise<void> {
     try {
@@ -2734,8 +3124,8 @@ class Backfill {
         ],
         relations: { series: true },
       });
-      // What was downloading and is now imported shows as being added to
-      // the library until the media server lists it.
+      // Imports show as being added to the library until the media server
+      // lists them.
       downloadTracker.setBackfillDownloads(
         jobs
           .filter((job) => job.status !== 'done')
@@ -2800,14 +3190,11 @@ class Backfill {
         `${torrents.product} reports a problem with the torrent: ${torrent.error ?? 'an error'}.`
       );
     }
-    const { have, complete, ...measured } = measureTorrent(
-      job,
-      torrent,
-      await torrents.getFiles(job.downloadId!)
-    );
+    const files = await torrents.getFiles(job.downloadId!);
+    const { have, complete, ...measured } = measureTorrent(job, torrent, files);
     Object.assign(job, measured, { size: measured.size || job.size });
     if (complete && torrent.state === 'moving') {
-      // Moved from an "incomplete" folder once done: imported after.
+      // Being moved out of an "incomplete" folder; import after.
       job.stage = `${torrent.name} is being moved to its folder`;
       await getRepository(BackfillJob).save(job);
       return false;
@@ -2816,32 +3203,35 @@ class Backfill {
       await torrents.stopTorrent(job.downloadId!).catch(() => undefined);
       job.progress = 100;
       job.sizeLeft = 0;
-      this.lastGain.delete(job.id);
+      this.watch.forget(job.id);
     } else {
       const { stage, held } = torrentStage(torrent, torrents.product);
       job.stage = stage;
-      const seen = this.lastGain.get(job.id);
-      // Paused, queued or being checked in the client is not stalling:
-      // the clock only runs while it is meant to be downloading.
-      if (!seen || have > seen.have || held) {
-        this.lastGain.set(job.id, { have, at: Date.now() });
-      } else {
-        const hours = getSettings().backfill.stallHours;
-        if (hours > 0 && Date.now() - seen.at > hours * 60 * 60_000) {
-          this.lastGain.delete(job.id);
-          await this.fail(
-            job,
-            `Nothing downloaded for ${hours} hour${hours === 1 ? '' : 's'}: nobody seems to be sharing it.`
-          );
-          return false;
-        }
+      const wanted = new Set(job.files.map((f) => f.index));
+      const { stallHours, slowHours } = getSettings().backfill;
+      const giveUp = this.watch.check(
+        job.id,
+        {
+          have,
+          left: measured.sizeLeft,
+          held,
+          incomplete: swarmLacks(
+            torrent,
+            files.filter((f) => wanted.has(f.index))
+          ),
+        },
+        { stallHours, slowHours }
+      );
+      if (giveUp) {
+        await this.fail(job, giveUp);
+        return false;
       }
     }
     await getRepository(BackfillJob).save(job);
     return complete;
   }
 
-  /** The Usenet client's folder for the finished job, once it is finished. */
+  /** The Usenet client's folder for the job once finished, else false. */
   private async followNzb(job: BackfillJob): Promise<string | false> {
     const usenet = usenetClientFor(this.clientById(job.clientId));
     const nzbJob = await usenet.getJob(job.downloadId!);
@@ -2850,8 +3240,8 @@ class Backfill {
       size: nzbJob.size || job.size,
     });
     job.stage = usenetStage(nzbJob, usenet.product);
-    if (nzbJob.place === 'history') this.nzbPace.delete(job.id);
     if (nzbJob.place === 'history') {
+      this.nzbPace.delete(job.id);
       if (/^failed$/i.test(nzbJob.status)) {
         await this.fail(
           job,
@@ -2873,7 +3263,7 @@ class Backfill {
     return false;
   }
 
-  /** Where the client's path is, as Sonarr or Radarr sees it. */
+  /** A client path as the arr sees it. */
   private async arrPath(
     arr: Arr,
     client: DownloadClientSettings,
@@ -2904,6 +3294,12 @@ class Backfill {
       const sep = save.includes('\\') ? '\\' : '/';
       for (const file of job.files) {
         const there = files.find((f) => f.index === file.index);
+        // A name escaping the torrent's folder would make the arr import a
+        // file from elsewhere on its disk.
+        if (there && escapesFolder(there.name)) {
+          file.note = 'The torrent names files outside its own folder.';
+          continue;
+        }
         if (there) {
           const inside = there.name.replace(/[\\/]/g, sep);
           paths.set(
@@ -2913,14 +3309,15 @@ class Backfill {
         }
       }
     } else {
-      const seen = await arr.getFolderFiles(
-        await this.arrPath(arr, client, folder)
-      );
+      const there = await this.arrPath(arr, client, folder);
+      const seen =
+        arr instanceof BackfillLidarr
+          ? await arr.getFolderFiles(there, row.artistArrId ?? undefined)
+          : await arr.getFolderFiles(there);
       for (const file of job.files) {
         if (file.whole) {
-          // Grabbed whole (packed in archives, or with scrambled names):
-          // its one video, whatever it was named. With several, which is
-          // the episode cannot be told.
+          // Grabbed whole (archives or scrambled names): take its one
+          // video, whatever its name. With several, the episode is unknown.
           const videos = seen.filter(
             (s) =>
               isVideo(s.path) && !isExtra(s.path) && s.size >= WHOLE_MIN_BYTES
@@ -2953,26 +3350,37 @@ class Backfill {
     for (let i = 0; i < ready.length; i += IMPORT_BATCH) {
       const batch = ready.slice(i, i + IMPORT_BATCH);
       commandIds.push(
-        arr instanceof BackfillRadarr
-          ? await arr.manualImport(
+        arr instanceof BackfillLidarr
+          ? await arr.importAlbumFiles(
               batch.map((file) => ({
                 path: file.path,
-                movieId: row.arrId,
+                artistId: row.artistArrId!,
+                albumId: row.arrId,
+                albumReleaseId: file.releaseId!,
+                trackIds: file.episodeIds,
                 quality: file.quality!,
-                languages: file.languages ?? [],
-                releaseGroup: file.releaseGroup,
               }))
             )
-          : await arr.manualImport(
-              batch.map((file) => ({
-                path: file.path,
-                seriesId: row.arrId,
-                episodeIds: file.episodeIds,
-                quality: file.quality!,
-                languages: file.languages ?? [],
-                releaseGroup: file.releaseGroup,
-              }))
-            )
+          : arr instanceof BackfillRadarr
+            ? await arr.manualImport(
+                batch.map((file) => ({
+                  path: file.path,
+                  movieId: row.arrId,
+                  quality: file.quality!,
+                  languages: file.languages ?? [],
+                  releaseGroup: file.releaseGroup,
+                }))
+              )
+            : await arr.manualImport(
+                batch.map((file) => ({
+                  path: file.path,
+                  seriesId: row.arrId,
+                  episodeIds: file.episodeIds,
+                  quality: file.quality!,
+                  languages: file.languages ?? [],
+                  releaseGroup: file.releaseGroup,
+                }))
+              )
       );
     }
     job.status = 'importing';
@@ -2995,7 +3403,7 @@ class Backfill {
       where: { id: job.seriesId },
     });
     const arr = this.arrFor(row);
-    // A command the app no longer knows (restarted, or cleared) is over.
+    // A command the app no longer knows (restarted or cleared) is over.
     const commands = await Promise.all(
       job.commandIds.map((id) =>
         arr.getCommand(id).catch((e) => {
@@ -3026,7 +3434,7 @@ class Backfill {
     await this.finish(job, row);
   }
 
-  /** Checks what landed in Sonarr or Radarr, cleans up, and reports. */
+  /** Verifies what the arr imported, cleans up, and reports. */
   private async finish(job: BackfillJob, row: BackfillSeries): Promise<void> {
     const { files: fileOf, missing } = await this.onDisk(row);
     let imported = 0;
@@ -3064,7 +3472,7 @@ class Backfill {
         this.note(job, 'warn', `Could not remove the download: ${message(e)}`);
       }
     } else if (rejected) {
-      // What was not taken is left for an admin to import by hand.
+      // Leave rejected files for an admin to import by hand.
       this.note(
         job,
         'warn',
@@ -3084,8 +3492,8 @@ class Backfill {
       }`
     );
     await getRepository(BackfillJob).save(job);
-    // The other packs found were judged against the files as they were:
-    // once some landed, what they would fill or replace has changed.
+    // Other packs were judged against the old files; once some landed,
+    // what they would fill or replace has changed.
     const candidates = getRepository(BackfillCandidate);
     const others = await candidates.count({
       where: { seriesId: row.id, status: 'ready' },
@@ -3118,41 +3526,47 @@ class Backfill {
           : undefined,
       url: `/backfill/jobs/${job.id}`,
     });
-    // Still missing some: the packs are judged again against what is there.
+    // Still missing some: search again against the current files.
     if (stale && missing) this.startSearch(row.id);
   }
 
   /**
-   * Whether Backfill may take a pack without an admin: it fills something
-   * missing, replaces nothing on disk, nothing in it was placed by the AI
-   * alone, and it meets auto-approve's score and size. With `wanted` (a
-   * failed download's episodes), it must fill at least one of them.
+   * Whether Backfill may take a pack without an admin: it fills something,
+   * replaces nothing, has no AI-only matches, isn't an unseeded torrent, is
+   * within size limits, and meets auto-approve's score and size. With
+   * `wanted` (a failed download's episodes), it must fill one of them.
    */
   private takesItself(
-    pack: { plan: PlanEntry[]; summary: PlanSummary },
+    pack: {
+      plan: PlanEntry[];
+      summary: PlanSummary;
+      protocol?: string;
+      seeders?: number | null;
+    },
     wanted?: Set<number>
   ): boolean {
     const auto = getSettings().backfill.autoApprove;
     const fills = pack.plan.filter((e) => e.action === 'fill');
     return (
       pack.summary.fill > 0 &&
+      !unseeded(pack) &&
+      !pack.summary.outsideSize &&
       pack.summary.replaces === 0 &&
       pack.summary.score >= auto.minScore &&
       pack.summary.fillBytes <= auto.maxSizeGb * 1024 ** 3 &&
-      // Nothing the AI placed is ever taken without an admin seeing it.
+      // AI matches are never taken without an admin seeing them.
       !fills.some((e) => e.matchedBy === 'ai') &&
       (!wanted || fills.some((e) => e.episodeIds.some((id) => wanted.has(id))))
     );
   }
 
   /**
-   * Gives a job up. Its download is removed only when the release was to
-   * blame (it stalled, never sent its file list, or the client could not
-   * finish it) and the client says its chosen files are not all in; then
-   * the release is marked dead and another offered. Otherwise what was
-   * downloaded is kept: finished (or not known), for an admin to import by
-   * hand; unfinished, stopped in the client, and the pack is offered again
-   * as it was.
+   * Fails a job. The download is removed only when the release is at fault
+   * (stalled, no file list, the client couldn't finish) and its chosen
+   * files aren't all in; the release is then marked dead and another
+   * offered. Otherwise the download is kept: if finished (or unknown), for
+   * an admin to import by hand; if unfinished, stopped in the client, with
+   * the pack offered again.
    */
   private async fail(
     job: BackfillJob,
@@ -3176,7 +3590,7 @@ class Backfill {
       );
       await getRepository(BackfillJob).save(job);
     } else if (!releaseAtFault) {
-      // Nothing to keep for a job that never reached the client.
+      // A job that never reached the client has nothing to keep.
       if (job.downloadId) {
         await this.stopDownload(job).catch(() => undefined);
         this.note(
@@ -3192,24 +3606,93 @@ class Backfill {
     const row = await getRepository(BackfillSeries).findOneOrFail({
       where: { id: job.seriesId },
     });
-    const outcome = releaseAtFault
-      ? await this.offerNext(row, job)
-      : await this.offerAgain(row, job);
-    // A search for a replacement says what became of it once it is done.
-    if (outcome !== 'searching') {
+    // Never reached the client: the pack waits for an admin for a day
+    // (see startFailures).
+    const notStarted = !job.startedAt && !job.downloadId;
+    const { outcome, stopped }: { outcome: string; stopped?: string } =
+      releaseAtFault
+        ? await this.offerNext(row, job)
+        : { outcome: await this.offerAgain(row, job, notStarted) };
+    // A replacement search, or the admin agent, reports the outcome itself.
+    if (outcome !== 'searching' && outcome !== 'agent') {
+      const why = reason.replace(/\.$/, '');
       backfillNotices.add({
         kind: outcome === 'replaced' ? 'replaced' : 'failed',
         seriesId: row.id,
         title: row.title,
         poster: row.poster,
         what: jobWhat(row, job),
-        detail: reason,
+        detail: stopped
+          ? `${why}. ${stopped}`
+          : notStarted && outcome === 'offered'
+            ? `${why}. It never started, so Backfill will not take the pack by itself for a day: approve it by hand once that is put right`
+            : reason,
         url: `/backfill/jobs/${job.id}`,
       });
     }
   }
 
-  /** Other downloads still under way for a series. */
+  /**
+   * Records a failed download's follow-up once the replacement search ends,
+   * unless something replaced it meanwhile.
+   */
+  private async settleFailed(
+    jobId: number,
+    followUp: 'offered' | 'none'
+  ): Promise<void> {
+    await getRepository(BackfillJob).update(
+      { id: jobId, followUp: 'searching', replacedById: IsNull() },
+      { followUp }
+    );
+  }
+
+  /**
+   * Hands a failed agent-started download back to the agent. Null if not
+   * the agent's, or the agent can't take it.
+   */
+  private async agentHandBack(job: BackfillJob): Promise<AgentHandBack> {
+    if (!this.onAgentDownloadFailed || !startedByAgent(job)) return null;
+    try {
+      return await this.onAgentDownloadFailed(job);
+    } catch (e) {
+      logger.warn('Could not hand a failed download back to the admin agent', {
+        label: LABEL,
+        jobId: job.id,
+        errorMessage: message(e),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * A lookup for packs whose download failed to start in the last day,
+   * matched by id or by name (a new search re-finds the release as a new
+   * pack). Returns the held reason, or undefined if not held.
+   */
+  private async startFailures(
+    seriesId: number
+  ): Promise<(pack: { id?: number; title: string }) => string | undefined> {
+    const failed = await getRepository(BackfillJob).find({
+      select: { candidateId: true, title: true, error: true },
+      where: {
+        seriesId,
+        status: 'failed',
+        startedAt: IsNull(),
+        finishedAt: MoreThan(new Date(Date.now() - START_FAILED_HOLD_MS)),
+      },
+      order: { finishedAt: 'DESC' },
+    });
+    return (pack) => {
+      const last = failed.find(
+        (j) =>
+          (pack.id !== undefined && j.candidateId === pack.id) ||
+          j.title === pack.title
+      );
+      return last ? heldReason(last.error) : undefined;
+    };
+  }
+
+  /** Count of other active downloads for a title. */
   private othersRunning(seriesId: number, jobId: number): Promise<number> {
     return getRepository(BackfillJob).count({
       where: {
@@ -3221,16 +3704,19 @@ class Backfill {
   }
 
   /**
-   * After a download fails, its release is marked dead and a good pack for
-   * the same episodes takes its place on its own (see takesItself): one
-   * from the last search, or else from a new one. That goes on until no
-   * good pack is left, when the best one found is offered to an admin; or
-   * until MAX_FAILED_PER_DAY failed in a day.
+   * After a failure, marks the release dead and auto-takes a good pack for
+   * the same episodes (see takesItself), from the last search or a new one.
+   * Repeats until no good pack is left, when the best is offered to an
+   * admin, or until MAX_FAILED_PER_DAY fail in a day.
    */
   private async offerNext(
     row: BackfillSeries,
     job: BackfillJob
-  ): Promise<'replaced' | 'searching' | 'offered' | 'none'> {
+  ): Promise<{
+    outcome: 'replaced' | 'searching' | 'agent' | 'offered' | 'none';
+    /** Why the admin agent stopped looking, if it did. */
+    stopped?: string;
+  }> {
     const candidates = getRepository(BackfillCandidate);
     if (job.candidateId) {
       await candidates.update(job.candidateId, {
@@ -3247,6 +3733,7 @@ class Backfill {
     const wanted = new Set(job.files.flatMap((f) => f.episodeIds));
 
     let held: string | null = null;
+    let stopped: { followUp: 'gaveUp' | 'limit'; why: string } | undefined;
     if (getSettings().backfill.replaceFailed && wanted.size) {
       const failed = await getRepository(BackfillJob).count({
         where: {
@@ -3256,13 +3743,17 @@ class Backfill {
         },
       });
       if (this.searching.has(row.id)) {
-        // A search under way judges the packs afresh; it offers what it finds.
+        // A running search re-judges the packs and offers what it finds.
         held = 'A search for this title is under way';
       } else if (failed >= MAX_FAILED_PER_DAY) {
         held = `${failed} downloads for this title failed in the last day, so the next is left for an admin`;
       } else {
+        const notAgain = await this.startFailures(row.id);
         const pick = ranked.find(
-          (c) => this.takesItself(c, wanted) && !multiMustWait(c, ranked)
+          (c) =>
+            this.takesItself(c, wanted) &&
+            !multiMustWait(c, ranked) &&
+            !notAgain(c)
         );
         if (pick) {
           try {
@@ -3271,8 +3762,10 @@ class Backfill {
               by: `Backfill (replacing #${job.id})`,
             });
             this.note(job, 'info', `Replaced by #${next.id}: ${pick.title}`);
+            job.followUp = 'replaced';
+            job.replacedById = next.id;
             await getRepository(BackfillJob).save(job);
-            return 'replaced';
+            return { outcome: 'replaced' };
           } catch (e) {
             this.note(
               job,
@@ -3281,17 +3774,39 @@ class Backfill {
             );
           }
         }
-        this.note(job, 'info', 'Searching again for a replacement');
-        await getRepository(BackfillJob).save(job);
-        this.startSearch(row.id, undefined, {
-          replacing: [...wanted],
-          failedJob: {
-            id: job.id,
-            what: jobWhat(row, job),
-            reason: job.error ?? 'The download failed',
-          },
-        });
-        return 'searching';
+        // An agent-started download goes back to the agent, which searches
+        // the way it did before, where Backfill's own search found nothing.
+        const handBack = await this.agentHandBack(job);
+        if (handBack && 'look' in handBack) {
+          this.note(
+            job,
+            'info',
+            'Handed back to the admin agent, to look for another release'
+          );
+          job.followUp = 'agent';
+          // Save first: whatever the agent starts links itself to this job,
+          // and nothing here may overwrite that.
+          await getRepository(BackfillJob).save(job);
+          await handBack.look();
+          return { outcome: 'agent' };
+        }
+        if (handBack) {
+          stopped = { followUp: handBack.stopped, why: handBack.why };
+          held = handBack.why;
+        } else {
+          this.note(job, 'info', 'Searching again for a replacement');
+          job.followUp = 'searching';
+          await getRepository(BackfillJob).save(job);
+          this.startSearch(row.id, undefined, {
+            replacing: [...wanted],
+            failedJob: {
+              id: job.id,
+              what: jobWhat(row, job),
+              reason: job.error ?? 'The download failed',
+            },
+          });
+          return { outcome: 'searching' };
+        }
       }
     }
 
@@ -3309,25 +3824,29 @@ class Backfill {
       this.note(job, 'info', `Offered the next pack: ${entity.title}`);
       await this.notifyFound(row, entity);
     }
+    // The agent stopping matters most to an admin, even with a pack offered.
+    job.followUp = stopped?.followUp ?? (next ? 'offered' : 'none');
     await getRepository(BackfillJob).save(job);
-    return next ? 'offered' : 'none';
+    return { outcome: next ? 'offered' : 'none', stopped: stopped?.why };
   }
 
   /**
-   * After a job gave up for something other than its release: the pack is
-   * offered again, to be approved once whatever went wrong is put right.
+   * After a failure not caused by the release, offers the pack again for
+   * approval once the problem is fixed.
    */
   private async offerAgain(
     row: BackfillSeries,
-    job: BackfillJob
+    job: BackfillJob,
+    byHand = false
   ): Promise<'offered' | 'none'> {
     const back = job.candidateId
       ? await getRepository(BackfillCandidate).update(
           { id: job.candidateId, status: 'approved' },
-          { status: 'ready' }
+          { status: 'ready', reason: byHand ? heldReason(job.error) : null }
         )
       : undefined;
     const offered = !!back?.affected;
+    job.followUp = offered ? 'offeredAgain' : 'none';
     const running = await this.othersRunning(row.id, job.id);
     await getRepository(BackfillSeries).update(
       { id: row.id, status: In(['downloading', 'found', 'none', 'stuck']) },
@@ -3337,17 +3856,18 @@ class Backfill {
       this.note(
         job,
         'info',
-        'The pack is offered again, to approve once that is put right'
+        byHand
+          ? 'The pack waits for an admin to approve it by hand, once that is put right'
+          : 'The pack is offered again, to approve once that is put right'
       );
-      await getRepository(BackfillJob).save(job);
     }
+    await getRepository(BackfillJob).save(job);
     return offered ? 'offered' : 'none';
   }
 
   /**
-   * Whether a download's chosen files are all in; undefined when the client
-   * cannot be asked, and then the download is kept rather than lost for
-   * want of an answer.
+   * Whether a download's chosen files are all in; undefined if the client
+   * can't be asked, so the download is kept rather than lost.
    */
   private async downloaded(job: BackfillJob): Promise<boolean | undefined> {
     if (!job.downloadId) return false;
@@ -3397,8 +3917,8 @@ class Backfill {
   }
 
   /**
-   * Saves a job's change of status, only if it is still in the status it
-   * was read in; otherwise it changed meanwhile, and nothing is saved.
+   * Saves a job's status change only if it is still in a `from` status;
+   * otherwise it changed meanwhile and this throws.
    */
   private async moveJob(
     job: BackfillJob,
@@ -3425,7 +3945,7 @@ class Backfill {
         throw new Error('Only a download can be paused.');
       }
       await this.stopDownload(job);
-      this.lastGain.delete(job.id);
+      this.watch.forget(job.id);
       this.note(job, 'info', 'Paused');
       return this.moveJob(job, ['downloading'], { status: 'paused', speed: 0 });
     });
@@ -3443,7 +3963,7 @@ class Backfill {
       } else {
         await usenetClientFor(client).resumeJob(job.downloadId!);
       }
-      this.lastGain.delete(job.id);
+      this.watch.forget(job.id);
       this.note(job, 'info', 'Resumed');
       return this.moveJob(job, ['paused'], { status: 'downloading' });
     });
@@ -3451,7 +3971,7 @@ class Backfill {
 
   /** Stops a job and removes its download; imported files stay. */
   public async end(id: number, user?: User): Promise<BackfillJob> {
-    // A tick under way would save the job over the ending.
+    // A running tick would overwrite the ending.
     const job = await this.exclusive(async () => {
       const job = await getRepository(BackfillJob).findOneOrFail({
         where: { id },
@@ -3464,8 +3984,8 @@ class Backfill {
       if (!['queued', 'downloading', 'paused'].includes(job.status)) {
         throw new Error('The job has already finished.');
       }
-      // Being added to the download client right now, from an approval:
-      // ended once it is there, its download is removed with it.
+      // Mid-add from an approval: end it once it's in the client, so its
+      // download is removed too.
       if (this.starting.has(job.id)) {
         throw new Error(
           'It is being added to the download client; try again in a moment.'
@@ -3505,14 +4025,21 @@ class Backfill {
     if (candidate.notifiedAt || !candidate.summary) return;
     const s = candidate.summary;
     const parts =
-      row.kind === 'movie'
-        ? [s.fill ? 'has the movie' : 'upgrades the movie']
-        : [
+      row.kind === 'album'
+        ? [
             s.fill
-              ? `fills ${s.fill} missing episode${s.fill === 1 ? '' : 's'}`
+              ? `fills ${s.fill} missing track${s.fill === 1 ? '' : 's'}`
               : '',
             s.upgrade ? `upgrades ${s.upgrade}` : '',
-          ].filter(Boolean);
+          ].filter(Boolean)
+        : row.kind === 'movie'
+          ? [s.fill ? 'has the movie' : 'upgrades the movie']
+          : [
+              s.fill
+                ? `fills ${s.fill} missing episode${s.fill === 1 ? '' : 's'}`
+                : '',
+              s.upgrade ? `upgrades ${s.upgrade}` : '',
+            ].filter(Boolean);
     backfillNotices.add({
       kind: 'found',
       seriesId: row.id,
@@ -3522,7 +4049,8 @@ class Backfill {
       detail: `${parts.join(' and ')}${
         s.quality ? ` (${s.quality}, score ${s.score})` : ''
       }`,
-      url: `/backfill/series/${row.id}`,
+      // The title page's review, showing this pack.
+      url: `/backfill/series/${row.id}?pack=${candidate.id}#review`,
     });
     await getRepository(BackfillCandidate).update(candidate.id, {
       notifiedAt: new Date(),
@@ -3538,12 +4066,12 @@ class Backfill {
       .map((c) => ({ id: c.id, name: c.name }));
   }
 
-  /** What keeps a client chosen in Backfill from working fully, if anything. */
+  /** What keeps a Backfill client from working fully, if anything. */
   public clientProblems(client: DownloadClientSettings): Promise<string[]> {
     return downloadClientFor(client).backfillProblems();
   }
 
-  /** Whether the settings' client still answers, for the settings test. */
+  /** The client's version, for the settings test. */
   public async testClient(id: number): Promise<string> {
     return downloadClientFor(this.clientById(id)).getVersion();
   }

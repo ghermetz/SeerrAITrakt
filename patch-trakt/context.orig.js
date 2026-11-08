@@ -15,41 +15,50 @@ const watchHistory_1 = require("../../lib/watchHistory");
 const logger_1 = __importDefault(require("../../logger"));
 const Search_1 = require("../../models/Search");
 const mapWithConcurrency_1 = require("../../utils/mapWithConcurrency");
+const typeorm_1 = require("typeorm");
 /*
- * The little each feature tells the model about a person, and turning the
- * titles a model names back into real ones.
+ * What each feature tells the model about a user, and mapping the titles a
+ * model names back to real ones.
  */
-/** Short, so "what I just watched" is what they just watched. */
+/** Short, so "what I just watched" stays current. */
 const RECENT_MS = 5 * 60 * 1000;
+/** By user and media server account, as suggestions are. */
 const recent = new Map();
-/** Plays shorter than this are someone checking what a title is. */
+/** Longest title taken from watch history. */
+const MAX_PLAYED_TITLE = 200;
+/** Plays below this percent are someone sampling a title. */
 const STARTED_PERCENT = 20;
 /**
- * What someone has been watching lately, newest first, as "Title (year)" for
- * films and "Title (series)" for shows: from the server's watch history
- * (Tautulli for Plex, the server itself for Jellyfin and Emby), counting a show they
- * are part-way through. Failing that, what they requested, marked as such so
- * it is never passed off as watched. Names only: nothing else about them
- * leaves the server.
+ * Recent watching, newest first, as "Title (year)" or "Title (series)", from
+ * watch history (Tautulli for Plex, the server itself for Jellyfin and Emby),
+ * including shows part-way through. Falls back to requests, marked so they
+ * are never passed off as watched. Only names leave the server.
  */
 const recentActivity = async (user) => {
-    const hit = recent.get(user.id);
+    const source = (0, watchHistory_1.watchSource)();
+    const viewer = source?.viewerOf(user);
+    const key = `${user.id}:${viewer ?? ''}`;
+    const hit = recent.get(key);
     if (hit && Date.now() - hit.at < RECENT_MS) {
         return hit.value;
     }
     const watched = new Map();
-    const source = (0, watchHistory_1.watchSource)();
-    if (source?.viewerOf(user)) {
+    if (source && viewer) {
         try {
             const history = await source.history(user, 300);
             for (const play of history) {
                 if (!(0, watchHistory_1.isCompletedPlay)(play) && play.percent < STARTED_PERCENT) {
                     continue;
                 }
+                // Media server text, kept to one plain line.
+                const title = (0, exports.clip)(play.title, MAX_PLAYED_TITLE);
+                if (!title) {
+                    continue;
+                }
                 const name = play.kind === 'movie'
-                    ? `${play.title}${play.year ? ` (${play.year})` : ''}`
-                    : `${play.title} (series)`;
-                // Newest first, so the first play of a title is its latest.
+                    ? `${title}${play.year ? ` (${play.year})` : ''}`
+                    : `${title} (series)`;
+                // History is newest first, so a title's first play is its latest.
                 if (!watched.has(name)) {
                     watched.set(name, play.at);
                 }
@@ -75,7 +84,7 @@ const recentActivity = async (user) => {
     }
     else {
         const requests = await (0, datasource_1.getRepository)(MediaRequest_1.MediaRequest).find({
-            where: { requestedBy: { id: user.id } },
+            where: { requestedBy: { id: user.id }, type: (0, typeorm_1.In)(media_1.VIDEO_MEDIA_TYPES) },
             relations: { media: true },
             order: { createdAt: 'DESC' },
             take: 10,
@@ -97,11 +106,11 @@ const recentActivity = async (user) => {
             items: names.map((name) => ({ name })),
         };
     }
-    recent.set(user.id, { at: Date.now(), value });
+    recent.set(key, { at: Date.now(), value });
     return value;
 };
 exports.recentActivity = recentActivity;
-/** Forget what was gathered, so the next answer asks again. */
+/** Clears the cache so the next answer refetches. */
 const forgetRecentActivity = () => recent.clear();
 exports.forgetRecentActivity = forgetRecentActivity;
 /** Just the names, for features that only need someone's taste. */
@@ -125,12 +134,12 @@ const ago = (at, now = Date.now()) => {
     return `${Math.floor(days / 30)} months ago`;
 };
 exports.ago = ago;
-/** Posters fetched ahead: about what an answer shows before scrolling. */
+/** Posters prefetched: about what an answer shows before scrolling. */
 const POSTERS_WARMED = 12;
 /**
- * The TMDB entry for each title a model named, with this person's view of
- * its status (available, requested...), in the order named, without repeats.
- * A title TMDB cannot find is dropped rather than guessed.
+ * The TMDB entry for each title the model named, with this user's status,
+ * in order and deduplicated. A title TMDB cannot find is dropped, not
+ * guessed.
  */
 const resolveTitles = async (user, named) => {
     const tmdb = new themoviedb_1.default();
@@ -151,16 +160,15 @@ const resolveTitles = async (user, named) => {
 };
 exports.resolveTitles = resolveTitles;
 /**
- * TMDB titles as the app shows them, each with what the library knows of
- * it (status, requests), in the order given, without repeats.
+ * TMDB titles as the app shows them, with library status and requests, in
+ * order and deduplicated.
  */
 const withLibraryStatus = async (user, found) => {
     const seen = new Set();
     const unique = found.filter((f) => !seen.has(`${f.kind}:${f.result.id}`) &&
         !!seen.add(`${f.kind}:${f.result.id}`));
-    // The posters shown first start on their way now, while the rest of the
-    // answer is put together, rather than once the browser has drawn the
-    // cards. Only when posters are served from Seerr's own cache.
+    // Prefetch the first posters while the answer is assembled, not after the
+    // browser draws the cards. Only when Seerr serves cached images.
     if ((0, settings_1.getSettings)().main.cacheImages) {
         (0, imageproxy_1.warmTmdbImages)(unique
             .slice(0, POSTERS_WARMED)
@@ -186,7 +194,7 @@ const label = (result) => {
     return year ? `${name} (${year})` : name;
 };
 exports.label = label;
-/** Cut to a length, on a word where possible. */
+/** Truncates to `max`, at a word boundary where possible. */
 const clip = (text, max) => {
     const clean = text.replace(/\s+/g, ' ').trim();
     if (clean.length <= max) {

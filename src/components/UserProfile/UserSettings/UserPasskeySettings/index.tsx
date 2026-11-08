@@ -31,7 +31,7 @@ const messages = defineMessages(
   'components.UserProfile.UserSettings.UserPasskeySettings',
   {
     passkeys: 'Passkeys',
-    hint: 'Sign in with Face ID, Touch ID, Windows Hello or a security key instead of your Plex account. Add one on each device you use; a passkey saved to a password manager also works on your other devices signed in to it.',
+    hint: 'Sign in with Face ID, Touch ID, Windows Hello or a security key. Add one on each device you use.',
     add: 'Add a Passkey',
     none: 'No passkeys yet.',
     added: 'Added {date}',
@@ -49,7 +49,7 @@ const messages = defineMessages(
       'This browser cannot use passkeys. Passkeys you have added on other devices still work there.',
     onlyYours: 'Passkeys can only be managed by their owner.',
     othersHint:
-      'Remove a passkey for a device that is lost or no longer theirs. Only they can add a passkey.',
+      'Remove a passkey for a lost or old device. Only they can add one.',
     othersNone: 'No passkeys.',
   }
 );
@@ -67,9 +67,8 @@ const UserPasskeySettings = () => {
     }
   }, [supported]);
   const isOwn = !!user && currentUser?.id === user.id;
-  // Someone who manages users can remove another person's passkeys (a lost
-  // phone, say); the server decides whose, and refuses the owner's or
-  // another admin's to anyone but the owner.
+  // Managers can remove others' passkeys (e.g. a lost phone); the server
+  // enforces whose and reserves the owner's and other admins' to the owner.
   const managing = !!user && !isOwn && hasPermission(Permission.MANAGE_USERS);
   const endpoint = isOwn
     ? '/api/v1/auth/passkey'
@@ -188,7 +187,7 @@ const UserPasskeySettings = () => {
               className="flex flex-wrap items-center gap-4 rounded-lg bg-gray-800/50 px-4 py-5 shadow ring-1 ring-gray-700 sm:p-6"
             >
               <div className="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-gray-700 sm:h-12 sm:w-12">
-                <FingerPrintIcon className="h-7 w-7 text-indigo-300" />
+                <FingerPrintIcon className="h-7 w-7 text-indigo-300 light:text-accent-text" />
               </div>
               <div className="min-w-0 flex-1">
                 {editing?.id === passkey.id ? (
@@ -212,11 +211,11 @@ const UserPasskeySettings = () => {
                   />
                 ) : (
                   <div className="flex items-center gap-2">
-                    <span className="truncate text-lg font-semibold text-white">
+                    <span className="min-w-0 break-words text-lg font-semibold text-strong">
                       {passkey.name}
                     </span>
                     {passkey.backedUp && (
-                      <span className="flex-none rounded-full bg-indigo-600/40 px-2 py-0.5 text-xs text-indigo-100">
+                      <span className="flex-none rounded-full bg-indigo-600/40 px-2 py-0.5 text-xs text-indigo-100 light:text-accent-text">
                         {intl.formatMessage(messages.synced)}
                       </span>
                     )}

@@ -1,5 +1,6 @@
 import Button from '@app/components/Common/Button';
 import Modal from '@app/components/Common/Modal';
+import { messages as requestMessages } from '@app/hooks/useBulkRequest';
 import useClickOutside from '@app/hooks/useClickOutside';
 import { MARKERS_KEY } from '@app/hooks/useMediaMarkers';
 import useToasts from '@app/hooks/useToasts';
@@ -12,7 +13,7 @@ import { useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR, { useSWRConfig } from 'swr';
 
-const messages = defineMessages('components.AddToList', {
+export const messages = defineMessages('components.AddToList', {
   addtolist: 'Add to List',
   inlist: 'In List',
   newlist: 'New list name',
@@ -23,7 +24,17 @@ const messages = defineMessages('components.AddToList', {
   done: 'Done',
 });
 
+/** What adding a title new to a list did about requesting it. */
+export interface ListAddResult {
+  added: boolean;
+  request?: {
+    outcome: 'requested' | 'here' | 'asked' | 'failed';
+    message?: string;
+  };
+}
+
 interface ListSummary {
+  kind?: 'watch' | 'music';
   id: number;
   name: string;
 }
@@ -32,9 +43,8 @@ interface AddToListProps {
   tmdbId: number;
   mediaType: 'movie' | 'tv';
   /**
-   * Icon-only, for use inside a title card. Membership is then only fetched
-   * once opened — a grid of cards each firing their own lookup would be
-   * dozens of requests per page.
+   * Icon-only, for title cards. Membership is fetched only when opened, to
+   * avoid one lookup per card.
    */
   compact?: boolean;
 }
@@ -54,10 +64,12 @@ const AddToList = ({ tmdbId, mediaType, compact }: AddToListProps) => {
     }
   });
 
-  // Shared key: SWR de-duplicates this across every card on the page.
-  const { data: lists, mutate: revalidateLists } = useSWR<ListSummary[]>(
+  // Shared key, so SWR dedupes this across cards.
+  const { data: allLists, mutate: revalidateLists } = useSWR<ListSummary[]>(
     !compact || isOpen ? '/api/v1/list' : null
   );
+  // Films and series go on watch lists, not playlists.
+  const lists = allLists?.filter((list) => list.kind !== 'music');
 
   const { data: membership, mutate: revalidateMembership } = useSWR<
     { listId: number; listName: string }[]
@@ -81,6 +93,25 @@ const AddToList = ({ tmdbId, mediaType, compact }: AddToListProps) => {
     });
   };
 
+  /** Says whether the add requested the title, or why it couldn't. */
+  const reportRequest = async (request: ListAddResult['request']) => {
+    if (request?.outcome === 'requested') {
+      addToast(intl.formatMessage(requestMessages.requested, { count: 1 }), {
+        appearance: 'success',
+        autoDismiss: true,
+      });
+      await globalMutate(`/api/v1/${mediaType}/${tmdbId}`);
+    } else if (request?.outcome === 'failed') {
+      addToast(
+        intl.formatMessage(requestMessages.refused, {
+          count: 1,
+          reason: request.message ?? '',
+        }),
+        { appearance: 'warning', autoDismiss: true }
+      );
+    }
+  };
+
   const toggle = async (listId: number) => {
     setPending((current) => [...current, listId]);
 
@@ -90,7 +121,11 @@ const AddToList = ({ tmdbId, mediaType, compact }: AddToListProps) => {
           `/api/v1/list/${listId}/item?tmdbId=${tmdbId}&mediaType=${mediaType}`
         );
       } else {
-        await axios.post(`/api/v1/list/${listId}/item`, { tmdbId, mediaType });
+        const { data } = await axios.post<ListAddResult>(
+          `/api/v1/list/${listId}/item`,
+          { tmdbId, mediaType }
+        );
+        await reportRequest(data.request);
       }
 
       await Promise.all([
@@ -116,8 +151,12 @@ const AddToList = ({ tmdbId, mediaType, compact }: AddToListProps) => {
       const { data } = await axios.post<{ id: number }>('/api/v1/list', {
         name,
       });
-      await axios.post(`/api/v1/list/${data.id}/item`, { tmdbId, mediaType });
+      const { data: added } = await axios.post<ListAddResult>(
+        `/api/v1/list/${data.id}/item`,
+        { tmdbId, mediaType }
+      );
       setNewName('');
+      await reportRequest(added.request);
       await Promise.all([
         revalidateLists(),
         revalidateMembership(),
@@ -130,10 +169,7 @@ const AddToList = ({ tmdbId, mediaType, compact }: AddToListProps) => {
 
   const body = (
     <>
-      {/*
-        Saying where a title already sits avoids adding the same thing to a
-        second list without realising.
-      */}
+      {/* Show existing lists so the title isn't added to a second one unknowingly. */}
       {isInAnyList && (
         <p className="mb-2 border-b border-gray-700 px-2 pb-2 text-xs text-gray-400">
           {intl.formatMessage(messages.alreadyon, {
@@ -161,7 +197,9 @@ const AddToList = ({ tmdbId, mediaType, compact }: AddToListProps) => {
                   readOnly
                   type="checkbox"
                 />
-                <span className="flex-1 truncate">{list.name}</span>
+                <span className="min-w-0 flex-1 whitespace-normal break-words">
+                  {list.name}
+                </span>
               </button>
             </li>
           ))}
@@ -204,7 +242,8 @@ const AddToList = ({ tmdbId, mediaType, compact }: AddToListProps) => {
       {compact ? (
         <button
           aria-label={intl.formatMessage(messages.addtolist)}
-          className="flex h-7 w-7 flex-none items-center justify-center rounded-md bg-gray-800/80 text-white ring-1 ring-gray-600 transition hover:bg-gray-700"
+          // On a poster, so dark in every look.
+          className="flex h-7 w-7 flex-none items-center justify-center rounded-md bg-[rgb(var(--media-scrim-raised)/0.8)] text-on-media ring-1 ring-gray-600 transition hover:bg-gray-700 light:hover:bg-[rgb(var(--media-scrim-raised))]"
           onClick={(e) => {
             e.preventDefault();
             setOpen((open) => !open);
@@ -234,9 +273,8 @@ const AddToList = ({ tmdbId, mediaType, compact }: AddToListProps) => {
       {isOpen &&
         (compact ? (
           /*
-            A 256px panel inside a ~150px card is clipped by the card's own
-            overflow, and a dropdown that size is awkward on a phone. The
-            modal portals above everything instead.
+            A 256px dropdown would be clipped by a ~150px card and is awkward
+            on phones, so a portalled modal is used.
           */
           <Transition
             as="div"
@@ -259,7 +297,7 @@ const AddToList = ({ tmdbId, mediaType, compact }: AddToListProps) => {
             </Modal>
           </Transition>
         ) : (
-          <div className="absolute right-0 z-50 mt-2 w-64 rounded-md border border-gray-700 bg-gray-800 p-2 shadow-lg">
+          <div className="media-action-menu absolute right-0 z-50 mt-2 w-64 rounded-md border border-gray-700 bg-gray-800 p-2 shadow-lg">
             {body}
           </div>
         ))}

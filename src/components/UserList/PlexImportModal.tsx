@@ -18,6 +18,8 @@ interface PlexImportProps {
 interface PlexImportResponse {
   createdUsers: unknown[];
   refreshedUsers: number;
+  /** Users skipped because another account has their email. */
+  skippedUsers?: { id: string; name: string; reason: string }[];
 }
 
 const messages = defineMessages('components.UserList', {
@@ -28,16 +30,17 @@ const messages = defineMessages('components.UserList', {
     'Plex import completed. No users were created or refreshed.',
   importfromplexsynced:
     'Plex users synced successfully. Existing users were refreshed.',
-  syncnotice:
-    'You can still click Sync to refresh existing Plex users, such as updated email or username details.',
+  syncnotice: 'Sync refreshes existing Plex users’ email and username.',
   importedfromplex:
-    '<strong>{userCount}</strong> Plex {userCount, plural, one {user} other {users}} imported successfully!',
+    '<strong>{userCount}</strong> Plex {userCount, plural, one {user} other {users}} imported.',
   importedPlexUsersNoPassword:
-    'Imported users do not have a {applicationTitle} password set. If you disable Plex sign-in, they will need to set a password from their profile or via a password reset link.',
+    'Imported users have no {applicationTitle} password. Without Plex sign-in, they’ll need to set one.',
   user: 'User',
   nouserstoimport: 'There are no Plex users to import.',
+  plexImportSkipped:
+    'Not imported, as another account already has their email: {names}. They can sign in with it and link Plex.',
   newplexsigninenabled:
-    'The <strong>Enable New Plex Sign-In</strong> setting is currently enabled. Plex users with library access do not need to be imported in order to sign in.',
+    '<strong>Enable New Plex Sign-In</strong> is on, so Plex users with library access can sign in without being imported.',
 });
 
 const PlexImportModal = ({ onCancel, onComplete }: PlexImportProps) => {
@@ -67,7 +70,16 @@ const PlexImportModal = ({ onCancel, onComplete }: PlexImportProps) => {
         { plexIds: selectedUsers }
       );
 
-      const { createdUsers, refreshedUsers } = importResponse;
+      const { createdUsers, refreshedUsers, skippedUsers } = importResponse;
+
+      if (skippedUsers?.length) {
+        addToast(
+          intl.formatMessage(messages.plexImportSkipped, {
+            names: intl.formatList(skippedUsers.map((user) => user.name)),
+          }),
+          { autoDismiss: false, appearance: 'warning' }
+        );
+      }
 
       if (isSyncOnly) {
         if (refreshedUsers > 0) {
@@ -177,7 +189,7 @@ const PlexImportModal = ({ onCancel, onComplete }: PlexImportProps) => {
             <Alert
               title={intl.formatMessage(messages.newplexsigninenabled, {
                 strong: (msg: React.ReactNode) => (
-                  <strong className="font-semibold text-white">{msg}</strong>
+                  <strong className="font-semibold text-strong">{msg}</strong>
                 ),
               })}
               type="info"
@@ -260,7 +272,7 @@ const PlexImportModal = ({ onCancel, onComplete }: PlexImportProps) => {
                               />
                             </span>
                           </td>
-                          <td className="whitespace-nowrap px-1 py-4 text-sm font-medium leading-5 text-gray-100 md:px-6">
+                          <td className="px-1 py-4 text-sm font-medium leading-5 text-gray-100 [overflow-wrap:anywhere] md:px-6">
                             <div className="flex items-center">
                               <Image
                                 className="h-10 w-10 flex-shrink-0 rounded-full"
@@ -269,7 +281,7 @@ const PlexImportModal = ({ onCancel, onComplete }: PlexImportProps) => {
                                 width={40}
                                 height={40}
                               />
-                              <div className="ml-4">
+                              <div className="ml-4 min-w-0">
                                 <div className="text-base font-bold leading-5">
                                   {user.username}
                                 </div>

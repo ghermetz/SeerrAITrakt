@@ -28,21 +28,45 @@ export enum Permission {
   RECENT_VIEW = 67108864,
   WATCHLIST_VIEW = 134217728,
   MANAGE_BLOCKLIST = 268435456,
+  REQUEST_MUSIC = 536870912,
   VIEW_BLOCKLIST = 1073741824,
+  /**
+   * 2^31: beyond a 32-bit `&`, so permissions are tested arithmetically, not
+   * bitwise, and stored as a bigint.
+   */
+  AUTO_APPROVE_MUSIC = 2147483648,
 }
+
+/** The single bits making up a permission value. */
+const bitsOf = (value: number): number[] => {
+  const bits: number[] = [];
+  let rest = value;
+  for (let bit = 1; rest > 0; bit *= 2) {
+    if (Math.floor(rest / bit) % 2 === 1) {
+      bits.push(bit);
+      rest -= bit;
+    }
+  }
+  return bits;
+};
+
+/**
+ * Whether a permission (any of its bits, for a multi-bit one) is set in a
+ * value. Arithmetic, not `&`: JavaScript's bitwise operators are 32-bit and
+ * lose 2^31 and above (and with them Auto-Approve Music).
+ */
+const holds = (value: number, permission: number): boolean =>
+  bitsOf(permission).some((bit) => Math.floor(value / bit) % 2 === 1);
 
 export interface PermissionCheckOptions {
   type: 'and' | 'or';
 }
 
 /**
- * Takes a Permission and the users permission value and determines
- * if the user has access to the permission provided. If the user has
- * the admin permission, true will always be returned from this check!
+ * Whether a permission value grants the given permission(s). Admin always
+ * passes.
  *
- * @param permissions Single permission or array of permissions
- * @param value users current permission value
- * @param options Extra options to control permission check behavior (mainly for arrays)
+ * @param options 'and' (default) or 'or' for arrays
  */
 export const hasPermission = (
   permissions: Permission | Permission[],
@@ -51,24 +75,23 @@ export const hasPermission = (
 ): boolean => {
   let total = 0;
 
-  // If we are not checking any permissions, bail out and return true
   if (permissions === 0) {
     return true;
   }
 
   if (Array.isArray(permissions)) {
-    if (value & Permission.ADMIN) {
+    if (holds(value, Permission.ADMIN)) {
       return true;
     }
     switch (options.type) {
       case 'and':
-        return permissions.every((permission) => !!(value & permission));
+        return permissions.every((permission) => holds(value, permission));
       case 'or':
-        return permissions.some((permission) => !!(value & permission));
+        return permissions.some((permission) => holds(value, permission));
     }
   } else {
     total = permissions;
   }
 
-  return !!(value & Permission.ADMIN) || !!(value & total);
+  return holds(value, Permission.ADMIN) || holds(value, total);
 };

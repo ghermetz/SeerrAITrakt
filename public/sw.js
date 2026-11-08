@@ -1,51 +1,53 @@
 /* eslint-disable no-undef */
-// Incrementing OFFLINE_VERSION will kick off the install event and force
-// previously cached resources to be updated from the network.
-// This variable is intentionally declared and unused.
+// Bump to reinstall the worker and refetch cached resources. Intentionally unused.
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-const OFFLINE_VERSION = 16;
+const OFFLINE_VERSION = 17;
 const CACHE_NAME = 'offline';
-// Customize this with a different URL if needed.
 const OFFLINE_URL = '/offline.html';
+// The offline page's script, kept with it: pages run only scripts from here.
+const OFFLINE_SCRIPT_URL = '/offline.js';
 
-// Next.js emits content-hashed, immutable static assets. Caching them
-// cache-first means an installed web app does not re-download the bundle on
-// every cold launch after the OS has evicted the HTTP cache.
+// Hashed, immutable Next.js assets, cache-first so an installed app doesn't
+// re-download the bundle after the OS evicts the HTTP cache.
 const STATIC_CACHE = 'static-v1';
-// Every deploy ships new content-hashed chunks; the old ones are never
-// requested again but would otherwise sit in the cache indefinitely.
+// Each deploy ships new hashed chunks; the old ones are never requested again.
 const STATIC_CACHE_MAX_ENTRIES = 300;
-// Proxied poster and backdrop images. Cache-first with a bounded size so
-// repeat views are instant and the origin proxy is not hit again.
+// Proxied posters and backdrops, cache-first and bounded. One Discover trip
+// stores about 160; the cap keeps several (about 20 MB) before evicting.
 const IMAGE_CACHE = 'images-v1';
-const IMAGE_CACHE_MAX_ENTRIES = 400;
-// Discover rows answer per person: their region and language, what they have
-// requested, their own suggestions. v2 dropped copies stored before the cache
-// was emptied on every sign-in and sign-out (see SESSION_CHANGES); v3 drops
-// copies stored before they were checked to be readable (see readsAsJson).
+const IMAGE_CACHE_MAX_ENTRIES = 1000;
+// Discover rows are per person (region, language, requests, suggestions).
+// v2: emptied on session change (SESSION_CHANGES); v3: checked readable (readsAsJson).
 const DISCOVER_CACHE = 'discover-v3';
 const DISCOVER_CACHE_MAX_ENTRIES = 60;
 
 const PRECACHE_CONCURRENCY = 3;
 
 /**
- * Requests that start or end a session. Once one succeeds, the Discover cache
- * belongs to someone else: it is emptied before the page carries on, so the
- * next person on the device never sees the last one's rows or suggestions.
+ * Requests that start or end a session. On success the Discover cache is
+ * emptied before the page continues, so the next person never sees the last
+ * one's rows. SSO sign-in is a navigation to the provider and back, which
+ * empties it whatever the answer.
  */
 const SESSION_CHANGES =
-  /^\/api\/v1\/auth\/(local|plex|jellyfin|jellyfin\/quickconnect\/authenticate|passkey\/login|logout)$/;
+  /^\/api\/v1\/auth\/(local|plex|jellyfin|jellyfin\/quickconnect\/authenticate|passkey\/login|logout|oidc\/[^/]+\/(sign-in|link|callback))$/;
 
-/** Changes after which the cached Discover rows are out of date. */
+/**
+ * The user's music requests, which a playlist import adds to in the
+ * background. Rows derived from it change little and are cached like the rest.
+ */
+const OWN_MUSIC_REQUESTS = /^\/api\/v1\/discover\/music\/your-requests$/;
+/** Wait for the server before showing the stored copy. */
+const OWN_MUSIC_WAIT_MS = 3000;
+
+/** Changes that make cached Discover rows stale. */
 const DISCOVER_CHANGES =
   /^\/api\/v1\/(request|media|blocklist|watchlist)(\/|$)/;
 
 /*
- * Whose Discover rows are cached. A sign-in the worker never saw (made from a
- * page it did not control, such as right after a hard refresh) must not leave
- * the last person's rows to be shown to the next. Every page the server
- * renders says who it was rendered for (X-Seerr-User), and every page load
- * passes through here: when that is not who the rows belong to, they go.
+ * Whose Discover rows are cached. Covers sign-ins the worker never saw (e.g.
+ * after a hard refresh): each server-rendered page names its user
+ * (X-Seerr-User), and a mismatch empties the rows.
  */
 const SESSION_CACHE = 'session-v1';
 const DISCOVER_OWNER = '/__sw/discover-owner';
@@ -99,10 +101,13 @@ const precacheRouteChunks = async () => {
 
         try {
           if (!(await cache.match(url))) {
-            await cache.add(url);
+            const response = await fetchWithTimeout(new Request(url));
+            if (response.ok && fitsCache(STATIC_CACHE, response)) {
+              await cache.put(url, response);
+            }
           }
         } catch {
-          // One missing chunk is not a reason to stop warming the rest.
+          // Keep warming the rest.
         }
       }
     };
@@ -116,9 +121,8 @@ const precacheRouteChunks = async () => {
 };
 
 /**
- * Responses that mean the server could not be reached at all: gateway errors,
- * and Cloudflare's origin errors (520–527, 530). A plain 500 is deliberately
- * absent — that is Seerr answering, with a bug, not Seerr being unreachable.
+ * Statuses meaning the server is unreachable: gateway errors and Cloudflare
+ * origin errors (520–527, 530). 500 is excluded: that is Seerr answering.
  */
 const UNREACHABLE_STATUSES = new Set([
   502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530,
@@ -141,10 +145,8 @@ const raceTimeout = (promise, timeoutMs) =>
   });
 
 /**
- * The stored offline page, if the worker managed to store one, told what
- * went wrong so it can say so: "network" (no connection at all),
- * "timeout" (no answer in time) or "status:522" (an answer that means the
- * server could not be reached, from Cloudflare or a proxy).
+ * The stored offline page, if any, told the reason: "network", "timeout" or
+ * "status:522" (an unreachable status from Cloudflare or a proxy).
  */
 const offlinePage = async (reason) => {
   const cache = await caches.open(CACHE_NAME);
@@ -170,35 +172,31 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     (async () => {
       const cache = await caches.open(CACHE_NAME);
-      // Setting {cache: 'reload'} in the new request will ensure that the
-      // response isn't fulfilled from the HTTP cache; i.e., it will be from
-      // the network.
-      //
-      // Never let this reject. If installing fails, the previous worker stays
-      // in control — and if that worker is serving a stale app shell, the
-      // user is stuck until they reinstall. An offline page is not worth that.
+      // {cache: 'reload'} bypasses the HTTP cache.
+      // Never reject: a failed install keeps the previous worker, which may
+      // serve a stale shell until reinstall.
       try {
-        await cache.add(new Request(OFFLINE_URL, { cache: 'reload' }));
+        await cache.addAll([
+          new Request(OFFLINE_URL, { cache: 'reload' }),
+          new Request(OFFLINE_SCRIPT_URL, { cache: 'reload' }),
+        ]);
       } catch {
-        // Offline fallback simply will not be available until the next
-        // install; everything else proceeds.
+        // No offline page until the next install.
       }
     })()
   );
-  // Force the waiting service worker to become the active service worker.
   self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
-      // Enable navigation preload if it's supported.
       // See https://developers.google.com/web/updates/2017/02/navigation-preload
       if ('navigationPreload' in self.registration) {
         await self.registration.navigationPreload.enable();
       }
 
-      // Drop caches from previous versions of this worker.
+      // Drop caches from previous worker versions.
       const keep = new Set([
         CACHE_NAME,
         STATIC_CACHE,
@@ -215,21 +213,15 @@ self.addEventListener('activate', (event) => {
     })()
   );
 
-  // Tell the active service worker to take control of the page immediately.
   clients.claim();
 
-  // Warming the chunk cache used to start here. On the first launch after a
-  // deploy that meant downloading well over a megabyte across six connections
-  // while the page was still fetching the data it needs to render anything —
-  // on a home-hosted server that starves the page's own requests. The client
-  // now asks for it once it has finished loading (see the message handler).
+  // Chunk warming waits for the page to finish loading (PRECACHE_ROUTES), so
+  // it doesn't starve the page's own requests on a slow server.
 });
 
 /*
- * A trim lists every entry in the cache. Run after each image stored, a page
- * of posters arriving at once meant dozens of listings of hundreds of entries
- * competing with the lookups that serve the posters themselves; one trim per
- * cache every few seconds is plenty.
+ * A trim lists every cache entry; throttled so a page of posters doesn't run
+ * dozens of listings that compete with serving them.
  */
 const TRIM_EVERY_MS = 5000;
 const lastTrim = new Map();
@@ -244,11 +236,9 @@ const trimCacheSoon = (cacheName, maxEntries) => {
 };
 
 /*
- * When entries were last served from each cache, while this worker runs. The
- * Cache API keeps only the order entries were stored in, so without this a
- * poster on every visit was evicted as soon as it was among the oldest
- * stored. Lost when the worker stops, so it is a best effort: what was used
- * since then is kept over what was not.
+ * Last-served time per entry, per cache. The Cache API only keeps insertion
+ * order, so this lets trims evict least recently used. Lost when the worker
+ * stops; best effort.
  */
 const lastUsed = new Map();
 const LAST_USED_LIMIT = 2000;
@@ -259,7 +249,7 @@ const markUsed = (cacheName, url) => {
     used = new Map();
     lastUsed.set(cacheName, used);
   }
-  // Re-inserted, so the map stays in order of use, oldest first.
+  // Re-insert to keep the map ordered by use, oldest first.
   used.delete(url);
   used.set(url, Date.now());
   if (used.size > LAST_USED_LIMIT) {
@@ -275,9 +265,8 @@ const trimCache = async (cacheName, maxEntries) => {
     return;
   }
 
-  // Least recently used first: entries not served since the worker started,
-  // in the order they were stored (the order keys() gives), then the rest
-  // by when they were last served.
+  // LRU order: entries unused since worker start (in keys() order), then the
+  // rest by last use.
   const used = lastUsed.get(cacheName) ?? new Map();
   const order = [
     ...keys.filter((request) => !used.has(request.url)),
@@ -289,18 +278,7 @@ const trimCache = async (cacheName, maxEntries) => {
   await Promise.all(excess.map((request) => cache.delete(request)));
 };
 
-/**
- * Serve from cache immediately when available and refresh the cached copy in
- * the background; fall back to the network when there is nothing cached.
- * `fetchResponse` lets a navigation reuse its preload response so the
- * refresh does not cost a second request.
- */
-/**
- * A fetch that gives up rather than hanging.
- *
- * Without this a request the server never answers leaves the page waiting
- * forever — the shell renders and the content spinner never stops.
- */
+/** A fetch that times out, so an unanswered request can't hang the page. */
 const fetchWithTimeout = async (request, timeoutMs = NETWORK_TIMEOUT_MS) => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -313,10 +291,8 @@ const fetchWithTimeout = async (request, timeoutMs = NETWORK_TIMEOUT_MS) => {
 };
 
 /**
- * Whether a response is JSON the page can read. A copy that is not (an
- * empty or cut-off body, or some other page answering in its place) is
- * never stored, and never served: the page cannot draw from it, and served
- * from the cache it would come back every time.
+ * Whether a response is readable JSON. Anything else (empty, truncated, or
+ * another page) is never stored or served, or it would be served every time.
  */
 const readsAsJson = async (response) => {
   if (!(response.headers.get('Content-Type') ?? '').includes('json')) {
@@ -331,6 +307,10 @@ const readsAsJson = async (response) => {
   }
 };
 
+/**
+ * Serve from cache and refresh in the background; network when nothing is
+ * cached. `fetchResponse` reuses a preload response to save a request.
+ */
 const staleWhileRevalidate = async (
   request,
   cacheName,
@@ -348,8 +328,7 @@ const staleWhileRevalidate = async (
 
   const refresh = (async () => {
     try {
-      // The preload promise resolves to undefined when preload is unavailable,
-      // so it cannot be trusted as the response on its own.
+      // The preload promise resolves to undefined when preload is unavailable.
       let response = fetchResponse ? await fetchResponse : undefined;
 
       if (!response) {
@@ -375,9 +354,8 @@ const staleWhileRevalidate = async (
     }
   })();
 
-  // The worker may be terminated as soon as a response is returned. Without
-  // keeping it alive the background refresh never finishes writing, the cache
-  // never updates, and every subsequent load serves the same stale copy.
+  // The worker can stop once a response is returned; keep it alive or the
+  // refresh never writes and the stale copy is served forever.
   if (keepAlive) {
     keepAlive(refresh);
   }
@@ -395,38 +373,118 @@ const staleWhileRevalidate = async (
   throw new Error('No cached or network response available');
 };
 
+/**
+ * Network first, stored copy only on timeout. For rows that change without
+ * the page acting, such as music requests added by a playlist import.
+ */
+const networkFirst = async (request, cacheName, maxEntries, timeoutMs) => {
+  const cache = await caches.open(cacheName);
+  try {
+    const response = await fetchWithTimeout(request, timeoutMs);
+    if (
+      response.ok &&
+      response.type !== 'opaqueredirect' &&
+      (await readsAsJson(response))
+    ) {
+      await cache.put(request, response.clone());
+      if (maxEntries) {
+        trimCache(cacheName, maxEntries);
+      }
+    }
+    return response;
+  } catch (e) {
+    const cached = await cache.match(request);
+    if (cached && (await readsAsJson(cached))) {
+      return cached;
+    }
+    throw e;
+  }
+};
+
+/**
+ * Whether a stored copy is still servable. Immutable or lifetime-less copies
+ * always are; one with a max-age (e.g. an album cover) is good until it expires.
+ */
+const stillFresh = (response) => {
+  const cacheControl = response.headers.get('Cache-Control') ?? '';
+  const maxAge = /(?:^|,)\s*max-age=(\d+)/i.exec(cacheControl);
+  const sentAt = Date.parse(response.headers.get('Date') ?? '');
+  if (/immutable/i.test(cacheControl) || !maxAge || Number.isNaN(sentAt)) {
+    return true;
+  }
+  return Date.now() < sentAt + Number(maxAge[1]) * 1000;
+};
+
+/**
+ * Whether a response belongs in its cache: an image for images, non-HTML for
+ * code. A proxy's SSO page can answer a chunk or poster after a redirect;
+ * cached, it would break the app until the cache is cleared by hand.
+ */
+const fitsCache = (cacheName, response) => {
+  if (response.redirected) {
+    return false;
+  }
+  const type = response.headers.get('Content-Type') ?? '';
+  return cacheName === IMAGE_CACHE
+    ? /^image\//i.test(type)
+    : !/^text\/html/i.test(type);
+};
+
 const cacheFirst = async (request, cacheName, maxEntries, keepAlive) => {
   const cache = await caches.open(cacheName);
-  const cached = await cache.match(request);
+  let cached = await cache.match(request);
+
+  // Drop and refetch a copy stored before this check existed.
+  if (cached && !fitsCache(cacheName, cached)) {
+    await cache.delete(request).catch(() => undefined);
+    cached = undefined;
+  }
 
   if (cached) {
     markUsed(cacheName, request.url);
+    if (!stillFresh(cached)) {
+      // Serve it now, refetch for next time.
+      keepAlive?.(
+        fetchAndStore(request, cache, cacheName, maxEntries).catch(
+          () => undefined
+        )
+      );
+    }
     return cached;
   }
 
   const response = await fetch(request);
-
-  // no-store: a stand-in for now (an image proxy still converting the real
-  // one), never to be kept under this address.
-  if (
-    response &&
-    response.ok &&
-    !/no-store/i.test(response.headers.get('Cache-Control') ?? '')
-  ) {
-    markUsed(cacheName, request.url);
-    // The worker can be stopped as soon as the response is handed over; keep
-    // it alive until the copy is stored, or the next view downloads it again.
-    const store = cache
-      .put(request, response.clone())
-      .then(() =>
-        maxEntries ? trimCacheSoon(cacheName, maxEntries) : undefined
-      )
-      .catch(() => undefined);
+  const store = keep(response, request, cache, cacheName, maxEntries);
+  if (store) {
+    // Keep the worker alive until stored, or the next view downloads it again.
     keepAlive?.(store);
   }
 
   return response;
 };
+
+/**
+ * Stores a copy unless it is an error or no-store (a placeholder from an image
+ * proxy still converting). Returns the store promise, or nothing.
+ */
+const keep = (response, request, cache, cacheName, maxEntries) => {
+  if (
+    !response ||
+    !response.ok ||
+    /no-store/i.test(response.headers.get('Cache-Control') ?? '') ||
+    !fitsCache(cacheName, response)
+  ) {
+    return undefined;
+  }
+  markUsed(cacheName, request.url);
+  return cache
+    .put(request, response.clone())
+    .then(() => (maxEntries ? trimCacheSoon(cacheName, maxEntries) : undefined))
+    .catch(() => undefined);
+};
+
+const fetchAndStore = async (request, cache, cacheName, maxEntries) =>
+  keep(await fetchWithTimeout(request), request, cache, cacheName, maxEntries);
 
 self.addEventListener('fetch', (event) => {
   const { request } = event;
@@ -441,7 +499,7 @@ self.addEventListener('fetch', (event) => {
       (async () => {
         const response = await fetch(request);
         if (response.ok) {
-          // Emptied, and owned by nobody until the next page says who.
+          // Owned by nobody until the next page names its user.
           await clearDiscover().catch(() => undefined);
         }
         return response;
@@ -450,11 +508,9 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // A request, an approval, a blocklisting or a watchlist change alters what
-  // the Discover rows show for a title. The rows are served from the cache
-  // first, so without this the page would ask again after a request and be
-  // handed the copy that still says "Request". Emptied before the page hears
-  // back, the next read of each row goes to the server.
+  // Requests, approvals, blocklisting and watchlist changes alter Discover
+  // rows. Empty the cache before the page hears back, or its next read gets a
+  // copy still saying "Request".
   if (
     request.method !== 'GET' &&
     url.origin === self.location.origin &&
@@ -477,6 +533,16 @@ self.addEventListener('fetch', (event) => {
   }
 
   if (url.origin === self.location.origin) {
+    // The copy stored with the offline page, so the two always match.
+    if (url.pathname === OFFLINE_SCRIPT_URL) {
+      event.respondWith(
+        (async () =>
+          (await (await caches.open(CACHE_NAME)).match(OFFLINE_SCRIPT_URL)) ??
+          fetch(request))()
+      );
+      return;
+    }
+
     if (url.pathname.startsWith('/_next/static/')) {
       event.respondWith(
         cacheFirst(request, STATIC_CACHE, STATIC_CACHE_MAX_ENTRIES, (promise) =>
@@ -495,12 +561,23 @@ self.addEventListener('fetch', (event) => {
       return;
     }
 
-    // The watchlist belongs to whoever is signed in; a cached copy keyed by
-    // address alone would show the last person's to the next one. The text a
-    // page is filtered by is asked for in batches that change as it loads,
-    // and each can take seconds while the server looks titles up: caching it
-    // only pushes real rows out of the cache, and a timeout here would cut it
-    // off. Both go straight to the network.
+    // Music requests change server-side (playlist import) with no page call to
+    // empty the cache: network first, stored copy when slow or offline.
+    if (OWN_MUSIC_REQUESTS.test(url.pathname)) {
+      event.respondWith(
+        networkFirst(
+          request,
+          DISCOVER_CACHE,
+          DISCOVER_CACHE_MAX_ENTRIES,
+          OWN_MUSIC_WAIT_MS
+        )
+      );
+      return;
+    }
+
+    // Watchlist is per user (a URL-keyed copy would leak across users).
+    // search-text batches change as the page loads and can be slow: caching
+    // evicts real rows and the timeout would cut them off. Both skip the cache.
     if (
       url.pathname.startsWith('/api/v1/discover/') &&
       url.pathname !== '/api/v1/discover/watchlist' &&
@@ -519,40 +596,36 @@ self.addEventListener('fetch', (event) => {
     }
   }
 
-  // We only want to call event.respondWith() if this is a navigation request
-  // for an HTML page.
-  //
-  // Navigations go straight to the network. Caching the HTML meant every
-  // deploy risked serving the previous build — which caused a reload loop and
-  // a stalled first launch — for a benefit that only showed on a slow
-  // connection. Static assets and images are still cached, which is where the
-  // real saving is.
+  // Navigations always go to the network: cached HTML can serve the previous
+  // build after a deploy (reload loop, stalled launch).
   if (event.request.mode === 'navigate') {
     event.respondWith(
       (async () => {
         try {
-          // Network first, always: pages are never served from a cache.
           const response = await raceTimeout(
             (async () =>
               (await event.preloadResponse) || fetch(event.request))(),
             NETWORK_TIMEOUT_MS
           );
 
-          // Behind Cloudflare, a server that is down does not fail the
-          // request: Cloudflare answers with its own error page. Show ours
-          // for those, but let an ordinary server error through, since
-          // "unreachable" would be the wrong message for a bug.
+          // Cloudflare answers for a down server with its own error page;
+          // show ours instead. Ordinary server errors pass through.
           if (UNREACHABLE_STATUSES.has(response.status)) {
             return (await offlinePage(`status:${response.status}`)) ?? response;
           }
 
-          // Settled before the page gets its response, so none of its own
-          // requests can be answered with someone else's rows.
+          // Settle before responding so no request gets someone else's rows.
+          if (
+            url.origin === self.location.origin &&
+            SESSION_CHANGES.test(url.pathname)
+          ) {
+            await clearDiscover().catch(() => undefined);
+          }
           await checkDiscoverOwner(response).catch(() => undefined);
 
           return response;
         } catch (error) {
-          // No connection, or the request hung past the timeout.
+          // No connection, or timed out.
           return (
             (await offlinePage(
               error && error.message === 'timeout' ? 'timeout' : 'network'
@@ -565,8 +638,7 @@ self.addEventListener('fetch', (event) => {
 });
 
 self.addEventListener('message', (event) => {
-  // The page tells us it has settled, so warming the cache competes with
-  // nothing. Guarded so a second message cannot start a parallel run.
+  // Sent once the page has settled. Guarded against a parallel run.
   if (event.data && event.data.type === 'PRECACHE_ROUTES') {
     if (!self.__precacheStarted) {
       self.__precacheStarted = true;
@@ -591,8 +663,28 @@ const setBadge = async (count) => {
   }
 };
 
+/**
+ * Parses a push. Non-JSON is shown as text, since a push must always show
+ * something (see below).
+ */
+const pushPayload = (data) => {
+  if (!data) {
+    return {};
+  }
+  try {
+    const payload = data.json();
+    return payload && typeof payload === 'object' ? payload : {};
+  } catch {
+    try {
+      return { message: data.text() };
+    } catch {
+      return {};
+    }
+  }
+};
+
 self.addEventListener('push', (event) => {
-  const payload = event.data ? event.data.json() : {};
+  const payload = pushPayload(event.data);
 
   const options = {
     body: payload.message,
@@ -618,8 +710,7 @@ self.addEventListener('push', (event) => {
   }
 
   if (payload.notificationType === 'MEDIA_PENDING') {
-    // In the person's language when the server sent the words; English
-    // from a server that predates them.
+    // Localised when the server sends labels; English otherwise.
     const labels = payload.actionLabels ?? {};
     options.actions.push(
       {
@@ -633,9 +724,8 @@ self.addEventListener('push', (event) => {
     );
   }
 
-  // Every push shows a notification. A push that shows nothing breaks the
-  // promise made when subscribing, and WebKit revokes the subscription of an
-  // app that does it — on an iPhone, notifications would quietly stop.
+  // Every push must show a notification, or WebKit revokes the subscription
+  // and iPhone notifications silently stop.
   event.waitUntil(
     Promise.all([
       payload.notificationType === 'MEDIA_PENDING' &&
@@ -650,12 +740,18 @@ self.addEventListener('push', (event) => {
   );
 });
 
-/**
- * Brings the app forward on `url`, reusing an open window rather than
- * opening a second copy of the app.
- */
+/** Focuses the app on `url`, reusing an open window when possible. */
 const openApp = async (url) => {
-  const target = new URL(url || '/', self.location.origin).href;
+  let target = new URL('/', self.location.origin).href;
+  try {
+    const asked = new URL(url || '/', self.location.origin);
+    // Only this app's own pages; anything else opens the home page.
+    if (asked.origin === self.location.origin) {
+      target = asked.href;
+    }
+  } catch {
+    // Not a URL: the home page.
+  }
   const windows = await clients.matchAll({
     type: 'window',
     includeUncontrolled: true,
@@ -672,7 +768,7 @@ const openApp = async (url) => {
       }
       return;
     } catch {
-      // Could not reuse it (not controlled by this worker): open a new one.
+      // Not controlled by this worker: open a new one.
     }
   }
 
@@ -680,11 +776,9 @@ const openApp = async (url) => {
 };
 
 /**
- * The token the server wants with anything that changes something, when its
- * CSRF protection is on. The page reads it from a cookie; the worker can only
- * where the browser lets it read cookies (cookieStore). With none yet, any
- * answer from the server hands one out. Undefined where cookies cannot be
- * read, or with the protection off.
+ * The CSRF token for mutating requests, read via cookieStore. With none yet,
+ * any server response sets one. Undefined where cookies can't be read or CSRF
+ * protection is off.
  */
 const csrfToken = async () => {
   if (!self.cookieStore) {
@@ -710,9 +804,8 @@ const csrfToken = async () => {
 
 /**
  * Approves or declines a request from the notification. The worker is kept
- * alive until the server answers — otherwise it can be stopped as soon as the
- * tap is handled, and the request is never sent. If it did not go through,
- * a notification says to open the app, and tapping it opens the request.
+ * alive until the server answers, or the request may never be sent. On
+ * failure, a notification links to the request.
  */
 const actOnRequest = async (data, status) => {
   let ok = false;
@@ -751,7 +844,7 @@ const actOnRequest = async (data, status) => {
     return;
   }
 
-  // One fewer waiting: bring the badge up to date.
+  // One fewer pending.
   try {
     const response = await fetchWithTimeout(
       new Request('/api/v1/request/count', { credentials: 'same-origin' })
@@ -760,7 +853,7 @@ const actOnRequest = async (data, status) => {
       await setBadge((await response.json()).pending);
     }
   } catch {
-    // The app corrects the badge the next time it is opened.
+    // The app corrects the badge when next opened.
   }
 };
 

@@ -10,94 +10,82 @@ import { useIntl } from 'react-intl';
 const messages = defineMessages('components.NotificationTypeSelector', {
   notificationTypes: 'Notification Types',
   mediarequested: 'Request Pending Approval',
-  mediarequestedDescription:
-    'Send notifications when users submit new media requests which require approval.',
-  usermediarequestedDescription:
-    'Get notified when other users submit new media requests which require approval.',
+  mediarequestedDescription: 'When requests need approval.',
+  usermediarequestedDescription: 'When other users’ requests need approval.',
   mediaapproved: 'Request Approved',
-  mediaapprovedDescription:
-    'Send notifications when media requests are manually approved.',
-  usermediaapprovedDescription:
-    'Get notified when your media requests are approved.',
+  mediaapprovedDescription: 'When requests are approved by hand.',
+  usermediaapprovedDescription: 'When your requests are approved.',
   mediaAutoApproved: 'Request Automatically Approved',
-  mediaAutoApprovedDescription:
-    'Send notifications when users submit new media requests which are automatically approved.',
+  mediaAutoApprovedDescription: 'When requests are approved automatically.',
   usermediaAutoApprovedDescription:
-    'Get notified when other users submit new media requests which are automatically approved.',
+    'When other users’ requests are approved automatically.',
   listactivity: 'List Activity',
   listactivityDescription:
-    'Get notified when someone adds to or removes from a list shared with you.',
+    'When someone adds to or removes from a list shared with you.',
   mediaavailable: 'Request Available',
-  mediaavailableDescription:
-    'Send notifications when media requests become available.',
-  usermediaavailableDescription:
-    'Get notified when your media requests become available.',
+  mediaavailableDescription: 'When requests become available.',
+  usermediaavailableDescription: 'When your requests become available.',
   mediafailed: 'Request Processing Failed',
-  mediafailedDescription:
-    'Send notifications when media requests fail to be added to Radarr or Sonarr.',
-  usermediafailedDescription:
-    'Get notified when media requests fail to be added to Radarr or Sonarr.',
+  mediafailedDescription: 'When requests can’t be added to Radarr or Sonarr.',
+  usermediafailedDescription: 'When other users’ requests fail.',
+  requestFailed: 'Request Failed',
+  requestFailedDescription: 'When a request of yours fails.',
+  playlistUpdate: 'Playlist Updates',
+  playlistUpdateDescription:
+    'When songs from a playlist you imported can’t be got, or the playlist can no longer be read.',
+  leavingSoon: 'Leaving Soon',
+  leavingSoonDescription:
+    'When something you requested is about to be deleted.',
+  turnedOff: 'Turned off for everyone in Settings → Notifications.',
   mediadeclined: 'Request Declined',
-  mediadeclinedDescription:
-    'Send notifications when media requests are declined.',
-  usermediadeclinedDescription:
-    'Get notified when your media requests are declined.',
+  mediadeclinedDescription: 'When requests are declined.',
+  usermediadeclinedDescription: 'When your requests are declined.',
   issuecreated: 'Issue Reported',
-  issuecreatedDescription: 'Send notifications when issues are reported.',
-  userissuecreatedDescription: 'Get notified when other users report issues.',
+  issuecreatedDescription: 'When issues are reported.',
+  userissuecreatedDescription: 'When other users report issues.',
   issuecomment: 'Issue Comment',
-  issuecommentDescription:
-    'Send notifications when issues receive new comments.',
-  userissuecommentDescription:
-    'Get notified when issues you reported receive new comments.',
-  adminissuecommentDescription:
-    'Get notified when other users comment on issues.',
+  issuecommentDescription: 'When issues get new comments.',
+  userissuecommentDescription: 'When issues you reported get new comments.',
+  adminissuecommentDescription: 'When other users comment on issues.',
   issueresolved: 'Issue Resolved',
-  issueresolvedDescription: 'Send notifications when issues are resolved.',
-  userissueresolvedDescription:
-    'Get notified when issues you reported are resolved.',
-  adminissueresolvedDescription:
-    'Get notified when issues are resolved by other users.',
+  issueresolvedDescription: 'When issues are resolved.',
+  userissueresolvedDescription: 'When issues you reported are resolved.',
+  adminissueresolvedDescription: 'When other users resolve issues.',
   issuereopened: 'Issue Reopened',
-  issuereopenedDescription: 'Send notifications when issues are reopened.',
-  userissuereopenedDescription:
-    'Get notified when issues you reported are reopened.',
-  adminissuereopenedDescription:
-    'Get notified when issues are reopened by other users.',
+  issuereopenedDescription: 'When issues are reopened.',
+  userissuereopenedDescription: 'When issues you reported are reopened.',
+  adminissuereopenedDescription: 'When other users reopen issues.',
   mediaautorequested: 'Request Automatically Submitted',
   mediaautorequestedDescription:
-    'Get notified when new media requests are automatically submitted for items on Your Watchlist.',
+    'When titles on your watchlist are requested automatically.',
   backfill: 'Backfill',
   backfillDescription:
-    'Send notifications when Backfill finds a pack waiting for approval, and when a backfill finishes or fails.',
+    'When Backfill has a pack to approve, or a backfill finishes or fails.',
   userbackfillDescription:
-    'Get notified when Backfill finds a pack waiting for your approval, and when a backfill finishes or fails. Tap it to approve or skip.',
+    'When Backfill has a pack for you to approve, or a backfill finishes or fails.',
   health: 'Health',
   healthDescription:
-    'Send notifications when a connected service newly has a problem: down, an indexer or subtitle provider paused, a disk filling up.',
+    'When a connected service has a new problem, like being down or a full disk.',
   userhealthDescription:
-    'Get notified when a connected service newly has a problem: down, an indexer or subtitle provider paused, a disk filling up. Tap it to open the Health page.',
+    'When a connected service has a new problem, like being down or a full disk.',
+  wrongMatch: 'Wrong Match',
+  wrongMatchDescription:
+    'When a media server matches a new import to the wrong title.',
+  userwrongMatchDescription:
+    'When a media server matches a new import to the wrong title.',
 });
 
 export const hasNotificationType = (
   types: Notification | Notification[],
   value: number
 ): boolean => {
-  let total: number;
-
-  // If we are not checking any notifications, bail out and return true
   if (types === 0) {
     return true;
   }
 
-  if (Array.isArray(types)) {
-    // Combine all notification values into one
-    total = types.reduce((a, v) => a + v, 0);
-  } else {
-    total = types;
-  }
+  const total = Array.isArray(types) ? types.reduce((a, v) => a + v, 0) : types;
 
-  // Test notifications don't need to be enabled
+  // Test notifications don't need to be enabled.
   if (!(value & Notification.TEST_NOTIFICATION)) {
     value += Notification.TEST_NOTIFICATION;
   }
@@ -123,11 +111,29 @@ export enum Notification {
   PLEX_REAUTH = 16384,
   BACKFILL = 32768,
   HEALTH = 65536,
+  WRONG_MATCH = 131072,
+  PLAYLIST_UPDATE = 262144,
+  REQUEST_FAILED = 524288,
+  LEAVING_SOON = 1048576,
 }
 
 export const ALL_NOTIFICATIONS = Object.values(Notification)
   .filter((v) => !isNaN(Number(v)))
   .reduce((a, v) => a + Number(v), 0);
+
+/** Web push default types, matching the server. */
+export const WEB_PUSH_STARTING_TYPES =
+  Notification.MEDIA_AVAILABLE |
+  Notification.MEDIA_FAILED |
+  Notification.REQUEST_FAILED |
+  Notification.LIST_ACTIVITY |
+  Notification.PLAYLIST_UPDATE |
+  Notification.LEAVING_SOON |
+  Notification.PLEX_REAUTH |
+  Notification.BACKFILL |
+  Notification.HEALTH |
+  Notification.WRONG_MATCH |
+  Notification.TEST_NOTIFICATION;
 
 export interface NotificationItem {
   id: string;
@@ -137,6 +143,10 @@ export interface NotificationItem {
   hasNotifyUser: boolean;
   children?: NotificationItem[];
   hidden?: boolean;
+  /** Personal only; never sent to a shared channel. */
+  personal?: boolean;
+  /** Shown, but disabled for everyone by the admin. */
+  turnedOff?: boolean;
 }
 
 interface NotificationTypeSelectorProps {
@@ -145,6 +155,8 @@ interface NotificationTypeSelectorProps {
   currentTypes: number;
   onUpdate: (newTypes: number) => void;
   error?: string;
+  /** A shared channel (Discord): personal types are hidden; admin-disabled ones greyed. */
+  channel?: boolean;
 }
 
 const NotificationTypeSelector = ({
@@ -153,6 +165,7 @@ const NotificationTypeSelector = ({
   currentTypes,
   onUpdate,
   error,
+  channel = false,
 }: NotificationTypeSelectorProps) => {
   const intl = useIntl();
   const settings = useSettings();
@@ -286,6 +299,27 @@ const NotificationTypeSelector = ({
         description: intl.formatMessage(messages.listactivityDescription),
         value: Notification.LIST_ACTIVITY,
         hasNotifyUser: true,
+        // Only to list members via their own settings, never a channel.
+        hidden: !user,
+        personal: true,
+      },
+      {
+        id: 'playlist-update',
+        name: intl.formatMessage(messages.playlistUpdate),
+        description: intl.formatMessage(messages.playlistUpdateDescription),
+        value: Notification.PLAYLIST_UPDATE,
+        hasNotifyUser: true,
+        hidden: !user,
+        personal: true,
+      },
+      {
+        id: 'leaving-soon',
+        name: intl.formatMessage(messages.leavingSoon),
+        description: intl.formatMessage(messages.leavingSoonDescription),
+        value: Notification.LEAVING_SOON,
+        hasNotifyUser: true,
+        hidden: !user,
+        personal: true,
       },
       {
         id: 'media-available',
@@ -309,6 +343,15 @@ const NotificationTypeSelector = ({
         value: Notification.MEDIA_FAILED,
         hidden: user && !hasPermission(Permission.MANAGE_REQUESTS),
         hasNotifyUser: false,
+      },
+      {
+        id: 'request-failed',
+        name: intl.formatMessage(messages.requestFailed),
+        description: intl.formatMessage(messages.requestFailedDescription),
+        value: Notification.REQUEST_FAILED,
+        hasNotifyUser: true,
+        hidden: !user,
+        personal: true,
       },
       {
         id: 'issue-created',
@@ -338,8 +381,7 @@ const NotificationTypeSelector = ({
           !hasPermission([Permission.MANAGE_ISSUES, Permission.CREATE_ISSUES], {
             type: 'or',
           }),
-        hasNotifyUser:
-          !user || hasPermission(Permission.MANAGE_ISSUES) ? false : true,
+        hasNotifyUser: !!user && !hasPermission(Permission.MANAGE_ISSUES),
       },
       {
         id: 'issue-resolved',
@@ -357,8 +399,7 @@ const NotificationTypeSelector = ({
           !hasPermission([Permission.MANAGE_ISSUES, Permission.CREATE_ISSUES], {
             type: 'or',
           }),
-        hasNotifyUser:
-          !user || hasPermission(Permission.MANAGE_ISSUES) ? false : true,
+        hasNotifyUser: !!user && !hasPermission(Permission.MANAGE_ISSUES),
       },
       {
         id: 'issue-reopened',
@@ -376,8 +417,7 @@ const NotificationTypeSelector = ({
           !hasPermission([Permission.MANAGE_ISSUES, Permission.CREATE_ISSUES], {
             type: 'or',
           }),
-        hasNotifyUser:
-          !user || hasPermission(Permission.MANAGE_ISSUES) ? false : true,
+        hasNotifyUser: !!user && !hasPermission(Permission.MANAGE_ISSUES),
       },
       {
         id: 'backfill',
@@ -399,21 +439,54 @@ const NotificationTypeSelector = ({
         hidden: user && !hasPermission(Permission.ADMIN),
         hasNotifyUser: false,
       },
+      {
+        id: 'wrong-match',
+        name: intl.formatMessage(messages.wrongMatch),
+        description: intl.formatMessage(
+          user
+            ? messages.userwrongMatchDescription
+            : messages.wrongMatchDescription
+        ),
+        value: Notification.WRONG_MATCH,
+        hidden: user && !hasPermission(Permission.ADMIN),
+        hasNotifyUser: false,
+      },
     ];
 
-    const filteredTypes = types.filter(
-      (type) => !type.hidden && hasNotificationType(type.value, enabledTypes)
+    const shown = types.filter((type) => !type.hidden);
+    const filteredTypes = (
+      channel ? shown.filter((type) => !type.personal) : shown
+    ).flatMap((type) =>
+      hasNotificationType(type.value, enabledTypes)
+        ? [type]
+        : // Nothing enabled means the service isn't set up, which it says.
+          channel && enabledTypes
+          ? [{ ...type, turnedOff: true }]
+          : []
     );
 
-    const newAllowedTypes = filteredTypes.reduce((a, v) => a + v.value, 0);
+    const newAllowedTypes = filteredTypes
+      .filter((type) => !type.turnedOff)
+      .reduce((a, v) => a + v.value, 0);
     if (newAllowedTypes !== allowedTypes) {
       setAllowedTypes(newAllowedTypes);
     }
 
-    return user
-      ? sortBy(filteredTypes, 'hasNotifyUser', 'DESC')
-      : filteredTypes;
-  }, [user, hasPermission, settings, intl, allowedTypes, enabledTypes]);
+    // Admin-disabled types go last.
+    return sortBy(
+      filteredTypes,
+      (type) => (type.turnedOff ? 1 : 0),
+      ...(user ? [(type: NotificationItem) => type.hasNotifyUser] : [])
+    );
+  }, [
+    user,
+    hasPermission,
+    settings,
+    intl,
+    allowedTypes,
+    enabledTypes,
+    channel,
+  ]);
 
   if (!availableTypes.length) {
     return null;
@@ -434,6 +507,7 @@ const NotificationTypeSelector = ({
                 option={type}
                 currentTypes={currentTypes}
                 onUpdate={onUpdate}
+                turnedOffNote={intl.formatMessage(messages.turnedOff)}
               />
             ))}
           </div>

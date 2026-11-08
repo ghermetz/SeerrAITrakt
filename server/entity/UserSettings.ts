@@ -1,5 +1,13 @@
+import type { UserDefaultProfile } from '@server/constants/requestDefaults';
+import { cleanDefaultProfiles } from '@server/constants/requestDefaults';
+import type { Appearance } from '@server/constants/theme';
+import { cleanAppearance } from '@server/constants/theme';
 import type { NotificationAgentTypes } from '@server/interfaces/api/userSettingsInterfaces';
-import { hasNotificationType, Notification } from '@server/lib/notifications';
+import {
+  hasNotificationType,
+  Notification,
+  WEB_PUSH_STARTING_TYPES,
+} from '@server/lib/notifications';
 import { NotificationAgentKey } from '@server/lib/settings';
 import {
   Column,
@@ -14,7 +22,7 @@ export const ALL_NOTIFICATIONS = Object.values(Notification)
   .filter((v) => !isNaN(Number(v)))
   .reduce((a, v) => a + Number(v), 0);
 
-// convert between DB representation (JSON string) into typescript array
+// Converts between the DB's JSON string and a string array.
 const jsonArrayTransformer = {
   from: (v: string | null): string[] => {
     try {
@@ -27,7 +35,7 @@ const jsonArrayTransformer = {
     v?.length ? JSON.stringify(v) : null,
 };
 
-/** The same, for a list of numbers. */
+/** Likewise, for a number array. */
 const jsonNumberArrayTransformer = {
   from: (v: string | null): number[] => {
     try {
@@ -41,6 +49,34 @@ const jsonNumberArrayTransformer = {
   },
   to: (v: number[] | null): string | null =>
     v?.length ? JSON.stringify(v) : null,
+};
+
+/** Saved default quality profiles as JSON; none when unreadable. */
+const defaultProfilesTransformer = {
+  from: (v: string | null): UserDefaultProfile[] => {
+    try {
+      return v ? cleanDefaultProfiles(JSON.parse(v)) : [];
+    } catch {
+      return [];
+    }
+  },
+  to: (
+    v: UserDefaultProfile[] | null | undefined
+  ): string | null | undefined =>
+    v === undefined ? undefined : v?.length ? JSON.stringify(v) : null,
+};
+
+/** A user's look as JSON; null (or anything unreadable) for none. */
+const appearanceTransformer = {
+  from: (v: string | null): Appearance | null => {
+    try {
+      return (v && cleanAppearance(JSON.parse(v))) || null;
+    } catch {
+      return null;
+    }
+  },
+  to: (v: Appearance | null | undefined): string | null | undefined =>
+    v === undefined ? undefined : v ? JSON.stringify(v) : null,
 };
 
 @Entity()
@@ -95,11 +131,11 @@ export class UserSettings {
   @Column({ nullable: true })
   public telegramSendSilently?: boolean;
 
-  /** Optional features (see constants/features) this person turned off. */
+  /** Optional features (see constants/features) this user turned off. */
   @Column({ type: 'text', nullable: true, transformer: jsonArrayTransformer })
   public disabledFeatures: string[];
 
-  /** Home page rows (discover slider ids) this person hid for themselves. */
+  /** Home page rows (discover slider ids) this user hid. */
   @Column({
     type: 'text',
     nullable: true,
@@ -108,15 +144,48 @@ export class UserSettings {
   public hiddenSliders: number[];
 
   /**
-   * This person's own list for the Networks row, as JSON (see
-   * server/constants/discoverNetworks.ts); null for the usual list.
+   * This user's Networks row list as JSON (see
+   * server/constants/discoverNetworks.ts); null for the default.
    */
   @Column({ type: 'text', nullable: true })
   public discoverNetworks?: string | null;
 
   /**
-   * Their Trakt username, for requesting what is on their public Trakt
-   * watchlist (with watchlistSyncMovies / watchlistSyncTv, as for Plex).
+   * This user's sidebar and phone menu order as item names (see
+   * server/constants/navigation.ts); empty for the default.
+   */
+  @Column({ type: 'text', nullable: true, transformer: jsonArrayTransformer })
+  public sidebarOrder: string[];
+
+  /** Sidebar and phone menu items this user hid. */
+  @Column({ type: 'text', nullable: true, transformer: jsonArrayTransformer })
+  public sidebarHidden: string[];
+
+  /**
+   * This user's look (Profile → Settings → Appearance); null for the server
+   * default.
+   */
+  @Column({ type: 'text', nullable: true, transformer: appearanceTransformer })
+  public appearance?: Appearance | null;
+
+  /**
+   * Their answer to a seasonal theme's first-time note: '<season>-<start
+   * year>:keep' or ':off' (server/lib/seasons).
+   */
+  @Column({ type: 'text', nullable: true })
+  public seasonNote?: string | null;
+
+  /**
+   * This user's CSS (Profile → Settings → Appearance), used only while an admin
+   * allows personal CSS; checked by checkPersonalCss before storing and again
+   * when served.
+   */
+  @Column({ type: 'text', nullable: true })
+  public customCss?: string | null;
+
+  /**
+   * Trakt username, for requesting their public Trakt watchlist (with
+   * watchlistSyncMovies / watchlistSyncTv, as for Plex).
    */
   @Column({ type: 'text', nullable: true })
   public traktUsername?: string | null;
@@ -126,6 +195,18 @@ export class UserSettings {
 
   @Column({ nullable: true })
   public watchlistSyncTv?: boolean;
+
+  /**
+   * Quality profiles this person picked for their own requests, per server
+   * (constants/requestDefaults). Used only while they may choose advanced
+   * request options.
+   */
+  @Column({
+    type: 'text',
+    nullable: true,
+    transformer: defaultProfilesTransformer,
+  })
+  public defaultProfiles?: UserDefaultProfile[];
 
   @Column({
     type: 'text',
@@ -140,7 +221,7 @@ export class UserSettings {
           slack: 0,
           telegram: 0,
           webhook: 0,
-          webpush: ALL_NOTIFICATIONS,
+          webpush: WEB_PUSH_STARTING_TYPES,
         };
         if (!value) {
           return defaultTypes;
@@ -148,9 +229,8 @@ export class UserSettings {
 
         const values = JSON.parse(value) as Partial<NotificationAgentTypes>;
 
-        // Something with the migration to this field has caused some issue where
-        // the value pre-populates with just a raw "2"? Here we check if that's the case
-        // and return the default notification types if so
+        // A past migration sometimes left a raw "2" here; fall back to the
+        // default types.
         if (typeof values !== 'object') {
           return defaultTypes;
         }
@@ -160,7 +240,7 @@ export class UserSettings {
         }
 
         if (values.webpush == null) {
-          values.webpush = ALL_NOTIFICATIONS;
+          values.webpush = WEB_PUSH_STARTING_TYPES;
         }
 
         return values;
@@ -172,7 +252,7 @@ export class UserSettings {
 
         const allowedKeys = Object.values(NotificationAgentKey);
 
-        // Remove any unknown notification agent keys before saving to db
+        // Drop unknown notification agent keys before saving.
         (Object.keys(value) as (keyof NotificationAgentTypes)[]).forEach(
           (key) => {
             if (!allowedKeys.includes(key)) {

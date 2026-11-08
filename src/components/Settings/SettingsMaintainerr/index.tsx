@@ -18,7 +18,7 @@ import useSWR, { useSWRConfig } from 'swr';
 const messages = defineMessages('components.Settings.SettingsMaintainerr', {
   maintainerrSettings: 'Maintainerr Settings',
   maintainerrSettingsDescription:
-    'Connect Maintainerr to warn people before titles are deleted and let them keep what they are still watching. Each server has its own features.',
+    'Warns people before titles are deleted, and lets them keep what they’re watching.',
   addmaintainerr: 'Add Maintainerr Server',
   features: 'Features',
   badges: 'Badges',
@@ -31,9 +31,8 @@ const messages = defineMessages('components.Settings.SettingsMaintainerr', {
 });
 
 /*
- * Maintainerr servers, laid out like the Radarr and Sonarr sections: a tile per
- * server with Edit and Delete, a dashed tile to add one, and a dialog for the
- * details.
+ * Maintainerr servers, laid out like Radarr and Sonarr: a tile per server with
+ * Edit and Delete, a dashed tile to add one, and a dialog for the details.
  */
 const SettingsMaintainerr = () => {
   const intl = useIntl();
@@ -135,7 +134,9 @@ const SettingsMaintainerr = () => {
                 hostname={server.hostname}
                 port={server.port}
                 isSSL={server.useSsl}
-                logo={<MaintainerrLogo className="h-10 w-10 flex-shrink-0" />}
+                logo={
+                  <MaintainerrLogo className="service-logo h-10 w-10 flex-shrink-0" />
+                }
                 detail={{
                   label: intl.formatMessage(messages.features),
                   value: featureList(server),

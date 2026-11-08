@@ -9,9 +9,18 @@ import TmdbLogo from '@app/assets/services/tmdb.svg';
 import TraktLogo from '@app/assets/services/trakt.svg';
 import TvdbLogo from '@app/assets/services/tvdb.svg';
 import useLocale from '@app/hooks/useLocale';
-import useSettings from '@app/hooks/useSettings';
+import type { PlayLink } from '@app/utils/playLinks';
 import { MediaType } from '@server/constants/media';
-import { MediaServerType } from '@server/constants/server';
+import type { MediaServerKind } from '@server/constants/server';
+
+const SERVER_LOGOS: Record<
+  MediaServerKind,
+  React.FC<React.SVGProps<SVGSVGElement>>
+> = {
+  plex: PlexLogo,
+  jellyfin: JellyfinLogo,
+  emby: EmbyLogo,
+};
 
 type ExternalLinkType = 'movie' | 'tv' | 'person';
 
@@ -21,7 +30,8 @@ interface ExternalLinkBlockProps {
   tvdbId?: number;
   imdbId?: string;
   rtUrl?: string;
-  mediaUrl?: string;
+  /** Links to the title on each media server that has it (usePlayLinks). */
+  playLinks?: PlayLink[];
 }
 
 const ExternalLinkBlock = ({
@@ -30,91 +40,84 @@ const ExternalLinkBlock = ({
   tvdbId,
   imdbId,
   rtUrl,
-  mediaUrl,
+  playLinks = [],
 }: ExternalLinkBlockProps) => {
-  const settings = useSettings();
   const { locale } = useLocale();
 
   return (
     <div className="flex w-full items-center justify-center space-x-2 sm:space-x-5">
-      {mediaUrl && (
-        <a
-          href={mediaUrl}
-          aria-label={
-            settings.currentSettings.mediaServerType === MediaServerType.PLEX
-              ? 'Plex'
-              : settings.currentSettings.mediaServerType ===
-                  MediaServerType.EMBY
-                ? 'Emby'
-                : 'Jellyfin'
-          }
-          className="w-12 opacity-50 transition duration-300 hover:opacity-100"
-          target="_blank"
-          rel="noreferrer"
-        >
-          {settings.currentSettings.mediaServerType === MediaServerType.PLEX ? (
-            <PlexLogo />
-          ) : settings.currentSettings.mediaServerType ===
-            MediaServerType.EMBY ? (
-            <EmbyLogo />
-          ) : (
-            <JellyfinLogo />
-          )}
-        </a>
-      )}
+      {playLinks.map((link) => {
+        const url = link.url ?? link.url4k;
+        if (!url) {
+          return null;
+        }
+        const Logo = SERVER_LOGOS[link.server];
+        return (
+          <a
+            key={link.server}
+            href={url}
+            aria-label={link.name}
+            className="external-link w-12"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <Logo className="service-logo" />
+          </a>
+        );
+      })}
       {tmdbId && (
         <a
           aria-label="TMDB"
           href={`https://www.themoviedb.org/${mediaType}/${tmdbId}?language=${locale}`}
-          className="w-8 opacity-50 transition duration-300 hover:opacity-100"
+          className="external-link w-8"
           target="_blank"
           rel="noreferrer"
         >
-          <TmdbLogo />
+          <TmdbLogo className="service-logo" />
         </a>
       )}
       {tvdbId && mediaType === MediaType.TV && (
         <a
           aria-label="TheTVDB"
           href={`http://www.thetvdb.com/?tab=series&id=${tvdbId}`}
-          className="w-9 opacity-50 transition duration-300 hover:opacity-100"
+          className="external-link w-9"
           target="_blank"
           rel="noreferrer"
         >
-          <TvdbLogo />
+          <TvdbLogo className="service-logo" />
         </a>
       )}
       {imdbId && mediaType !== 'person' && (
         <a
           aria-label="IMDb"
           href={`https://www.imdb.com/title/${imdbId}`}
-          className="w-8 opacity-50 transition duration-300 hover:opacity-100"
+          className="external-link w-8"
           target="_blank"
           rel="noreferrer"
         >
-          <ImdbLogo />
+          <ImdbLogo className="service-logo" />
         </a>
       )}
       {imdbId && mediaType === 'person' && (
         <a
           aria-label="IMDb"
           href={`https://www.imdb.com/name/${imdbId}`}
-          className="w-8 opacity-50 transition duration-300 hover:opacity-100"
+          className="external-link w-8"
           target="_blank"
           rel="noreferrer"
         >
-          <ImdbLogo />
+          <ImdbLogo className="service-logo" />
         </a>
       )}
       {rtUrl && (
         <a
           aria-label="Rotten Tomatoes"
           href={rtUrl}
-          className="w-14 opacity-50 transition duration-300 hover:opacity-100"
+          className="external-link w-14"
           target="_blank"
           rel="noreferrer"
         >
-          <RTLogo />
+          <RTLogo className="service-logo" />
         </a>
       )}
       {imdbId && mediaType !== 'person' && (
@@ -123,11 +126,11 @@ const ExternalLinkBlock = ({
           href={`https://trakt.tv/${
             mediaType === 'movie' ? 'movies' : 'shows'
           }/${imdbId}`}
-          className="w-8 opacity-50 transition duration-300 hover:opacity-100"
+          className="external-link w-8"
           target="_blank"
           rel="noreferrer"
         >
-          <TraktLogo />
+          <TraktLogo className="service-logo" />
         </a>
       )}
       {imdbId && mediaType !== 'person' && (
@@ -136,22 +139,22 @@ const ExternalLinkBlock = ({
             imdbId
           )}`}
           aria-label="Simkl"
-          className="w-8 opacity-50 transition duration-300 hover:opacity-100"
+          className="external-link w-8"
           target="_blank"
           rel="noreferrer"
         >
-          <SimklLogo />
+          <SimklLogo className="service-logo" />
         </a>
       )}
       {tmdbId && mediaType === MediaType.MOVIE && (
         <a
           aria-label="Letterboxd"
           href={`https://letterboxd.com/tmdb/${tmdbId}`}
-          className="w-8 opacity-50 transition duration-300 hover:opacity-100"
+          className="external-link w-8"
           target="_blank"
           rel="noreferrer"
         >
-          <LetterboxdLogo />
+          <LetterboxdLogo className="service-logo" />
         </a>
       )}
     </div>

@@ -1,6 +1,7 @@
 import Alert from '@app/components/Common/Alert';
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
+import SaveBar from '@app/components/Common/SaveBar';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
@@ -21,8 +22,7 @@ const messages = defineMessages(
     toastWebPushTestSending: 'Sending web push test notification…',
     toastWebPushTestSuccess: 'Web push test notification sent!',
     toastWebPushTestFailed: 'Web push test notification failed to send.',
-    httpsRequirement:
-      'In order to receive web push notifications, Seerr AI must be served over HTTPS.',
+    httpsRequirement: 'Web push needs Seerr AI served over HTTPS.',
   }
 );
 
@@ -141,7 +141,7 @@ const NotificationsWebPush = () => {
                   <Field type="checkbox" id="embedPoster" name="embedPoster" />
                 </div>
               </div>
-              <div className="actions">
+              <SaveBar>
                 <div className="flex justify-end">
                   <span className="ml-3 inline-flex rounded-md shadow-sm">
                     <Button
@@ -175,7 +175,7 @@ const NotificationsWebPush = () => {
                     </Button>
                   </span>
                 </div>
-              </div>
+              </SaveBar>
             </Form>
           );
         }}

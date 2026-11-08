@@ -1,6 +1,7 @@
 import TheMovieDb from '@server/api/themoviedb';
 import { DiscoverSliderType, defaultSliders } from '@server/constants/discover';
 import { MediaStatus, MediaType } from '@server/constants/media';
+import { MediaServerType } from '@server/constants/server';
 import { getRepository } from '@server/datasource';
 import DiscoverSlider from '@server/entity/DiscoverSlider';
 import Media from '@server/entity/Media';
@@ -18,7 +19,7 @@ import path from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
 /*
- * "Suggested for you": a fake Tautulli's history and stubbed TMDB
+ * "Suggested for you": a fake Tautulli history and stubbed TMDB
  * recommendations, behind the real API validator.
  */
 
@@ -37,7 +38,7 @@ const fake = http.createServer((_req, res) => {
   );
 });
 
-// TMDB recommendations, by the title asked about.
+// TMDB recommendations by source title.
 let movieRecs: Record<number, { id: number; adult?: boolean }[]> = {};
 let tvRecs: Record<number, { id: number }[]> = {};
 let tmdbAsks = 0;
@@ -92,7 +93,7 @@ stub('getTvRecommendations', async ({ tvId }: { tvId: number }) => {
 let app: Server;
 let port: number;
 let actingAs: User;
-// Suggestions are kept a day per Plex account, so each test uses its own.
+// Suggestions are cached a day per Plex account, so each test uses its own.
 let nextPlexId = 1000;
 
 before(async () => {
@@ -127,6 +128,8 @@ beforeEach(async () => {
   movieRecs = {};
   tvRecs = {};
   tmdbAsks = 0;
+  // Tautulli is Plex's watch history, read while Plex is connected.
+  getSettings().main.mediaServerType = MediaServerType.PLEX;
   getSettings().tautulli = {
     hostname: '127.0.0.1',
     port: (fake.address() as { port: number }).port,
@@ -190,7 +193,7 @@ const ids = (results: { id: number; mediaType: string }[]) =>
 
 describe('GET /discover/suggested', () => {
   it('is empty, not an error, without Tautulli', async () => {
-    // The setter merges, so each field is cleared.
+    // The setter merges, so clear each field.
     getSettings().tautulli = {
       hostname: '',
       port: undefined,
@@ -219,8 +222,8 @@ describe('GET /discover/suggested', () => {
     await library(20, MediaType.TV, '220');
     // The series counts through its episode, by the show's rating key.
     history = [moviePlay(110), episodePlay(220, 2201), moviePlay(111)];
-    // 500 is recommended by both films, so it outranks what only one points
-    // to, even the most recent watch's first pick.
+    // 500 is recommended by both films, so it outranks single recommendations,
+    // even the latest watch's top pick.
     movieRecs = { 10: [{ id: 400 }, { id: 500 }], 11: [{ id: 500 }] };
     tvRecs = { 20: [{ id: 600 }] };
 
@@ -236,7 +239,7 @@ describe('GET /discover/suggested', () => {
   it('leaves out anything already started, finished or not', async () => {
     await library(10, MediaType.MOVIE, '110');
     await library(11, MediaType.MOVIE, '111');
-    // 11 was started and abandoned: never a seed, and never suggested.
+    // 11 was started and abandoned: never a seed, never suggested.
     history = [moviePlay(110), moviePlay(111, 0)];
     movieRecs = { 10: [{ id: 11 }, { id: 12 }], 11: [{ id: 99 }] };
 
@@ -346,7 +349,7 @@ describe('the Suggested for You row', () => {
   it('goes straight after the watchlist when added to an existing home page', async () => {
     const repository = getRepository(DiscoverSlider);
     await repository.clear();
-    // The home page as it was before this row existed, with a custom row.
+    // The home page from before this row existed, with a custom row.
     let order = 0;
     for (const slider of defaultSliders) {
       if (slider.type !== DiscoverSliderType.SUGGESTED) {
@@ -381,5 +384,43 @@ describe('the Suggested for You row', () => {
       'no two rows share a position'
     );
     assert.equal(types[types.length - 1], DiscoverSliderType.TMDB_SEARCH);
+  });
+});
+
+describe('the Anime row', () => {
+  it('keeps a number of its own, past those Seerr uses', () => {
+    // Stored in the database: reusing a taken number would turn existing rows
+    // into this one.
+    assert.equal(DiscoverSliderType.ANIME, 24);
+  });
+
+  it('goes after Upcoming Series when added to an existing home page', async () => {
+    const repository = getRepository(DiscoverSlider);
+    await repository.clear();
+    let order = 0;
+    for (const slider of defaultSliders) {
+      if (slider.type !== DiscoverSliderType.ANIME) {
+        await repository.save(
+          new DiscoverSlider({ ...slider, order: order++ })
+        );
+      }
+    }
+
+    await DiscoverSlider.bootstrapSliders();
+
+    const sliders = await repository.find({ order: { order: 'ASC' } });
+    const types = sliders.map((s) => s.type);
+    const at = types.indexOf(DiscoverSliderType.ANIME);
+    assert.deepEqual(types.slice(at - 1, at + 2), [
+      DiscoverSliderType.UPCOMING_TV,
+      DiscoverSliderType.ANIME,
+      DiscoverSliderType.NETWORKS,
+    ]);
+    assert.equal(sliders[at].enabled, true);
+    assert.equal(
+      new Set(sliders.map((s) => s.order)).size,
+      sliders.length,
+      'no two rows share a position'
+    );
   });
 });

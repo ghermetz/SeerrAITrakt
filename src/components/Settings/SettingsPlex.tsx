@@ -3,7 +3,11 @@ import Badge from '@app/components/Common/Badge';
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import PageTitle from '@app/components/Common/PageTitle';
+import SaveBar from '@app/components/Common/SaveBar';
 import LibraryItem from '@app/components/Settings/LibraryItem';
+import MusicLibraries, {
+  musicLibrariesKey,
+} from '@app/components/Settings/MusicLibraries';
 import SettingsBadge from '@app/components/Settings/SettingsBadge';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
@@ -19,16 +23,17 @@ import type { PlexSettings } from '@server/lib/settings';
 import axios from 'axios';
 import { Field, Formik } from 'formik';
 import orderBy from 'lodash/orderBy';
+import Link from 'next/link';
 import { useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
-import useSWR from 'swr';
+import useSWR, { mutate } from 'swr';
 import * as Yup from 'yup';
 
 const messages = defineMessages('components.Settings', {
   plex: 'Plex',
   plexsettings: 'Plex Settings',
   plexsettingsDescription:
-    'Configure the settings for your Plex server. Seerr AI scans your Plex libraries to determine content availability.',
+    'Seerr AI scans your Plex libraries to see what’s available.',
   serverpreset: 'Server',
   serverLocal: 'local',
   serverRemote: 'remote',
@@ -46,19 +51,19 @@ const messages = defineMessages('components.Settings', {
   toastPlexConnectingSuccess: 'Plex connection established successfully!',
   toastPlexConnectingFailure: 'Failed to connect to Plex.',
   settingUpPlexDescription:
-    'To set up Plex, you can either enter the details manually or select a server retrieved from <RegisterPlexTVLink>plex.tv</RegisterPlexTVLink>. Press the button to the right of the dropdown to fetch the list of available servers.',
+    'Enter the details by hand, or pick a server from <RegisterPlexTVLink>plex.tv</RegisterPlexTVLink> with the button beside the list.',
   hostname: 'Hostname or IP Address',
   port: 'Port',
   enablessl: 'Use SSL',
   plexlibraries: 'Plex Libraries',
   plexlibrariesDescription:
-    'The libraries Seerr AI scans for titles. Set up and save your Plex connection settings, then click the button below if no libraries are listed.',
+    'The libraries Seerr AI scans. Save your Plex settings, then use the button below if none are listed.',
   scanning: 'Syncing…',
   refreshServers: 'Refresh Server List',
   scan: 'Sync Libraries',
   manualscan: 'Manual Library Scan',
   manualscanDescription:
-    "Normally, this will only be run once every 24 hours. Seerr AI will check your Plex server's recently added more aggressively. If this is your first time configuring Plex, a one-time full manual library scan is recommended!",
+    'Runs once a day; recently added items are checked more often. Do a full scan after first setup.',
   notrunning: 'Not Running',
   currentlibrary: 'Current Library: {name}',
   librariesRemaining: 'Libraries Remaining: {count}',
@@ -68,7 +73,7 @@ const messages = defineMessages('components.Settings', {
   validationPortRequired: 'You must provide a valid port number',
   webAppUrl: '<WebAppLink>Web App</WebAppLink> URL',
   webAppUrlTip:
-    'Optionally direct users to the web app on your server instead of https://app.plex.tv/desktop',
+    'Optional: send people to your server’s web app instead of https://app.plex.tv/desktop',
   urlBase: 'URL Base',
   externalUrl: 'External URL',
   validationApiKey: 'You must provide an API key',
@@ -76,6 +81,8 @@ const messages = defineMessages('components.Settings', {
   validationUrlTrailingSlash: 'URL must not end in a trailing slash',
   validationUrlBaseLeadingSlash: 'URL base must have a leading slash',
   validationUrlBaseTrailingSlash: 'URL base must not end in a trailing slash',
+  plexNotConnected:
+    'Seerr AI is not connected to Plex. Connect it under <MediaServersLink>Media Servers</MediaServersLink>.',
 });
 
 interface Library {
@@ -183,6 +190,7 @@ const SettingsPlex = ({ isSetupSettings }: SettingsPlexProps) => {
     } finally {
       setIsSyncing(false);
       revalidate();
+      mutate(musicLibrariesKey('/api/v1/settings/plex'));
     }
   };
 
@@ -273,6 +281,23 @@ const SettingsPlex = ({ isSetupSettings }: SettingsPlexProps) => {
         <p className="description">
           {intl.formatMessage(messages.plexsettingsDescription)}
         </p>
+        {!isSetupSettings && data?.connected === false && (
+          <div className="section">
+            <Alert
+              type="warning"
+              title={intl.formatMessage(messages.plexNotConnected, {
+                MediaServersLink: (msg: React.ReactNode) => (
+                  <Link
+                    href="/settings/media-servers"
+                    className="text-strong transition duration-300 hover:underline"
+                  >
+                    {msg}
+                  </Link>
+                ),
+              })}
+            />
+          </div>
+        )}
         {isSetupSettings && (
           <div className="section">
             <Alert
@@ -280,7 +305,7 @@ const SettingsPlex = ({ isSetupSettings }: SettingsPlexProps) => {
                 RegisterPlexTVLink: (msg: React.ReactNode) => (
                   <a
                     href="https://plex.tv"
-                    className="text-white transition duration-300 hover:underline"
+                    className="text-strong transition duration-300 hover:underline"
                     target="_blank"
                     rel="noreferrer"
                   >
@@ -478,7 +503,7 @@ const SettingsPlex = ({ isSetupSettings }: SettingsPlexProps) => {
                 </div>
               </div>
               <div className="form-row">
-                <label htmlFor="ssl" className="checkbox-label">
+                <label htmlFor="useSsl" className="checkbox-label">
                   {intl.formatMessage(messages.enablessl)}
                 </label>
                 <div className="form-input-area">
@@ -517,7 +542,7 @@ const SettingsPlex = ({ isSetupSettings }: SettingsPlexProps) => {
                       inputMode="url"
                       id="webAppUrl"
                       name="webAppUrl"
-                      placeholder="https://your-server-fqdn.com/web/index.html"
+                      placeholder="https://plex.example.com/web/index.html"
                     />
                   </div>
                   {errors.webAppUrl &&
@@ -527,7 +552,7 @@ const SettingsPlex = ({ isSetupSettings }: SettingsPlexProps) => {
                     )}
                 </div>
               </div>
-              <div className="actions">
+              <SaveBar>
                 <div className="flex justify-end">
                   <span className="ml-3 inline-flex rounded-md shadow-sm">
                     <Button
@@ -544,7 +569,7 @@ const SettingsPlex = ({ isSetupSettings }: SettingsPlexProps) => {
                     </Button>
                   </span>
                 </div>
-              </div>
+              </SaveBar>
             </form>
           );
         }}
@@ -583,6 +608,10 @@ const SettingsPlex = ({ isSetupSettings }: SettingsPlexProps) => {
           ))}
         </ul>
       </div>
+      <MusicLibraries
+        endpoint="/api/v1/settings/plex"
+        isSetup={isSetupSettings}
+      />
       <div className="mb-6 mt-10">
         <h3 className="heading">{intl.formatMessage(messages.manualscan)}</h3>
         <p className="description">
@@ -594,7 +623,7 @@ const SettingsPlex = ({ isSetupSettings }: SettingsPlexProps) => {
           <div className="relative mb-6 h-8 w-full overflow-hidden rounded-full bg-gray-600">
             {dataSync?.running && (
               <div
-                className="h-8 bg-indigo-600 transition-all duration-200 ease-in-out"
+                className="h-8 bg-accent transition-all duration-200 ease-in-out"
                 style={{
                   width: `${Math.round(
                     (dataSync.progress / dataSync.total) * 100

@@ -47,6 +47,11 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
     databaseEvent: Media,
     is4k: boolean
   ) {
+    // Music requests are completed per album by the music scans
+    // (lib/music/completion), not from the artist's status.
+    if (event.mediaType === MediaType.MUSIC) {
+      return;
+    }
     const requestRepository = manager.getRepository(MediaRequest);
     const seasonRequestRepository = manager.getRepository(SeasonRequest);
 
@@ -61,8 +66,7 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
       },
     });
 
-    // Check the media entity status and if available
-    // or deleted, set the related request to completed
+    // Complete related requests when the media is available or deleted.
     if (relatedRequests.length > 0) {
       const completedRequests: MediaRequest[] = [];
 
@@ -80,7 +84,7 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
         } else if (event.mediaType === 'tv') {
           const allSeasonResults: boolean[] = [];
 
-          // Sequential on purpose as these saves share the transaction's connection
+          // Sequential: these saves share the transaction's connection.
           for (const requestSeason of request.seasons) {
             const matchingSeason = event.seasons.find(
               (mediaSeason) =>
@@ -131,7 +135,13 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
         }
       }
 
-      await requestRepository.save(completedRequests);
+      // One at a time: saving together runs every request's afterUpdate
+      // concurrently on this connection, and on Postgres their savepoints undo
+      // each other, aborting the scan's save and losing the "available"
+      // notifications.
+      for (const request of completedRequests) {
+        await requestRepository.save(request);
+      }
     }
   }
 
@@ -140,8 +150,15 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
       return;
     }
 
+    // An artist is available once every wanted album is, which says nothing
+    // about a pending request's albums: those still await approval.
+    const isMusic =
+      (event.entity.mediaType ?? event.databaseEntity.mediaType) ===
+      MediaType.MUSIC;
+
     try {
       if (
+        !isMusic &&
         event.entity.status === MediaStatus.AVAILABLE &&
         event.databaseEntity?.status === MediaStatus.PENDING
       ) {
@@ -167,6 +184,7 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
 
     try {
       if (
+        !isMusic &&
         event.entity.status4k === MediaStatus.AVAILABLE &&
         event.databaseEntity?.status4k === MediaStatus.PENDING
       ) {
@@ -190,8 +208,7 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
       );
     }
 
-    // Manually load related seasons into databaseEntity
-    // for seasonStatusCheck in afterUpdate
+    // Load seasons into databaseEntity for seasonStatusCheck in afterUpdate.
     const seasons = await event.manager
       .getRepository(Season)
       .createQueryBuilder('season')
@@ -207,9 +224,8 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
       return;
     }
 
-    // The title's part of its history: when it started processing, became
-    // available, or left the library. Blocklisting is recorded where it
-    // happens, with who did it and why.
+    // Record status changes in the title's history: processing, available, or
+    // removed. Blocklisting is recorded where it happens, with who and why.
     const statusEvents: Partial<Record<MediaStatus, MediaEventType>> = {
       [MediaStatus.PROCESSING]: MediaEventType.PROCESSING,
       [MediaStatus.PARTIALLY_AVAILABLE]: MediaEventType.PARTIALLY_AVAILABLE,
@@ -224,10 +240,15 @@ export class MediaSubscriber implements EntitySubscriberInterface<Media> {
       const tmdbId =
         (event.entity as Media).tmdbId ??
         (event.databaseEntity as Media).tmdbId;
-      if (type && tmdbId) {
+      // Music is keyed by the artist's MusicBrainz id (its tmdbId is 0).
+      const foreignId =
+        (event.entity as Media).foreignId ??
+        (event.databaseEntity as Media).foreignId;
+      if (type && (tmdbId || foreignId)) {
         await recordMediaEvent(
           {
             tmdbId,
+            foreignId,
             mediaType:
               (event.entity as Media).mediaType ??
               (event.databaseEntity as Media).mediaType,

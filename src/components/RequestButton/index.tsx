@@ -1,10 +1,14 @@
 import ButtonWithDropdown from '@app/components/Common/ButtonWithDropdown';
+import DeclineRequestModal from '@app/components/DeclineRequestModal';
 import RequestModal from '@app/components/RequestModal';
 import usePushDeviceState from '@app/hooks/usePushDeviceState';
+import useRequestAction from '@app/hooks/useRequestAction';
 import useSettings from '@app/hooks/useSettings';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
+import { outsideLibraries } from '@app/utils/outsideLibraries';
+import { oneAfterAnother } from '@app/utils/requestActions';
 import {
   ArrowDownTrayIcon,
   BellAlertIcon,
@@ -78,8 +82,14 @@ const RequestButton = ({
   const [showRequestModal, setShowRequestModal] = useState(false);
   const [showRequest4kModal, setShowRequest4kModal] = useState(false);
   const [editRequest, setEditRequest] = useState(false);
+  // Kept while the dialog fades out so its content doesn't change.
+  const [declining, setDeclining] = useState<{
+    show: boolean;
+    requests: MediaRequest[];
+  }>({ show: false, requests: [] });
+  const declineRequests = (requests: MediaRequest[]) =>
+    setDeclining({ show: true, requests });
 
-  // All pending requests
   const activeRequests = media?.requests.filter(
     (request) => request.status === MediaRequestStatus.PENDING && !request.is4k
   );
@@ -87,14 +97,11 @@ const RequestButton = ({
     (request) => request.status === MediaRequestStatus.PENDING && request.is4k
   );
 
-  // Any request that has not finished yet: a user wants notifying whether it
-  // is still awaiting approval or already downloading. `activeRequest` below
-  // is pending-only, which is not the right set for this.
+  // Any unfinished request, pending or downloading (`activeRequest` is
+  // pending-only).
   const watchableRequest = useMemo(
     () =>
-      // Nothing to wait for once it is here. A request can sit at APPROVED
-      // after the media has landed, which is why the request status alone is
-      // not enough to decide this.
+      // A request can stay APPROVED after the media arrives, so check media status.
       media?.status === MediaStatus.AVAILABLE
         ? undefined
         : media?.requests.find(
@@ -106,7 +113,7 @@ const RequestButton = ({
     [media]
   );
 
-  // Current user's pending request, or the first pending request
+  // The current user's pending request, else the first pending one.
   const activeRequest = useMemo(() => {
     return activeRequests && activeRequests.length > 0
       ? (activeRequests.find(
@@ -122,35 +129,27 @@ const RequestButton = ({
       : undefined;
   }, [active4kRequests, user]);
 
-  const modifyRequest = async (
-    request: MediaRequest,
-    type: 'approve' | 'decline'
-  ) => {
-    const response = await axios.post(`/api/v1/request/${request.id}/${type}`);
+  const { run } = useRequestAction();
 
-    if (response) {
+  const approveRequest = (request: MediaRequest) =>
+    run(async () => {
+      await axios.post(`/api/v1/request/${request.id}/approve`);
       onUpdate();
       globalMutate('/api/v1/request/count');
-    }
-  };
+    });
 
-  const modifyRequests = async (
-    requests: MediaRequest[],
-    type: 'approve' | 'decline'
-  ): Promise<void> => {
-    if (!requests) {
-      return;
-    }
-
-    await Promise.all(
-      requests.map(async (request) => {
-        return axios.post(`/api/v1/request/${request.id}/${type}`);
-      })
-    );
-
-    onUpdate();
-    globalMutate('/api/v1/request/count');
-  };
+  // Sequential, like declining; successes still show if one fails.
+  const approveRequests = (requests: MediaRequest[]) =>
+    run(async () => {
+      const errors = await oneAfterAnother(requests, (request) =>
+        axios.post(`/api/v1/request/${request.id}/approve`)
+      );
+      onUpdate();
+      globalMutate('/api/v1/request/count');
+      if (errors.length) {
+        throw errors[0];
+      }
+    });
 
   const { data: watchState, mutate: revalidateWatch } = useSWR<{
     watching: boolean;
@@ -159,10 +158,9 @@ const RequestButton = ({
   }>(watchableRequest ? `/api/v1/request/${watchableRequest.id}/watch` : null);
 
   const isWatching = watchState?.watching ?? false;
-  // The offer to watch never depends on this fetch: if it is slow or fails,
-  // the button still appears. The fetch only refines it — flipping to
-  // "You Will Be Notified" once watching, or to the enable prompt when the
-  // server has positively reported the user has no notification channel.
+  // The watch button never waits on this fetch; it only refines it (to
+  // "You Will Be Notified", or the enable prompt when the server reports no
+  // notification channel).
   const isUnreachable = watchState?.reachable === false;
   const { state: pushState, subscribe: subscribeToPush } = usePushDeviceState();
 
@@ -170,8 +168,7 @@ const RequestButton = ({
     try {
       await axios.post(`/api/v1/request/${requestId}/watch`);
     } catch (e) {
-      // 400 means no notification channel; let the reachability state take
-      // over so the button becomes the enable prompt.
+      // 400: no notification channel; reachability state shows the enable prompt.
       if (axios.isAxiosError(e) && e.response?.status === 400) {
         revalidateWatch();
         return;
@@ -192,17 +189,14 @@ const RequestButton = ({
 
   const buttons: ButtonOption[] = [];
 
-  // Someone else already requested this, so a second request is refused.
-  // Offer to be notified alongside the original requester instead.
+  // Already requested by someone else: offer to be notified instead.
   if (watchableRequest && user?.id && isUnreachable) {
     buttons.push({
       id: 'enable-notifications',
       text: intl.formatMessage(messages.enablenotifications),
       action: async () => {
-        // This device can be asked for notifications right here. Otherwise
-        // (already asked and refused, not installed, not supported) it is
-        // set up on their notification settings, where every way of being
-        // told is offered.
+        // Ask for push here if possible; otherwise (refused, not installed,
+        // unsupported) send them to notification settings.
         if (pushState === 'prompt') {
           const subscribed = await subscribeToPush();
 
@@ -242,7 +236,7 @@ const RequestButton = ({
     );
   }
 
-  // If there are pending requests, show request management options first
+  // Pending requests: show management options first.
   if (activeRequest || active4kRequest) {
     if (
       activeRequest &&
@@ -271,7 +265,7 @@ const RequestButton = ({
           id: 'approve-request',
           text: intl.formatMessage(messages.approverequest),
           action: () => {
-            modifyRequest(activeRequest, 'approve');
+            approveRequest(activeRequest);
           },
           svg: <CheckIcon />,
         },
@@ -279,7 +273,7 @@ const RequestButton = ({
           id: 'decline-request',
           text: intl.formatMessage(messages.declinerequest),
           action: () => {
-            modifyRequest(activeRequest, 'decline');
+            declineRequests([activeRequest]);
           },
           svg: <XMarkIcon />,
         }
@@ -297,7 +291,7 @@ const RequestButton = ({
             requestCount: activeRequests.length,
           }),
           action: () => {
-            modifyRequests(activeRequests, 'approve');
+            approveRequests(activeRequests);
           },
           svg: <CheckIcon />,
         },
@@ -307,7 +301,7 @@ const RequestButton = ({
             requestCount: activeRequests.length,
           }),
           action: () => {
-            modifyRequests(activeRequests, 'decline');
+            declineRequests(activeRequests);
           },
           svg: <XMarkIcon />,
         }
@@ -341,7 +335,7 @@ const RequestButton = ({
           id: 'approve-4k-request',
           text: intl.formatMessage(messages.approverequest4k),
           action: () => {
-            modifyRequest(active4kRequest, 'approve');
+            approveRequest(active4kRequest);
           },
           svg: <CheckIcon />,
         },
@@ -349,7 +343,7 @@ const RequestButton = ({
           id: 'decline-4k-request',
           text: intl.formatMessage(messages.declinerequest4k),
           action: () => {
-            modifyRequest(active4kRequest, 'decline');
+            declineRequests([active4kRequest]);
           },
           svg: <XMarkIcon />,
         }
@@ -367,7 +361,7 @@ const RequestButton = ({
             requestCount: active4kRequests.length,
           }),
           action: () => {
-            modifyRequests(active4kRequests, 'approve');
+            approveRequests(active4kRequests);
           },
           svg: <CheckIcon />,
         },
@@ -377,7 +371,7 @@ const RequestButton = ({
             requestCount: active4kRequests.length,
           }),
           action: () => {
-            modifyRequests(active4kRequests, 'decline');
+            declineRequests(active4kRequests);
           },
           svg: <XMarkIcon />,
         }
@@ -385,8 +379,10 @@ const RequestButton = ({
     }
   }
 
-  // Standard request button
+  // Standard request button. Not for a title the server has outside the
+  // viewer's libraries: a request would bring nothing they can watch.
   if (
+    !outsideLibraries(media) &&
     (!media ||
       media.status === MediaStatus.UNKNOWN ||
       (media.status === MediaStatus.DELETED && !activeRequest)) &&
@@ -411,6 +407,7 @@ const RequestButton = ({
     });
   } else if (
     mediaType === 'tv' &&
+    !outsideLibraries(media) &&
     (!activeRequest || activeRequest.requestedBy.id !== user?.id) &&
     hasPermission([Permission.REQUEST, Permission.REQUEST_TV], {
       type: 'or',
@@ -432,6 +429,7 @@ const RequestButton = ({
 
   // 4K request button
   if (
+    !outsideLibraries(media, true) &&
     (!media ||
       media.status4k === MediaStatus.UNKNOWN ||
       (media.status4k === MediaStatus.DELETED && !active4kRequest)) &&
@@ -458,6 +456,7 @@ const RequestButton = ({
     });
   } else if (
     mediaType === 'tv' &&
+    !outsideLibraries(media, true) &&
     (!active4kRequest || active4kRequest.requestedBy.id !== user?.id) &&
     hasPermission([Permission.REQUEST_4K, Permission.REQUEST_4K_TV], {
       type: 'or',
@@ -480,12 +479,25 @@ const RequestButton = ({
 
   const [buttonOne, ...others] = buttons;
 
+  const declineModal = (
+    <DeclineRequestModal
+      show={declining.show}
+      requests={declining.requests}
+      onCancel={() => setDeclining((d) => ({ ...d, show: false }))}
+      onComplete={() => {
+        setDeclining((d) => ({ ...d, show: false }));
+        onUpdate();
+      }}
+    />
+  );
+
   if (!buttonOne) {
-    return null;
+    return declineModal;
   }
 
   return (
     <>
+      {declineModal}
       <RequestModal
         tmdbId={tmdbId}
         show={showRequestModal}

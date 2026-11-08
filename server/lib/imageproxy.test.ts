@@ -1,26 +1,27 @@
 import ImageProxy, {
   ImageNotFoundError,
   maxAgeOf,
+  redirectGuard,
 } from '@server/lib/imageproxy';
 import assert from 'node:assert/strict';
 import { promises } from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 
 /**
- * Regression cover for two faults that produced blank posters:
+ * Guards against blank posters:
  *
- *  - the cache directory was cleared before writing, so a concurrent request
- *    for the same image could delete the file another had just written;
- *  - the read then took whatever the directory listed first, including a
- *    partially written temporary file.
+ *  - clearing the cache directory before writing lets a concurrent request
+ *    delete a file another just wrote;
+ *  - a read must never pick up a partially written temporary file.
  */
 describe('image proxy cache', () => {
   const cacheRoot = join(tmpdir(), `seerr-imageproxy-test-${process.pid}`);
-  // The proxy resolves its cache directory when the module loads, so the
-  // directory cannot be redirected from here. Unique paths per run keep every
-  // test genuinely cold instead.
+  // The cache directory is resolved at module load and can't be redirected;
+  // unique paths per run keep each test cold.
   const unique = `${process.pid}-${Date.now()}`;
   const path = (name: string) => `/t/p/w500/${unique}-${name}.jpg`;
   let upstreamCalls = 0;
@@ -56,8 +57,8 @@ describe('image proxy cache', () => {
     await promises.rm(cacheRoot, { recursive: true, force: true });
     delete process.env.CONFIG_DIRECTORY;
 
-    // The proxy wrote into the default cache directory, since it resolves
-    // that at module load. Remove only this run's entries.
+    // Written to the default cache directory (resolved at load); remove only
+    // this run's entries.
     const defaultDir = join(__dirname, '../../config/cache/images/tmdb');
 
     try {
@@ -126,9 +127,8 @@ describe('image proxy cache', () => {
   });
 
   it('keeps serving a complete image while the same entry is rewritten', async () => {
-    // The original fault cleared the directory before writing, so a reader
-    // arriving mid-write found nothing. Hammering one path with concurrent
-    // reads and writes must never produce an empty buffer.
+    // Concurrent reads and writes on one path must never yield an empty
+    // buffer.
     await proxy.getImage(path('rewrite'));
 
     const results = await Promise.all(
@@ -142,8 +142,8 @@ describe('image proxy cache', () => {
   });
 
   it('does not let a stalled fetch block later images', async () => {
-    // A fetch that never answers must give up (the proxy sets a timeout)
-    // rather than keep that poster, and whoever waits on it, waiting.
+    // A fetch that never answers must time out rather than block the poster
+    // and its waiters.
     const slow = new ImageProxy('tmdb', 'https://image.tmdb.org', {});
     let released = false;
 
@@ -183,10 +183,50 @@ describe('image proxy cache', () => {
   it('reports a stale entry rather than discarding it', async () => {
     const image = await proxy.getImage(path('stale'));
 
-    // An expired entry is still served and refreshed in the background, so a
-    // poster never disappears while it revalidates.
+    // An expired entry is served and refreshed in the background, so posters
+    // never vanish while revalidating.
     assert.ok(image.imageBuffer.length > 0);
     assert.equal(typeof image.meta.isStale, 'boolean');
+  });
+});
+
+describe('clearing old images from the cache', () => {
+  // The proxy's cache directory, resolved as at module load.
+  const cacheDir = process.env.CONFIG_DIRECTORY
+    ? join(process.env.CONFIG_DIRECTORY, 'cache/images')
+    : join(__dirname, '../../config/cache/images');
+  const key = `clear-${process.pid}-${Date.now()}`;
+
+  after(() =>
+    promises.rm(join(cacheDir, key), { recursive: true, force: true })
+  );
+
+  it('goes through every entry, even one holding more than one file', async () => {
+    const longAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
+    const old = `86400.${longAgo}.etag.jpg`;
+    const fresh = `86400.${Date.now() + 86400000}.etag.jpg`;
+    const entries: Record<string, string[]> = {
+      // An old image beside a write that never finished.
+      one: [old, `${old}.123.456.tmp`],
+      two: [old, `${old}.123.789.tmp`],
+      three: [old, `${old}.124.111.tmp`],
+      four: [old],
+      kept: [fresh],
+    };
+    for (const [entry, files] of Object.entries(entries)) {
+      await promises.mkdir(join(cacheDir, key, entry), { recursive: true });
+      for (const file of files) {
+        const filePath = join(cacheDir, key, entry, file);
+        await promises.writeFile(filePath, 'x');
+        await promises.utimes(filePath, longAgo / 1000, longAgo / 1000);
+      }
+    }
+
+    await ImageProxy.clearCache(key);
+
+    assert.deepEqual((await promises.readdir(join(cacheDir, key))).sort(), [
+      'kept',
+    ]);
   });
 });
 
@@ -267,8 +307,8 @@ describe('what the image cache keeps, and how it serves it', () => {
       (await proxy.getImage(path('photo'))).meta.contentType,
       'image/jpeg'
     );
-    // "image/svg" (from the file extension) is not a type browsers will
-    // draw; a logo served that way would be blank.
+    // "image/svg" (from the extension) isn't a type browsers render; the logo
+    // would be blank.
     assert.equal(
       (await proxy.getImage(path('logo', 'svg'))).meta.contentType,
       'image/svg+xml'
@@ -313,5 +353,96 @@ describe('what the image cache keeps, and how it serves it', () => {
     await proxy.getImage(path('unseen', 'png'));
     assert.ok(await proxy.peek(path('unseen', 'png')));
     assert.equal(calls.length, 1);
+  });
+});
+
+/*
+ * A host's images are fetched from that host. A redirect elsewhere (a
+ * taken-over host, or one answering for another) isn't followed onto the
+ * server's own network.
+ */
+describe('image redirects', () => {
+  const unique = `${process.pid}-${Date.now()}`;
+  let elsewhere: string[] = [];
+  let home: string[] = [];
+  let upstream: http.Server;
+  let other: http.Server;
+
+  before(async () => {
+    other = http.createServer((req, res) => {
+      elsewhere.push(req.url ?? '');
+      res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+      res.end(Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+    });
+    await new Promise<void>((r) => other.listen(0, '127.0.0.1', () => r()));
+    const otherPort = (other.address() as AddressInfo).port;
+    upstream = http.createServer((req, res) => {
+      if (req.url === '/moved.jpg') {
+        home.push(req.url);
+        res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+        return res.end(Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+      }
+      res.writeHead(302, {
+        Location: req.url?.includes('away')
+          ? `http://localhost:${otherPort}/moved.jpg`
+          : req.url?.includes('port')
+            ? `http://127.0.0.1:${otherPort}/moved.jpg`
+            : '/moved.jpg',
+      });
+      res.end();
+    });
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', () => r()));
+  });
+
+  after(async () => {
+    upstream.close();
+    other.close();
+    const dir = join(__dirname, '../../config/cache/images/redirect-test');
+    await promises.rm(dir, { recursive: true, force: true });
+  });
+
+  it('follows one on the same host and port, and refuses one to another', async () => {
+    const proxy = new ImageProxy(
+      'redirect-test',
+      `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`
+    );
+    elsewhere = [];
+    home = [];
+    const image = await proxy.getImage(`/t/p/w500/${unique}-home.jpg`);
+    assert.equal(image.meta.contentType, 'image/jpeg');
+    assert.deepEqual(home, ['/moved.jpg']);
+
+    await assert.rejects(() => proxy.getImage(`/t/p/w500/${unique}-away.jpg`));
+    await assert.rejects(() => proxy.getImage(`/t/p/w500/${unique}-port.jpg`));
+    assert.deepEqual(elsewhere, [], 'the other host and port were never asked');
+  });
+
+  it('lets album covers go on to archive.org, over https only', () => {
+    const guard = redirectGuard('https://coverartarchive.org', ['archive.org']);
+    for (const hostname of [
+      'coverartarchive.org',
+      'archive.org',
+      'ia800309.us.archive.org',
+    ]) {
+      assert.doesNotThrow(() => guard({ protocol: 'https:', hostname }));
+    }
+    for (const [protocol, hostname] of [
+      ['http:', 'archive.org'],
+      ['https:', 'notarchive.org'],
+      ['https:', 'archive.org.example.com'],
+      ['https:', '169.254.169.254'],
+      ['http:', 'coverartarchive.org'],
+    ]) {
+      assert.throws(() => guard({ protocol, hostname }), hostname);
+    }
+    assert.doesNotThrow(() =>
+      guard({ protocol: 'https:', hostname: 'archive.org', port: 443 })
+    );
+    for (const hostname of ['coverartarchive.org', 'archive.org']) {
+      assert.throws(
+        () => guard({ protocol: 'https:', hostname, port: 8443 }),
+        hostname
+      );
+    }
   });
 });

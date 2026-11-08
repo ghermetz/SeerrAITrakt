@@ -1,7 +1,16 @@
 # SeerrAI + Trakt pour l'IA (patch local) :
 #  - context.js  : historique Trakt dans les goûts + ensemble "déjà vu" (Trakt complet + Jellyfin)
 #  - features.js : 20 titres d'historique au modèle, filtre "déjà vu" (recherche IA, Pick for the Room)
-# Rebuild après chaque MAJ de SeerrAI : sudo ~/seerr-trakt-patch/rebuild.sh
+#
+# Les .orig.js sont les copies de référence des fichiers AMONT (SeerrAI 2.4.2, commit 2495460).
+# Le contrôle anti-dérive ci-dessous échoue si l'image amont a changé ces fichiers : le patch
+# doit alors être réadapté avant de produire une image (diff context.orig.js context.js...).
 FROM ghcr.io/corruptmods/seerr-ai:latest
+COPY context.orig.js features.orig.js /tmp/
+# Anti-dérive : les fichiers IA de l'image amont doivent être identiques aux références.
+RUN cmp -s /tmp/context.orig.js /app/dist/lib/ai/context.js \
+    && cmp -s /tmp/features.orig.js /app/dist/lib/ai/features.js \
+    && echo "Anti-dérive : fichiers IA amont conformes (patch Trakt applicable)" \
+    || { echo "ERREUR : context.js ou features.js a changé en amont — réadapter le patch Trakt (voir patch-trakt/README.md)"; exit 1; }
 COPY --chown=node:node context.js /app/dist/lib/ai/context.js
 COPY --chown=node:node features.js /app/dist/lib/ai/features.js

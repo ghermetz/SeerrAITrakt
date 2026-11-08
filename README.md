@@ -1,71 +1,101 @@
-# SeerrAITrakt
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./public/logo_ai_dark.svg">
+    <img src="./public/logo_ai_light.svg" alt="Seerr AI" width="400">
+  </picture>
+</p>
 
-> **Fork de [corruptmods/SeerrAI](https://github.com/corruptmods/SeerrAI)** (lui-même fork de Jellyseerr)
-> avec un **patch Trakt maison** pour le homelab **lelinuxien.fr** — recommandations IA alimentées
-> par l'historique de visionnage Trakt + Jellyfin, le tout 100 % local.
+**Seerr AI** is a request manager for Plex, Jellyfin and Emby: people find films, series and music and ask for them, and it gets them through Radarr, Sonarr and Lidarr. It is a fork of [Seerr](https://github.com/seerr-team/seerr) and keeps everything Seerr does.
 
-Ce fork ne modifie **pas le code source** : il embarque un **patch au niveau du build distribué**
-(dossier [`patch-trakt/`](patch-trakt/)) appliqué par-dessus l'image officielle du fork amont.
-Le commit de référence est `3b3cca9` (**SeerrAI 1.1.0**) — c'est exactement la version qui tourne
-en production.
+## Highlights
 
----
+- **Bring in a playlist**: paste a Spotify or Apple Music share link and every song is found and requested, then kept up to date each day. Songs that were never a single are taken from their album, so you get the song, not the whole album.
+- **AI Search and the admin agent**: describe a title or show a photo; report a problem in plain words and it gets fixed; an agent that finds what Sonarr, Radarr and Lidarr can't, with nothing changed until you approve.
+- **Backfill and Download Check**: stuck titles and albums found through Prowlarr, and fake or wrong downloads turned away before they land.
+- **Plex, Jellyfin and Emby together**, with sign-in through any of them or single sign-on, and who has which library managed from one page.
+- **Quality profiles** for Radarr and Sonarr from Seerr AI's presets or TRaSH Guides, explained in plain words.
+- **Status that says why**: what each download is doing, when it should arrive, live as it happens, for films, series and music alike.
 
-## Système de base (production lelinuxien.fr)
+## What it does
 
-| Élément | Détail |
+**Requests and discovery**
+- Request films, series, single seasons or single episodes; get new seasons as they premiere.
+- Status that says what a download is doing and when it should arrive.
+- Discover rows each person arranges, Suggested for You, an Anime page, filters that can leave out streaming services.
+- Shared lists with "up next" for each series, that take a film or a whole collection at once; a release calendar, Roulette.
+
+**Media servers**
+- Plex, Jellyfin and Emby, one or all three at once. Available on any counts; Play on each.
+- Library sharing: see who has each library on Plex, Jellyfin and Emby, and give or take one from everyone at once, with a preview first and Undo after.
+- Match Check finds titles a server matched wrongly, nightly and as requests arrive, and puts them right in Plex: at the press of a button, or by itself if you turn that on. Every fix can be undone.
+
+**Music**
+- Playlist import from Spotify or Apple Music: each song matched on MusicBrainz and requested within your limit (or as one batch for an admin to approve), with where every song stands, Try again for those that couldn't be found or downloaded, and one notification for the whole playlist. It carries on in the background and after a restart.
+- Request albums, a whole discography, or just one song (the radio edit or the club mix) through Lidarr; a song only on an album can be taken from it on its own.
+- Recent Music Requests and Recently Added Music rows, with status that updates by itself.
+- Top Songs, Trending Songs, Top Albums and Top Artists from Apple Music's charts, and rows of your own from the music you ask for.
+- Backfill and the admin agent go after albums Lidarr couldn't find.
+
+**Sign-in**
+- Plex, Jellyfin, Emby, a password, passkeys, or single sign-on (Authentik, Authelia, Keycloak, Pocket ID, Google).
+- Personal API keys for apps and scripts.
+
+**AI** (optional: Claude, OpenAI or a model on your own hardware)
+- AI Search for films, series and music, from a description or a photo; Pick for the Room; spoiler-free Catch Me Up.
+- Tell it what's wrong ("missing episodes", "no subtitles", "this album is missing songs") and it sets about fixing it. Siri can report what's playing.
+- An admin agent that finds what Sonarr, Radarr and Lidarr can't, and changes nothing without approval.
+
+**Admin tools**
+- Backfill: searches Prowlarr for stuck titles and albums, imports only what's missing, and replaces a torrent that can't finish.
+- Download Check: catches fake and wrong downloads and stuck imports, and says why it turned each one down.
+- Quality profiles for Radarr and Sonarr, from Seerr AI's presets or TRaSH Guides, with your own adjustments and a plain-words view of what each one takes. Off until you apply it.
+- A Health page with alerts, and live progress from six download clients.
+- Subtitles through Bazarr, transcribed with Whisper when none can be found, showing what Bazarr is doing as it works.
+- Works with Radarr 7.
+
+**Everywhere**
+- Installs as an app on a phone, and comes back to the page you were on.
+- Light and dark themes, accent colours and custom CSS; 40 languages.
+
+Every extra can be turned off for everyone, or by each person for themselves.
+
+## Screenshots
+
+| | |
 |---|---|
-| Base | SeerrAI 1.1.0 — `ghcr.io/corruptmods/seerr-ai:latest` |
-| Image finale | `192.168.1.35:5555/seerr-ai-trakt:latest` (registre OCI local TLS) |
-| Runtime | Podman **rootful**, socket `/run/podman/podman.sock`, compose `~/podman/seerr` |
-| Reverse proxy | Zoraxy → `jellyseer.lelinuxien.fr` (port 5055) |
-| IA | **100 % locale** : provider `openai` → `http://llama-gen:8080/v1` (llama.cpp), modèle `qwen3-4b` — config dans `settings.json`, aucune variable d'environnement |
-| Orchestration | Stack **Komodo** `seerr` — poll des updates + auto-update activés |
+| ![The AI panel over Discover, with example requests and problem reports](./docs/seerr-ai/screenshots/ai-search.jpg)<br>**AI Search**: describe a title, request a franchise or report a problem | ![Backfill: stuck titles, missing episodes and the admin agent's recent work](./docs/seerr-ai/screenshots/backfill.jpg)<br>**Backfill**: finds what Sonarr and Radarr can't |
+| ![Health: CPU and memory, every connected service, and what needs attention](./docs/seerr-ai/screenshots/health.jpg)<br>**Health**: every service and what needs attention | ![Calendar: releases and episodes for today, tomorrow and the week ahead](./docs/seerr-ai/screenshots/calendar.jpg)<br>**Calendar**: what's coming |
+| ![Discover: titles deleting soon, recently added and recent requests](./docs/seerr-ai/screenshots/discover.jpg)<br>**Discover** | ![A film's page: poster, overview and crew](./docs/seerr-ai/screenshots/title-page.jpg)<br>**A title page** |
+| ![The Music page: new music and popular albums](./docs/seerr-ai/screenshots/music.jpg)<br>**Music**, requested through Lidarr | ![Settings, Media Servers: Plex as the primary server, Jellyfin and Emby ready to connect](./docs/seerr-ai/screenshots/media-servers.jpg)<br>**Media Servers**: Plex, Jellyfin and Emby, in any mix |
+| ![Profile, Settings, Appearance: mode, accent colour and dark background](./docs/seerr-ai/screenshots/appearance.jpg)<br>**Appearance**: everyone picks their own look | ![On a phone: Discover, and the sign-in page with Jellyfin, Quick Connect, Plex, Emby, Authentik and a Seerr AI password](./docs/seerr-ai/screenshots/phones.jpg)<br>**On a phone**, with every way to sign in |
+| ![Settings, Quality: a Sonarr server's presets from TRaSH Guides, 720p filled in by Seerr AI](./docs/seerr-ai/screenshots/quality.jpg)<br>**Quality profiles**: presets from Seerr AI or TRaSH Guides, per server | ![What it does: a profile's goal, what it prefers, in bands, and what it never takes](./docs/seerr-ai/screenshots/quality-what-it-does.jpg)<br>**What it does**: every profile in plain words |
 
-## Améliorations apportées (patch Trakt)
+## Install
 
-Deux fichiers du build distribué sont remplacés (`/app/dist/lib/ai/`) :
-
-### 1. `context.js` — l'historique Trakt entre dans le contexte IA
-- Injecte jusqu'à **20 titres** de l'historique Trakt public (`/users/<pseudo>/history`)
-  dans `recentActivity`, au lieu des 8 titres d'amont
-- Titres traduits via **TMDB** dans la langue de l'instance
-- **Dédoublonnage** avec l'historique Jellyfin (pas de doublons Trakt/Jellyfin dans le contexte)
-
-### 2. `features.js` — filtre « déjà vu »
-- `watchedKeys` = Trakt `/watched/movies` + `/watched/shows` **complets** + Jellyfin
-  (`titleId → Media.jellyfinMediaId`), mis en **cache 30 min**
-- Les titres déjà vus sont retirés des **résultats de recherche IA** et des candidats
-  **« Pick for the Room »** — sauf demande explicite de l'utilisateur (liste, demande)
-
-### Prérequis
-- Client ID Trakt (`settings.trakt.clientId`) et `traktUsername` renseignés par profil
-  (utilisateur principal : `guytrom`)
-- Le profil Trakt doit être **public**
-
-## Pipeline de mise à jour
-
-```bash
-sudo ~/seerr-trakt-patch/rebuild.sh
+```yaml
+services:
+  seerr-ai:
+    image: ghcr.io/corruptmods/seerr-ai:latest
+    init: true
+    environment:
+      - TZ=America/New_York
+    ports:
+      - 5055:5055
+    volumes:
+      - ./config:/app/config
+    restart: unless-stopped
 ```
 
-1. `podman pull` de la dernière image amont `ghcr.io/corruptmods/seerr-ai:latest`
-2. **Contrôle anti-dérive** : les `context.js`/`features.js` extraits de la nouvelle image
-   sont comparés aux `.orig.js` — si l'amont les a modifiés, le script **s'arrête**
-   (le patch doit être réadapté : `diff /tmp/<f>.upstream.js <f>.orig.js`)
-3. `podman build` de l'image patchée → `localhost/seerr-ai-trakt:latest`
-4. **Push vers le registre OCI local** `192.168.1.35:5555` (TLS, CA approuvée dans le
-   magasin système + `/etc/containers/certs.d/192.168.1.35:5555/ca.crt`)
-5. Recréation du conteneur
+Open port 5055 and follow the setup. Images are for amd64 and arm64; on Kubernetes, `helm install seerr-ai oci://ghcr.io/corruptmods/seerr-ai-chart`. It can also take over an existing Seerr database: back it up first. [Installing and updating](./docs/seerr-ai/install.md) covers PostgreSQL, updates and building it yourself.
 
-**Pourquoi un registre local ?** Komodo (l'orchestrateur) ne peut pas sonder les images
-`localhost/*`. En publiant l'image sur un registre nommé, Komodo détecte le nouveau digest
-(poll horaire) et **redéploie la stack automatiquement** — la mise à jour est donc :
-`rebuild.sh` → détection Komodo → déploiement auto, sans intervention.
+## Documentation
 
-## Limites connues
+- **[Seerr AI guide](./docs/seerr-ai/README.md)**: every feature, for people using it and for admins.
+- **[What's new](./CHANGELOG.md)**: each release.
+- **[Developer notes](./docs/FORK.md)**: building, testing and the fork's rules.
+- **API**: [seerr-api.yml](./seerr-api.yml), also served at `/api-docs`.
+- What Seerr already does: [docs.seerr.dev](https://docs.seerr.dev).
 
-- Les patches portent sur le **JS compilé** : toute évolution majeure de l'amont sur ces
-  fichiers demande une réadaptation manuelle (le script de rebuild la détecte)
-- Komodo ne peut pas déclencher `rebuild.sh` lui-même (image construite localement) :
-  le pull amont reste manuel ou via cron
+## Credits and licence
+
+Seerr AI is built on [Seerr](https://github.com/seerr-team/seerr) and the Overseerr and Jellyseerr projects before it. It is released under the same [MIT licence](./LICENSE). Please report its problems [here](https://github.com/corruptmods/SeerrAI/issues), not to the Seerr project.

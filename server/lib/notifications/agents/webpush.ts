@@ -5,12 +5,21 @@ import { User } from '@server/entity/User';
 import { UserPushSubscription } from '@server/entity/UserPushSubscription';
 import { defineMessages, getIntl } from '@server/i18n';
 import globalMessages from '@server/i18n/globalMessages';
+import { declineReasonOf } from '@server/lib/notifications/declineReason';
+import { NOTIFICATION_TIMEOUT_MS } from '@server/lib/notifications/http';
+import { mediaPagePath } from '@server/lib/notifications/mediaPage';
+import { isPushServiceEndpoint } from '@server/lib/pushEndpoint';
 import type { NotificationAgentConfig } from '@server/lib/settings';
 import { NotificationAgentKey, getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import type { AvailableLocale } from '@server/types/languages';
 import webpush from 'web-push';
-import { Notification, shouldSendAdminNotification } from '..';
+import {
+  Notification,
+  WEB_PUSH_STARTING_TYPES,
+  hasNotificationType,
+  shouldSendAdminNotification,
+} from '..';
 import type { NotificationAgent, NotificationPayload } from './agent';
 import { BaseAgent } from './agent';
 
@@ -22,9 +31,11 @@ const messages = defineMessages('notifications.agents.webpush', {
   available: 'Your {quality}{mediaType} request is now available!',
   downloadedTitleMovie: 'Movie Downloaded',
   downloadedTitleTv: 'TV Show Downloaded',
+  downloadedTitleMusic: 'Music Downloaded',
   downloadedBody: '{title} is ready to play.',
   failedTitleMovie: 'Movie Request Failed',
   failedTitleTv: 'TV Show Request Failed',
+  failedTitleMusic: 'Music Request Failed',
   failedBody: '{title} could not be downloaded.',
   declined: 'Your {quality}{mediaType} request was declined.',
   failed: 'Failed to process {quality}{mediaType} request.',
@@ -54,10 +65,8 @@ interface PushNotificationPayload {
   pendingRequestsCount?: number;
   isAdmin?: boolean;
   /**
-   * The words for the Approve and Decline buttons on a request waiting for
-   * approval, and for the notice shown when a tap on one does not go
-   * through, in the person's language: the service worker has none of its
-   * own.
+   * Localized Approve/Decline labels and failure text; the service worker has
+   * no i18n.
    */
   actionLabels?: {
     approve: string;
@@ -78,46 +87,49 @@ interface WebPushError extends Error {
 }
 
 /**
- * Decides whether a user should receive a web push notification of this type.
- *
- * A user with no settings row at all defaults to enabled. A user who has a
- * settings row but has never touched the web push types resolves to a bitmask
- * of 0, which would silently opt them out of everything — including the
- * availability notification they registered their device for. Treat that
- * untouched state as enabled too; an explicit non-zero mask is still honoured.
+ * Whether the user gets this web push type; WEB_PUSH_STARTING_TYPES if they
+ * never chose.
  */
 export const wantsWebPush = (
   user: User | undefined,
   type: Notification
 ): boolean => {
-  // A broken sign-in is not something to opt out of: a user who had turned
-  // it off would never learn their watchlist had stopped syncing.
+  // Not opt-out: the user would never learn their watchlist stopped syncing.
   if (type === Notification.PLEX_REAUTH) {
     return true;
   }
 
   const settings = user?.settings;
+  const configured = settings?.notificationTypes[NotificationAgentKey.WEBPUSH];
 
-  if (!settings) {
-    return true;
-  }
-
-  const configured = settings.notificationTypes[NotificationAgentKey.WEBPUSH];
-
-  if (configured === undefined || configured === null) {
-    return true;
+  if (!settings || configured === undefined || configured === null) {
+    return hasNotificationType(type, WEB_PUSH_STARTING_TYPES);
   }
 
   return settings.hasNotificationType(NotificationAgentKey.WEBPUSH, type);
 };
 
+/** Types web push can send; each user picks theirs. */
 const WEB_PUSH_NOTIFICATION_TYPES: number[] = [
+  Notification.MEDIA_PENDING,
+  Notification.MEDIA_APPROVED,
+  Notification.MEDIA_AUTO_APPROVED,
+  Notification.MEDIA_AUTO_REQUESTED,
+  Notification.MEDIA_DECLINED,
   Notification.MEDIA_AVAILABLE,
   Notification.MEDIA_FAILED,
+  Notification.REQUEST_FAILED,
+  Notification.ISSUE_CREATED,
+  Notification.ISSUE_COMMENT,
+  Notification.ISSUE_RESOLVED,
+  Notification.ISSUE_REOPENED,
   Notification.LIST_ACTIVITY,
+  Notification.PLAYLIST_UPDATE,
+  Notification.LEAVING_SOON,
   Notification.PLEX_REAUTH,
   Notification.BACKFILL,
   Notification.HEALTH,
+  Notification.WRONG_MATCH,
   Notification.TEST_NOTIFICATION,
 ];
 
@@ -143,7 +155,7 @@ class WebPushAgent
     const intl = getIntl(locale);
     const { embedPoster } = getSettings().notifications.agents.webpush;
 
-    // Several at once, gathered into one: it says everything itself.
+    // A digest carries its own text.
     if (payload.digest) {
       return {
         notificationType: Notification[type],
@@ -158,7 +170,9 @@ class WebPushAgent
     const mediaType = payload.media
       ? payload.media.mediaType === MediaType.MOVIE
         ? intl.formatMessage(globalMessages.movie)
-        : intl.formatMessage(globalMessages.series)
+        : payload.media.mediaType === MediaType.MUSIC
+          ? intl.formatMessage(globalMessages.music)
+          : intl.formatMessage(globalMessages.series)
       : undefined;
     const is4k = payload.request?.is4k;
     const quality = is4k ? '4K ' : '';
@@ -173,19 +187,15 @@ class WebPushAgent
 
     let message: string | undefined;
     switch (type) {
+      // These carry their own message (and, for some, the page to open).
       case Notification.TEST_NOTIFICATION:
-        message = payload.message;
-        break;
-      // List activity supplies its own sentence, e.g. "Jordan added Dune."
       case Notification.LIST_ACTIVITY:
-        message = payload.message;
-        break;
       case Notification.PLEX_REAUTH:
-        message = payload.message;
-        break;
-      // Backfill supplies its own sentence and the page to open.
       case Notification.BACKFILL:
       case Notification.HEALTH:
+      case Notification.WRONG_MATCH:
+      case Notification.PLAYLIST_UPDATE:
+      case Notification.LEAVING_SOON:
         message = payload.message;
         break;
       case Notification.MEDIA_AUTO_REQUESTED:
@@ -199,7 +209,7 @@ class WebPushAgent
           quality,
           mediaType,
         });
-        // Push shows no extra fields, so the estimate goes in the message.
+        // Push has no extra fields, so the estimate goes in the message.
         const expected = payload.extra?.find(
           (field) => field.name === 'Expected'
         )?.value;
@@ -221,13 +231,19 @@ class WebPushAgent
           mediaType,
         });
         break;
-      case Notification.MEDIA_DECLINED:
+      case Notification.MEDIA_DECLINED: {
         message = intl.formatMessage(messages.declined, {
           quality,
           mediaType,
         });
+        const declineReason = declineReasonOf(type, payload);
+        if (declineReason) {
+          message = `${message}\n${intl.formatMessage(globalMessages.declineReason)}: ${declineReason}`;
+        }
         break;
+      }
       case Notification.MEDIA_FAILED:
+      case Notification.REQUEST_FAILED:
         message = intl.formatMessage(messages.failed, {
           quality,
           mediaType,
@@ -276,7 +292,7 @@ class WebPushAgent
       (payload.issue
         ? `/issues/${payload.issue.id}`
         : payload.media
-          ? `/${payload.media.mediaType}/${payload.media.tmdbId}`
+          ? mediaPagePath(payload.media, payload.request)
           : undefined);
 
     const actionUrlTitle = payload.actionUrl
@@ -287,23 +303,34 @@ class WebPushAgent
           )
         : undefined;
 
-    const isTv = payload.media?.mediaType === MediaType.TV;
+    const kind = payload.media?.mediaType;
 
-    // Availability and failure notifications lead with what happened and put
-    // the title in the body, which reads better in a phone notification than
-    // a bare title followed by a plot synopsis.
+    // Availability and failure lead with the event and put the title in the
+    // body; reads better on a phone than a title plus synopsis.
     let subject = payload.subject;
 
     if (type === Notification.MEDIA_AVAILABLE && payload.subject) {
       subject = intl.formatMessage(
-        isTv ? messages.downloadedTitleTv : messages.downloadedTitleMovie
+        kind === MediaType.TV
+          ? messages.downloadedTitleTv
+          : kind === MediaType.MUSIC
+            ? messages.downloadedTitleMusic
+            : messages.downloadedTitleMovie
       );
       message = intl.formatMessage(messages.downloadedBody, {
         title: payload.subject,
       });
-    } else if (type === Notification.MEDIA_FAILED && payload.subject) {
+    } else if (
+      (type === Notification.MEDIA_FAILED ||
+        type === Notification.REQUEST_FAILED) &&
+      payload.subject
+    ) {
       subject = intl.formatMessage(
-        isTv ? messages.failedTitleTv : messages.failedTitleMovie
+        kind === MediaType.TV
+          ? messages.failedTitleTv
+          : kind === MediaType.MUSIC
+            ? messages.failedTitleMusic
+            : messages.failedTitleMovie
       );
       message = intl.formatMessage(messages.failedBody, {
         title: payload.subject,
@@ -348,9 +375,6 @@ class WebPushAgent
     type: Notification,
     payload: NotificationPayload
   ): Promise<boolean> {
-    // Web push is scoped to availability and failure notifications only. Test
-    // notifications are allowed through so the agent can still be verified
-    // from the settings page.
     if (!WEB_PUSH_NOTIFICATION_TYPES.includes(type)) {
       return true;
     }
@@ -368,6 +392,21 @@ class WebPushAgent
       pushSub: UserPushSubscription,
       notificationPayload: Buffer
     ) => {
+      // Endpoints are validated at signup; delete older ones that aren't a
+      // browser push service rather than call them.
+      if (!isPushServiceEndpoint(pushSub.endpoint)) {
+        logger.warn(
+          'Removing a web push subscription that is not at a browser push service',
+          {
+            label: 'Notifications',
+            recipient: pushSub.user.displayName,
+            subscriptionId: pushSub.id,
+          }
+        );
+        await userPushSubRepository.delete(pushSub.id);
+        return;
+      }
+
       logger.debug('Sending web push notification', {
         label: 'Notifications',
         recipient: pushSub.user.displayName,
@@ -384,7 +423,8 @@ class WebPushAgent
               p256dh: pushSub.p256dh,
             },
           },
-          notificationPayload
+          notificationPayload,
+          { timeout: NOTIFICATION_TIMEOUT_MS }
         );
       } catch (e) {
         const webPushError = e as WebPushError;
@@ -431,12 +471,8 @@ class WebPushAgent
       );
     }
 
-    // Approvals and declines used to send every admin an extra push that only
-    // updated the app badge and showed nothing. Browsers require a push to
-    // show a notification: WebKit revokes the subscription of an app that
-    // does not, so on an iPhone those pushes cost the admin their
-    // notifications. The app refreshes the badge itself whenever it is
-    // opened or focused, so they are no longer sent.
+    // No silent badge-only pushes to admins: WebKit revokes the subscription
+    // of an app whose push shows nothing. The app refreshes its badge on focus.
     if (payload.notifyAdmin) {
       const users = await userRepository.find();
 

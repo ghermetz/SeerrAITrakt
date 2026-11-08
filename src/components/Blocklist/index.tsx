@@ -7,12 +7,14 @@ import Header from '@app/components/Common/Header';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import PageTitle from '@app/components/Common/PageTitle';
 import useDebouncedState from '@app/hooks/useDebouncedState';
+import useNearScreen, { useLoadWhenNear } from '@app/hooks/useNearScreen';
 import useToasts from '@app/hooks/useToasts';
 import { useUpdateQueryParams } from '@app/hooks/useUpdateQueryParams';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import ErrorPage from '@app/pages/_error';
 import defineMessages from '@app/utils/defineMessages';
+import { pictureLoading } from '@app/utils/nearScreen';
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -31,7 +33,6 @@ import Link from 'next/link';
 import { useRouter } from 'next/router';
 import type { ChangeEvent } from 'react';
 import { useEffect, useRef, useState } from 'react';
-import { useInView } from 'react-intersection-observer';
 import { FormattedRelativeTime, useIntl } from 'react-intl';
 import useSWR from 'swr';
 
@@ -74,11 +75,9 @@ const Blocklist = () => {
   const updateQueryParams = useUpdateQueryParams({ page: page.toString() });
 
   /*
-   * Keep the filter, page size and search across opening a title and coming
-   * back. The Requests, Issues and Users pages already saved theirs; this one
-   * reset to "Manual" and 10 per page every time. Filter and page size are
-   * remembered like on those pages; the search only for this browser tab, so
-   * it survives Back without lingering into a later visit.
+   * Restore filter, page size and search after visiting a title. Filter and
+   * page size persist like the Requests page; search only for this tab, so it
+   * survives Back without lingering into a later visit.
    */
   useEffect(() => {
     try {
@@ -99,9 +98,9 @@ const Blocklist = () => {
         setSearchFilter(search);
       }
     } catch {
-      // Unreadable settings just mean starting from the defaults.
+      // Unreadable: use defaults.
     }
-    // Restores once on arrival; saving is handled separately below.
+    // Restore once on mount; saving is below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -112,12 +111,11 @@ const Blocklist = () => {
         JSON.stringify({ currentFilter, currentPageSize })
       );
     } catch {
-      // Storage can be unavailable (private mode); nothing to do.
+      // Storage unavailable (private mode).
     }
   }, [currentFilter, currentPageSize]);
 
-  // Skips the save on arrival, which would otherwise write an empty search
-  // over the saved one before the restored value has come through.
+  // Skip the first save, which would overwrite the saved search before the restore lands.
   const skipFirstSearchSave = useRef(true);
   useEffect(() => {
     if (skipFirstSearchSave.current) {
@@ -148,16 +146,12 @@ const Blocklist = () => {
     }
   );
 
-  // check if there's no data and no errors in the table
-  // so as to show a spinner inside the table and not refresh the whole component
   if (!data && error) {
     return <ErrorPage statusCode={500} />;
   }
 
   const searchItem = (e: ChangeEvent<HTMLInputElement>) => {
-    // Remove the "page" query param from the URL
-    // so that the "skip" query param on line 62 is empty
-    // and the search returns results without skipping items
+    // Drop ?page so the new search starts at the first page.
     if (router.query.page) router.replace(router.basePath);
 
     setSearchFilter(e.target.value as string);
@@ -223,7 +217,7 @@ const Blocklist = () => {
       {!data ? (
         <LoadingSpinner />
       ) : data.results.length === 0 ? (
-        <div className="flex w-full flex-col items-center justify-center py-24 text-white">
+        <div className="flex w-full flex-col items-center justify-center py-24 text-strong">
           <span className="text-2xl text-gray-400">
             {intl.formatMessage(globalMessages.noresults)}
           </span>
@@ -242,7 +236,7 @@ const Blocklist = () => {
         data.results.map((item: BlocklistItem) => {
           return (
             <div
-              className="py-2"
+              className="list-row py-2"
               key={`request-list-${item.mediaType}-${item.tmdbId}`}
             >
               <BlocklistedItem item={item} revalidateList={revalidate} />
@@ -274,7 +268,7 @@ const Blocklist = () => {
             </p>
           </div>
           <div className="flex justify-center sm:flex-1 sm:justify-start lg:justify-center">
-            <span className="-mt-3 items-center truncate text-sm sm:mt-0">
+            <span className="-mt-3 items-center text-sm sm:mt-0">
               {intl.formatMessage(globalMessages.resultsperpage, {
                 pageSize: (
                   <select
@@ -337,9 +331,8 @@ interface BlocklistedItemProps {
 const BlocklistedItem = ({ item, revalidateList }: BlocklistedItemProps) => {
   const [isUpdating, setIsUpdating] = useState<boolean>(false);
   const { addToast } = useToasts();
-  const { ref, inView } = useInView({
-    triggerOnce: true,
-  });
+  // Load the title and images once the row is near the screen.
+  const { ref, near, nearness } = useNearScreen();
   const intl = useIntl();
   const { hasPermission } = useUser();
 
@@ -347,9 +340,8 @@ const BlocklistedItem = ({ item, revalidateList }: BlocklistedItemProps) => {
     item.mediaType === 'movie'
       ? `/api/v1/movie/${item.tmdbId}`
       : `/api/v1/tv/${item.tmdbId}`;
-  const { data: title, error } = useSWR<MovieDetails | TvDetails>(
-    inView ? url : null
-  );
+  const titleKey = useLoadWhenNear(url, near);
+  const { data: title, error } = useSWR<MovieDetails | TvDetails>(titleKey);
 
   if (!title && !error) {
     return (
@@ -398,14 +390,9 @@ const BlocklistedItem = ({ item, revalidateList }: BlocklistedItemProps) => {
             alt=""
             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
             fill
+            {...pictureLoading(nearness)}
           />
-          <div
-            className="absolute inset-0"
-            style={{
-              backgroundImage:
-                'linear-gradient(90deg, rgba(31, 41, 55, 0.47) 0%, rgba(31, 41, 55, 1) 100%)',
-            }}
-          />
+          <div className="row-backdrop-fade absolute inset-y-0 -right-px left-0" />
         </div>
       )}
       <div className="relative flex w-full flex-col justify-between overflow-hidden sm:flex-row">
@@ -422,18 +409,19 @@ const BlocklistedItem = ({ item, revalidateList }: BlocklistedItemProps) => {
               type="tmdb"
               src={
                 title?.posterPath
-                  ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${title.posterPath}`
+                  ? `https://image.tmdb.org/t/p/w300_and_h450_face${title.posterPath}`
                   : '/images/seerr_poster_not_found.png'
               }
               alt=""
               sizes="100vw"
               style={{ width: '100%', height: 'auto', objectFit: 'cover' }}
-              width={600}
-              height={900}
+              width={300}
+              height={450}
+              {...pictureLoading(nearness)}
             />
           </Link>
           <div className="flex flex-col justify-center overflow-hidden pl-2 xl:pl-4">
-            <div className="pt-0.5 text-xs font-medium text-white sm:pt-1">
+            <div className="pt-0.5 text-xs font-medium text-strong sm:pt-1">
               {title &&
                 (isMovie(title)
                   ? title.releaseDate
@@ -447,7 +435,7 @@ const BlocklistedItem = ({ item, revalidateList }: BlocklistedItemProps) => {
                   : `/tv/${item.tmdbId}`
               }
             >
-              <span className="mr-2 min-w-0 truncate text-lg font-bold text-white hover:underline xl:text-xl">
+              <span className="mr-2 min-w-0 break-words text-lg font-bold text-strong hover:underline xl:truncate xl:text-xl">
                 {title && (isMovie(title) ? title.title : title.name)}
               </span>
             </Link>
@@ -467,7 +455,7 @@ const BlocklistedItem = ({ item, revalidateList }: BlocklistedItemProps) => {
               <span className="card-field-name">
                 {intl.formatMessage(globalMessages.blocklisted)}
               </span>
-              <span className="flex truncate text-sm text-gray-300">
+              <span className="flex min-w-0 flex-wrap text-sm text-gray-300 xl:flex-nowrap xl:truncate">
                 {intl.formatMessage(messages.blocklistedby, {
                   date: (
                     <FormattedRelativeTime
@@ -479,8 +467,8 @@ const BlocklistedItem = ({ item, revalidateList }: BlocklistedItemProps) => {
                     />
                   ),
                   user: item.user ? (
-                    <Link href={`/users/${item.user.id}`}>
-                      <span className="group flex items-center truncate">
+                    <Link href={`/users/${item.user.id}`} className="min-w-0">
+                      <span className="group flex min-w-0 items-center xl:truncate">
                         <CachedImage
                           type="avatar"
                           src={item.user.avatar}
@@ -490,7 +478,7 @@ const BlocklistedItem = ({ item, revalidateList }: BlocklistedItemProps) => {
                           height={20}
                           style={{ objectFit: 'cover' }}
                         />
-                        <span className="ml-1 truncate text-sm font-semibold group-hover:text-white group-hover:underline">
+                        <span className="ml-1 min-w-0 break-words text-sm font-semibold group-hover:text-strong group-hover:underline xl:truncate">
                           {item.user.displayName}
                         </span>
                       </span>
@@ -514,7 +502,7 @@ const BlocklistedItem = ({ item, revalidateList }: BlocklistedItemProps) => {
                 {intl.formatMessage(messages.reason)}
               </span>
               <span
-                className="truncate text-sm text-gray-300"
+                className="min-w-0 break-words text-sm text-gray-300 xl:truncate"
                 title={item.reason}
               >
                 {item.reason}
@@ -523,13 +511,13 @@ const BlocklistedItem = ({ item, revalidateList }: BlocklistedItemProps) => {
           )}
           <div className="card-field">
             {item.mediaType === 'movie' ? (
-              <div className="pointer-events-none z-40 self-start rounded-full border border-blue-500 bg-blue-600/80 shadow-md">
+              <div className="pointer-events-none z-40 self-start rounded-full border border-blue-500 bg-blue-600/fill shadow-md">
                 <div className="flex h-4 items-center px-2 py-2 text-center text-xs font-medium uppercase tracking-wider text-white sm:h-5">
                   {intl.formatMessage(globalMessages.movie)}
                 </div>
               </div>
             ) : (
-              <div className="pointer-events-none z-40 self-start rounded-full border border-purple-600 bg-purple-600/80 shadow-md">
+              <div className="pointer-events-none z-40 self-start rounded-full border border-purple-600 bg-purple-600/fill shadow-md">
                 <div className="flex h-4 items-center px-2 py-2 text-center text-xs font-medium uppercase tracking-wider text-white sm:h-5">
                   {intl.formatMessage(globalMessages.tvshow)}
                 </div>

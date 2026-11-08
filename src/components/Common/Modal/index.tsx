@@ -41,10 +41,7 @@ interface ModalProps {
   backdrop?: string;
   children?: React.ReactNode;
   dialogClass?: string;
-  /**
-   * An X in the top corner that does what Cancel does, so a long dialog can
-   * be closed without scrolling to its buttons.
-   */
+  /** A corner X that cancels, so a long dialog closes without scrolling. */
   showCloseButton?: boolean;
 }
 
@@ -84,7 +81,8 @@ const Modal = React.forwardRef<HTMLDivElement, ModalProps>(
   ) => {
     const intl = useIntl();
     const modalRef = useRef<HTMLDivElement>(null);
-    const backgroundClickableRef = useRef(backgroundClickable); // This ref is used to detect state change inside the useClickOutside hook
+    // Latest value for the outside-click and Escape handlers.
+    const backgroundClickableRef = useRef(backgroundClickable);
     useEffect(() => {
       backgroundClickableRef.current = backgroundClickable;
     }, [backgroundClickable]);
@@ -94,8 +92,8 @@ const Modal = React.forwardRef<HTMLDivElement, ModalProps>(
       }
     });
     useLockBodyScroll(true, disableScrollLock);
-    // Escape closes it as a click outside would; a dialog that may not be
-    // closed by a stray click (one holding unsaved work) keeps to its buttons.
+    // Escape acts as a click outside; a dialog that ignores stray clicks
+    // (unsaved work) ignores Escape too.
     useDialogFocus(modalRef, {
       onEscape: () => {
         if (onCancel && backgroundClickableRef.current) {
@@ -110,7 +108,7 @@ const Modal = React.forwardRef<HTMLDivElement, ModalProps>(
     return ReactDOM.createPortal(
       <TransitionChild
         as="div"
-        className="fixed bottom-0 left-0 right-0 top-0 z-50 flex h-full w-full items-center justify-center bg-gray-800/70"
+        className="fixed bottom-0 left-0 right-0 top-0 z-50 flex h-full w-full items-center justify-center bg-overlay/70"
         enter="transition-opacity duration-300"
         enterFrom="opacity-0"
         enterTo="opacity-100"
@@ -135,8 +133,9 @@ const Modal = React.forwardRef<HTMLDivElement, ModalProps>(
           </div>
         </Transition>
         <Transition
-          className={`hide-scrollbar relative inline-block w-full overflow-auto bg-gray-800 px-4 pb-4 pt-4 text-left align-bottom shadow-xl ring-1 ring-gray-700 transition-all focus:outline-none sm:my-8 sm:max-w-3xl sm:rounded-lg sm:align-middle ${dialogClass}`}
+          className={`hide-scrollbar relative inline-block w-full overflow-auto bg-surface px-4 pb-4 pt-4 text-left align-bottom shadow-xl ring-1 ring-subtle transition-all focus:outline-none sm:my-8 sm:max-w-3xl sm:rounded-lg sm:align-middle ${dialogClass}`}
           role="dialog"
+          data-seerr="modal"
           aria-modal="true"
           aria-labelledby={title ? titleId : subTitle ? subTitleId : undefined}
           aria-describedby={title && subTitle ? subTitleId : undefined}
@@ -156,9 +155,8 @@ const Modal = React.forwardRef<HTMLDivElement, ModalProps>(
           ref={modalRef}
         >
           {/*
-            Sticky, in a zero-height strip at the top of the panel, which is
-            what scrolls: the X stays in reach however far down a long dialog
-            has been scrolled.
+            Sticky in a zero-height strip at the top of the scrolling panel,
+            so the X stays in reach.
           */}
           {showCloseButton && onCancel && (
             <div className="sticky top-0 z-20 flex h-0 justify-end">
@@ -166,7 +164,7 @@ const Modal = React.forwardRef<HTMLDivElement, ModalProps>(
                 type="button"
                 onClick={onCancel}
                 aria-label={intl.formatMessage(globalMessages.close)}
-                className="-mr-1 -mt-1 h-8 w-8 rounded-md bg-gray-800/80 p-1 text-gray-400 transition duration-150 hover:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                className="-mr-1 -mt-1 h-8 w-8 rounded-md bg-surface/panel p-1 text-muted transition duration-150 hover:text-strong focus:outline-none focus:ring-2 focus:ring-indigo-500"
               >
                 <XMarkIcon className="h-6 w-6" />
               </button>
@@ -184,18 +182,19 @@ const Modal = React.forwardRef<HTMLDivElement, ModalProps>(
                 // The dialog is at most 48rem wide.
                 sizes="(min-width: 640px) 768px, 100vw"
               />
+              {/* Fades into the dialog's colour in either theme. */}
               <div
                 className="absolute inset-0"
                 style={{
                   backgroundImage:
-                    'linear-gradient(180deg, rgba(31, 41, 55, 0.75) 0%, rgba(31, 41, 55, 1) 100%)',
+                    'linear-gradient(180deg, rgb(var(--surface) / 0.75) 0%, rgb(var(--surface)) 100%)',
                 }}
               />
             </div>
           )}
           <div className="relative -mx-4 overflow-x-hidden px-4 pt-0.5 sm:flex sm:items-center">
             <div
-              className={`mt-3 truncate text-center text-white sm:mt-0 sm:text-left ${
+              className={`mt-3 min-w-0 text-center text-strong sm:mt-0 sm:text-left ${
                 showCloseButton ? 'px-8 sm:pl-0 sm:pr-10' : ''
               }`}
             >
@@ -203,7 +202,7 @@ const Modal = React.forwardRef<HTMLDivElement, ModalProps>(
                 <div className="flex flex-col space-y-1">
                   {title && (
                     <span
-                      className="text-overseerr truncate pb-0.5 text-2xl font-bold leading-6"
+                      className="text-overseerr break-words pb-0.5 text-2xl font-bold leading-7"
                       id={titleId}
                       data-testid="modal-title"
                     >
@@ -212,7 +211,7 @@ const Modal = React.forwardRef<HTMLDivElement, ModalProps>(
                   )}
                   {subTitle && (
                     <span
-                      className="truncate text-lg font-semibold leading-6 text-gray-200"
+                      className="break-words text-lg font-semibold leading-6 text-gray-200"
                       id={subTitleId}
                       data-testid="modal-title"
                     >
@@ -225,7 +224,7 @@ const Modal = React.forwardRef<HTMLDivElement, ModalProps>(
           </div>
           {children && (
             <div
-              className={`relative mt-4 text-sm leading-5 text-gray-300 ${
+              className={`relative mt-4 text-sm leading-5 text-default ${
                 !(onCancel || onOk || onSecondary || onTertiary) ? 'mb-3' : ''
               }`}
             >

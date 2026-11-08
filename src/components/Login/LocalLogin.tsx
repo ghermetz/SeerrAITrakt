@@ -2,9 +2,9 @@ import Button from '@app/components/Common/Button';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
 import useSettings from '@app/hooks/useSettings';
 import defineMessages from '@app/utils/defineMessages';
+import { SERVER_NAMES } from '@app/utils/mediaServerAccounts';
 import { ArrowLeftOnRectangleIcon } from '@heroicons/react/24/outline';
 import { ExclamationTriangleIcon } from '@heroicons/react/24/solid';
-import { MediaServerType } from '@server/constants/server';
 import axios from 'axios';
 import { Field, Form, Formik } from 'formik';
 import Link from 'next/link';
@@ -20,7 +20,7 @@ const messages = defineMessages('components.Login', {
   validationemailrequired: 'You must provide a valid email address',
   validationpasswordrequired: 'You must provide a password',
   jellyfinLocalLoginHint:
-    "If you haven't set an email address in your profile, use your {mediaServerName} username instead.",
+    'No email in your profile? Use your {mediaServerName} username.',
   loginerror: 'Something went wrong while trying to sign in.',
   toomanyattempts: 'Too many sign-in attempts. Try again in a few minutes.',
   credentialerror: 'The email address or password is incorrect.',
@@ -47,6 +47,11 @@ const LocalLogin = ({ revalidate }: LocalLoginProps) => {
       intl.formatMessage(messages.validationpasswordrequired)
     ),
   });
+
+  // Jellyfin/Emby users have their username as email until they set one.
+  const jellyfinFamilyNames = settings.currentSettings.mediaServers
+    .filter((server) => server.kind === 'jellyfin' || server.kind === 'emby')
+    .map((server) => SERVER_NAMES[server.kind]);
 
   const passwordResetEnabled =
     settings.currentSettings.applicationUrl &&
@@ -87,7 +92,7 @@ const LocalLogin = ({ revalidate }: LocalLoginProps) => {
           <>
             <Form data-form-type="login">
               <div>
-                <h2 className="-mt-1 mb-6 text-center text-lg font-bold text-neutral-200">
+                <h2 className="-mt-1 mb-6 text-center text-lg font-bold text-neutral-200 light:text-strong">
                   {intl.formatMessage(messages.loginwithapp, {
                     appName: settings.currentSettings.applicationTitle,
                   })}
@@ -103,7 +108,7 @@ const LocalLogin = ({ revalidate }: LocalLoginProps) => {
                       inputMode="email"
                       data-testid="email"
                       data-form-type="username,email"
-                      className="!bg-gray-700/80 placeholder:text-gray-400"
+                      className="!bg-gray-700/80 placeholder:text-gray-400 light:!bg-field"
                     />
                   </div>
                   {touched.email && values.email.match(/\s$/) && (
@@ -119,17 +124,12 @@ const LocalLogin = ({ revalidate }: LocalLoginProps) => {
                     typeof errors.email === 'string' && (
                       <div className="error">{errors.email}</div>
                     )}
-                  {(settings.currentSettings.mediaServerType ===
-                    MediaServerType.JELLYFIN ||
-                    settings.currentSettings.mediaServerType ===
-                      MediaServerType.EMBY) && (
+                  {jellyfinFamilyNames.length > 0 && (
                     <div className="mt-1 text-xs text-gray-400">
                       {intl.formatMessage(messages.jellyfinLocalLoginHint, {
-                        mediaServerName:
-                          settings.currentSettings.mediaServerType ===
-                          MediaServerType.JELLYFIN
-                            ? 'Jellyfin'
-                            : 'Emby',
+                        mediaServerName: intl.formatList(jellyfinFamilyNames, {
+                          type: 'disjunction',
+                        }),
                       })}
                     </div>
                   )}
@@ -145,7 +145,7 @@ const LocalLogin = ({ revalidate }: LocalLoginProps) => {
                       autoComplete="current-password"
                       data-testid="password"
                       data-form-type="password"
-                      className="!bg-gray-700/80 placeholder:text-gray-400"
+                      className="!bg-gray-700/80 placeholder:text-gray-400 light:!bg-field"
                       data-1pignore="false"
                       data-lpignore="false"
                     />
@@ -160,7 +160,7 @@ const LocalLogin = ({ revalidate }: LocalLoginProps) => {
                     {passwordResetEnabled && (
                       <Link
                         href="/resetpassword"
-                        className="pt-2 text-sm text-indigo-500 hover:text-indigo-400"
+                        className="pt-2 text-sm text-accent-text hover:text-indigo-400 light:hover:text-accent-text"
                       >
                         {intl.formatMessage(messages.forgotpassword)}
                       </Link>

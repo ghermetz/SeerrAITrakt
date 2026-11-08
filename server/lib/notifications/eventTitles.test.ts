@@ -26,7 +26,7 @@ import assert from 'node:assert/strict';
 import { after, before, describe, it, mock } from 'node:test';
 
 describe('notification event lines in English', () => {
-  // What webhooks have always been sent, and still are.
+  // Webhooks must keep receiving these exact strings.
   it('are word for word what they were', () => {
     const cases: [Notification, MediaType, boolean, string][] = [
       [Notification.MEDIA_PENDING, MediaType.MOVIE, false, 'New Movie Request'],
@@ -92,10 +92,8 @@ describe('notification event lines in English', () => {
   });
 });
 
-/*
- * The new lines are only in English until they are translated, so the
- * channels are checked with a line that already is: "Available".
- */
+// Newer lines are English-only until translated, so channels are checked with
+// "Available".
 const translated = {
   message: {
     id: 'notifications.common.available',
@@ -106,10 +104,10 @@ const translated = {
 const payload = (): NotificationPayload => ({
   event: 'Available',
   eventTitle: translated,
-  subject: 'Dune (2021)',
+  subject: 'Zelvara (2021)',
   notifySystem: true,
   notifyAdmin: false,
-  media: { mediaType: MediaType.MOVIE, tmdbId: 438631 } as never,
+  media: { mediaType: MediaType.MOVIE, tmdbId: 549172 } as never,
   request: {
     is4k: false,
     requestedBy: { displayName: 'Jordan' },
@@ -130,7 +128,7 @@ describe('notification event lines in each channel', () => {
 
     assert.match(
       new DiscordAgent().buildEmbed(type, payload(), 'fr').title ?? '',
-      /^Disponible: Dune/
+      /^Disponible: Zelvara/
     );
     const telegram = new TelegramAgent()['getNotificationPayload'](
       type,
@@ -139,12 +137,12 @@ describe('notification event lines in each channel', () => {
     ) as { text?: string; caption?: string };
     assert.match(
       telegram.text ?? telegram.caption ?? '',
-      /Disponible \\- Dune/
+      /Disponible \\- Zelvara/
     );
     assert.equal(
       new PushbulletAgent()['getNotificationPayload'](type, payload(), 'fr')
         .title,
-      'Disponible - Dune (2021)'
+      'Disponible - Zelvara (2021)'
     );
     assert.equal(
       (
@@ -185,14 +183,14 @@ describe('notification event lines in each channel', () => {
       embedPoster: false,
       options: { url: 'https://gotify.example', token: 't', ...options },
     } as never)['getNotificationPayload'](type, payload());
-    assert.equal(gotify.title, 'Verfügbar - Dune (2021)');
+    assert.equal(gotify.title, 'Verfügbar - Zelvara (2021)');
 
     const ntfy = new NtfyAgent({
       enabled: true,
       embedPoster: false,
       options: { url: 'https://ntfy.example', topic: 't', ...options },
     } as never)['buildPayload'](type, payload());
-    assert.equal(ntfy.title, 'Verfügbar - Dune (2021)');
+    assert.equal(ntfy.title, 'Verfügbar - Zelvara (2021)');
   });
 
   it('are in the server’s language for channels that pick none', () => {
@@ -201,7 +199,10 @@ describe('notification event lines in each channel', () => {
       Notification.MEDIA_AVAILABLE,
       payload()
     ) as { text?: string; caption?: string };
-    assert.match(telegram.text ?? telegram.caption ?? '', /Verfügbar \\- Dune/);
+    assert.match(
+      telegram.text ?? telegram.caption ?? '',
+      /Verfügbar \\- Zelvara/
+    );
     main.locale = savedLocale;
   });
 
@@ -227,20 +228,19 @@ describe('notification event lines in each channel', () => {
       { ...payload(), event: 'Season 2 Is Here', eventTitle: undefined },
       'fr'
     );
-    assert.match(embed.title ?? '', /^Season 2 Is Here: Dune/);
+    assert.match(embed.title ?? '', /^Season 2 Is Here: Zelvara/);
   });
 });
 
 describe('a request’s notification', () => {
   it('carries its event line to be put in each channel’s language', async () => {
-    // The client sets its methods on each instance, so the stub swallows
-    // that write.
+    // The client assigns methods per instance; the stub swallows that write.
     Object.defineProperty(TheMovieDb.prototype, 'getMovie', {
       configurable: true,
       set() {},
       get() {
         return async () => ({
-          title: 'Dune',
+          title: 'Zelvara',
           release_date: '2021-10-22',
           overview: 'Spice.',
           poster_path: null,
@@ -265,7 +265,7 @@ describe('a request’s notification', () => {
       }) as MediaRequest;
       await MediaRequest.sendNotification(
         request,
-        { tmdbId: 438631 } as never,
+        { tmdbId: 549172 } as never,
         Notification.MEDIA_PENDING
       );
     } finally {

@@ -1,8 +1,13 @@
+import Alert from '@app/components/Common/Alert';
 import Badge from '@app/components/Common/Badge';
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
+import SaveBar from '@app/components/Common/SaveBar';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
 import LibraryItem from '@app/components/Settings/LibraryItem';
+import MusicLibraries, {
+  musicLibrariesKey,
+} from '@app/components/Settings/MusicLibraries';
 import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
@@ -14,27 +19,28 @@ import { MediaServerType } from '@server/constants/server';
 import type { JellyfinSettings } from '@server/lib/settings';
 import axios from 'axios';
 import { Field, Formik } from 'formik';
-import { useState } from 'react';
+import Link from 'next/link';
+import { useEffect, useRef, useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
-import useSWR from 'swr';
+import useSWR, { mutate } from 'swr';
 import * as Yup from 'yup';
 
 const messages = defineMessages('components.Settings', {
   jellyfinsettings: '{mediaServerName} Settings',
   jellyfinsettingsDescription:
-    'Configure the settings for your {mediaServerName} server. {mediaServerName} scans your {mediaServerName} libraries to see what content is available.',
+    'Seerr AI scans your {mediaServerName} libraries to see what’s available.',
   timeout: 'Timeout',
   save: 'Save Changes',
   saving: 'Saving…',
   jellyfinlibraries: '{mediaServerName} Libraries',
   jellyfinlibrariesDescription:
-    'The libraries {mediaServerName} scans for titles. Click the button below if no libraries are listed.',
+    'The {mediaServerName} libraries Seerr AI scans. None listed? Use the button below.',
   jellyfinSettingsFailure:
     'Something went wrong while saving {mediaServerName} settings.',
   jellyfinSettingsSuccess: '{mediaServerName} settings saved successfully!',
   jellyfinSettings: '{mediaServerName} Settings',
   jellyfinSettingsDescription:
-    'Optionally configure the internal and external endpoints for your {mediaServerName} server. In most cases, the external URL is different to the internal URL. A custom password reset URL can also be set for {mediaServerName} login, in case you would like to redirect to a different password reset page. You can also change the Jellyfin API key, which was automatically generated previously.',
+    'Optional internal and external addresses for {mediaServerName}, a password reset page, and its API key.',
   externalUrl: 'External URL',
   hostname: 'Hostname or IP Address',
   port: 'Port',
@@ -48,14 +54,14 @@ const messages = defineMessages('components.Settings', {
   jellyfinSyncFailedGenericError:
     'Something went wrong while syncing libraries',
   jellyfinSyncFailedConnectionError:
-    'Unable to reach the {mediaServerName} server. Check that it is running and reachable from Seerr AI.',
+    'Can’t reach {mediaServerName}. Check it’s running and reachable from Seerr AI.',
   toggleLibraryFailure: 'Failed to update library.',
   invalidurlerror: 'Unable to connect to {mediaServerName} server.',
   syncing: 'Syncing',
   syncJellyfin: 'Sync Libraries',
   manualscanJellyfin: 'Manual Library Scan',
   manualscanDescriptionJellyfin:
-    "Normally, this will only be run once every 24 hours. Seerr AI will check your {mediaServerName} server's recently added more aggressively. If this is your first time configuring Seerr AI, a one-time full manual library scan is recommended!",
+    'Runs once a day; recently added items are checked more often. Do a full scan after first setup.',
   notrunning: 'Not Running',
   currentlibrary: 'Current Library: {name}',
   librariesRemaining: 'Libraries Remaining: {count}',
@@ -69,7 +75,9 @@ const messages = defineMessages('components.Settings', {
   validationUrlBaseTrailingSlash: 'URL base must not end in a trailing slash',
   tip: 'Tip',
   scanbackground:
-    'Scanning will run in the background. You can continue the setup process in the meantime.',
+    'The scan runs in the background; you can carry on with setup.',
+  jellyfinNotConnected:
+    'Seerr AI is not connected to {mediaServerName}. Connect it under <MediaServersLink>Media Servers</MediaServersLink>.',
 });
 
 interface Library {
@@ -88,26 +96,45 @@ interface SyncStatus {
 
 interface SettingsJellyfinProps {
   isSetupSettings?: boolean;
+  /**
+   * The server these settings are for. Defaults to Jellyfin, or Emby when Emby
+   * is connected and Jellyfin isn't.
+   */
+  kind?: 'jellyfin' | 'emby';
 }
 
 const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
   isSetupSettings,
+  kind: kindProp,
 }) => {
+  const settings = useSettings();
+  // /settings/jellyfin, Emby's old address, still shows Emby's settings when
+  // Emby is connected and Jellyfin isn't.
+  const connected = settings.currentSettings.mediaServers.map((s) => s.kind);
+  const kind =
+    kindProp ??
+    (connected.includes('jellyfin')
+      ? 'jellyfin'
+      : connected.includes('emby') ||
+          settings.currentSettings.mediaServerType === MediaServerType.EMBY
+        ? 'emby'
+        : 'jellyfin');
+  const endpoint = `/api/v1/settings/${kind}`;
+  const mediaServerName = kind === 'emby' ? 'Emby' : 'Jellyfin';
   const [isSyncing, setIsSyncing] = useState(false);
   const {
     data,
     error,
     mutate: revalidate,
-  } = useSWR<JellyfinSettings>('/api/v1/settings/jellyfin');
+  } = useSWR<JellyfinSettings>(endpoint);
   const { data: dataSync, mutate: revalidateSync } = useSWR<SyncStatus>(
-    '/api/v1/settings/jellyfin/sync',
+    `${endpoint}/sync`,
     {
       refreshInterval: (latestData) => (latestData?.running ? 1000 : 10000),
     }
   );
   const intl = useIntl();
   const { addToast } = useToasts();
-  const settings = useSettings();
 
   const JellyfinSettingsSchema = Yup.object().shape({
     hostname: Yup.string()
@@ -163,9 +190,10 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
     setIsSyncing(true);
 
     try {
-      await axios.post('/api/v1/settings/jellyfin/library/sync');
+      await axios.post(`${endpoint}/library/sync`);
       setIsSyncing(false);
       revalidate();
+      mutate(musicLibrariesKey(endpoint));
     } catch (e) {
       if (e?.response?.data?.message === 'SYNC_ERROR_GROUPED_FOLDERS') {
         addToast(
@@ -180,10 +208,7 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
       } else if (e?.response?.data?.message === 'CONNECTION_ERROR') {
         addToast(
           intl.formatMessage(messages.jellyfinSyncFailedConnectionError, {
-            mediaServerName:
-              settings.currentSettings.mediaServerType === MediaServerType.EMBY
-                ? 'Emby'
-                : 'Jellyfin',
+            mediaServerName,
           }),
           {
             autoDismiss: true,
@@ -209,15 +234,27 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
     }
   };
 
+  // In first-time setup, list the just-connected server's libraries without
+  // needing Sync Libraries.
+  const syncedForSetup = useRef(false);
+  useEffect(() => {
+    if (isSetupSettings && data?.ip && !syncedForSetup.current) {
+      syncedForSetup.current = true;
+      syncLibraries();
+    }
+    // Once, when the settings first arrive.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSetupSettings, data?.ip]);
+
   const startScan = async () => {
-    await axios.post('/api/v1/settings/jellyfin/sync', {
+    await axios.post(`${endpoint}/sync`, {
       start: true,
     });
     revalidateSync();
   };
 
   const cancelScan = async () => {
-    await axios.post('/api/v1/settings/jellyfin/sync', {
+    await axios.post(`${endpoint}/sync`, {
       cancel: true,
     });
     revalidateSync();
@@ -226,7 +263,7 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
   const toggleLibrary = async (libraryId: string) => {
     setIsSyncing(true);
     try {
-      await axios.put(`/api/v1/settings/jellyfin/library/${libraryId}`, {
+      await axios.put(`${endpoint}/library/${libraryId}`, {
         enabled: !activeLibraries.includes(libraryId),
       });
     } catch {
@@ -244,17 +281,28 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
     return <LoadingSpinner />;
   }
 
-  const mediaServerFormatValues = {
-    mediaServerName:
-      settings.currentSettings.mediaServerType === MediaServerType.JELLYFIN
-        ? 'Jellyfin'
-        : settings.currentSettings.mediaServerType === MediaServerType.EMBY
-          ? 'Emby'
-          : undefined,
-  };
+  const mediaServerFormatValues = { mediaServerName };
 
   return (
     <>
+      {!isSetupSettings && data?.connected === false && (
+        <div className="mb-6">
+          <Alert
+            type="warning"
+            title={intl.formatMessage(messages.jellyfinNotConnected, {
+              mediaServerName,
+              MediaServersLink: (msg: React.ReactNode) => (
+                <Link
+                  href="/settings/media-servers"
+                  className="text-strong transition duration-300 hover:underline"
+                >
+                  {msg}
+                </Link>
+              ),
+            })}
+          />
+        </div>
+      )}
       <div className="mb-6">
         <h3 className="heading">
           {intl.formatMessage(
@@ -298,6 +346,7 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
           ))}
         </ul>
       </div>
+      <MusicLibraries endpoint={endpoint} isSetup={isSetupSettings} />
       <div className="mb-6 mt-10">
         <h3 className="heading">
           <FormattedMessage {...messages.manualscanJellyfin} />
@@ -314,7 +363,7 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
           <div className="relative mb-6 h-8 w-full overflow-hidden rounded-full bg-gray-600">
             {dataSync?.running && (
               <div
-                className="h-8 bg-indigo-600 transition-all duration-200 ease-in-out"
+                className="h-8 bg-accent transition-all duration-200 ease-in-out"
                 style={{
                   width: `${Math.round(
                     (dataSync.progress / dataSync.total) * 100
@@ -441,7 +490,7 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
         validationSchema={JellyfinSettingsSchema}
         onSubmit={async (values) => {
           try {
-            await axios.post('/api/v1/settings/jellyfin', {
+            await axios.post(endpoint, {
               ip: values.hostname,
               port: Number(values.port),
               useSsl: values.useSsl,
@@ -506,7 +555,7 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
                   <div className="form-row">
                     <label htmlFor="hostname" className="text-label">
                       {intl.formatMessage(messages.hostname)}
-                      <span className="text-red-500">*</span>
+                      <span className="text-danger-text">*</span>
                     </label>
                     <div className="form-input-area">
                       <div className="form-input-field">
@@ -652,9 +701,7 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
                     )}
                 </div>
               </div>
-              <div
-                className={`actions ${isSetupSettings ? 'mt-0 border-0' : ''}`}
-              >
+              <SaveBar className={isSetupSettings ? 'mt-0 border-0' : ''}>
                 <div className="flex justify-end">
                   <span className="ml-3 inline-flex rounded-md shadow-sm">
                     <Button
@@ -671,7 +718,7 @@ const SettingsJellyfin: React.FC<SettingsJellyfinProps> = ({
                     </Button>
                   </span>
                 </div>
-              </div>
+              </SaveBar>
             </form>
           );
         }}

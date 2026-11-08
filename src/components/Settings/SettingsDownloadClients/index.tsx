@@ -23,7 +23,7 @@ import useSWR from 'swr';
 const messages = defineMessages('components.Settings.SettingsDownloadClients', {
   title: 'Download Clients',
   description:
-    'Link your download clients so download progress updates every few seconds, with what the client is doing (repairing, unpacking, running its script, no one to download from): SABnzbd, NZBGet, qBittorrent, Transmission, Deluge or rTorrent. Radarr and Sonarr still send the downloads; Seerr AI only reads them. Backfill can send what it finds to any of them.',
+    'Shows live download progress and what the client is doing. Radarr and Sonarr still send downloads; Backfill can use any.',
   addClient: 'Add Download Client',
   client: 'Client',
   sabnzbd: 'SABnzbd',
@@ -33,7 +33,7 @@ const messages = defineMessages('components.Settings.SettingsDownloadClients', {
   deluge: 'Deluge',
   rtorrent: 'rTorrent',
   deleteClient: 'Delete Download Client',
-  deleteClientConfirm: 'Are you sure you want to delete this download client?',
+  deleteClientConfirm: 'Delete this download client?',
   deleteFailed: 'Could not delete the download client.',
 });
 
@@ -51,9 +51,8 @@ const LOGOS: Record<
 };
 
 /*
- * Download clients, laid out like the Maintainerr section: a tile per client
- * with Edit and Delete, a dashed tile to add one, and a dialog for the
- * details.
+ * Download clients, laid out like Maintainerr: a tile per client with Edit and
+ * Delete, a dashed tile to add one, and a dialog for the details.
  */
 const SettingsDownloadClients = () => {
   const intl = useIntl();
@@ -139,7 +138,9 @@ const SettingsDownloadClients = () => {
                   hostname={client.hostname}
                   port={client.port}
                   isSSL={client.useSsl}
-                  logo={<Logo className="h-10 w-10 flex-shrink-0" />}
+                  logo={
+                    <Logo className="service-logo h-10 w-10 flex-shrink-0" />
+                  }
                   detail={{
                     label: intl.formatMessage(messages.client),
                     value: intl.formatMessage(messages[client.type]),

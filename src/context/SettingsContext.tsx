@@ -1,4 +1,5 @@
 import { MediaServerType } from '@server/constants/server';
+import { SERVER_THEME_DEFAULTS } from '@server/constants/theme';
 import type { PublicSettingsResponse } from '@server/interfaces/api/settingsInterfaces';
 import React from 'react';
 import useSWR from 'swr';
@@ -13,11 +14,15 @@ const defaultSettings = {
   applicationTitle: 'Seerr AI',
   applicationUrl: '',
   disabledFeatures: [] as string[],
+  animeExcludedCountries: [] as string[],
   hideAvailable: false,
   hideBlocklisted: false,
   hideRequested: false,
   localLogin: true,
   mediaServerLogin: true,
+  personalApiKeys: 'off' as const,
+  mediaServers: [],
+  oidcProviders: [],
   movie4kEnabled: false,
   series4kEnabled: false,
   discoverRegion: '',
@@ -38,6 +43,12 @@ const defaultSettings = {
   aiReady: false,
   subtitlesReady: false,
   traktReady: false,
+  musicReady: false,
+  musicSearch: { inAll: false },
+  musicSongs: false,
+  themeDefault: SERVER_THEME_DEFAULTS,
+  seasons: [],
+  customCss: { server: null, personal: false },
 };
 
 export const SettingsContext = React.createContext<SettingsContextProps>({
@@ -52,9 +63,8 @@ export const SettingsProvider = ({
     fallbackData: currentSettings,
   });
 
-  // A failed refresh keeps the settings last loaded (SWR holds on to them):
-  // falling back to the defaults would turn features off until it next
-  // succeeded.
+  // SWR keeps the last settings on a failed refresh; defaults would turn
+  // features off until it succeeded.
   const newSettings = data ?? defaultSettings;
 
   return (

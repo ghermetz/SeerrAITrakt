@@ -1,6 +1,8 @@
+import usePageReturn from '@app/hooks/usePageReturn';
 import useTitleChanged, { pageHolds } from '@app/hooks/useTitleChanged';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
+import { START_PAGES, listProgress } from '@app/utils/discoverPages';
 import { MediaStatus } from '@server/constants/media';
 import { useEffect } from 'react';
 import { useIntl } from 'react-intl';
@@ -32,6 +34,8 @@ interface DiscoverResult<T, S> {
   isReachingEnd: boolean;
   error: unknown;
   titles: T[];
+  /** Pages of results loaded. */
+  pagesLoaded: number;
   firstResultData?: BaseSearchResult<T> & S;
   mutate?: () => void;
 }
@@ -60,7 +64,18 @@ const useDiscover = <
 >(
   endpoint: string,
   options?: O,
-  { hideAvailable = true, hideBlocklisted = true, hideRequested = true } = {}
+  {
+    hideAvailable = true,
+    hideBlocklisted = true,
+    hideRequested = true,
+    shortPages = false,
+  }: {
+    hideAvailable?: boolean;
+    hideBlocklisted?: boolean;
+    hideRequested?: boolean;
+    /** Pages may hold fewer than 20 without being last, so only the page count marks the end. */
+    shortPages?: boolean;
+  } = {}
 ): DiscoverResult<T, S> => {
   const settings = useSettings();
   const { hasPermission } = useUser();
@@ -89,38 +104,32 @@ const useDiscover = <
       return `${endpoint}?${finalQueryString}`;
     },
     {
-      initialSize: 3,
       revalidateFirstPage: false,
       dedupingInterval: 30000,
       revalidateOnFocus: false,
     }
   );
 
-  // After a request from one of these cards, reload only the pages that
-  // hold the title, so its badge changes without reloading the whole row.
+  // After a request, reload only the pages holding the title.
   useTitleChanged((title) => {
     if (data?.some((page) => pageHolds(page, title))) {
       mutate(undefined, { revalidate: (page) => pageHolds(page, title) });
     }
   });
 
-  // A film and a series can share a TMDB number: both are kept.
+  // A film and a series can share a TMDB id; keep both.
   const resultIds = new Set<string>();
 
   const isLoadingInitialData = !data && !error;
-  const isLoadingMore =
+  const loadingPages =
     isLoadingInitialData ||
     (size > 0 &&
       !!data &&
       typeof data[size - 1] === 'undefined' &&
       isValidating);
 
-  const fetchMore = () => {
-    setSize(size + 1);
-  };
-
   let titles = (data ?? []).reduce((a, v) => {
-    // A page without its list is passed over, as in MediaSlider.
+    // Skip pages without results, as in MediaSlider.
     if (!Array.isArray(v?.results)) {
       return a;
     }
@@ -171,17 +180,72 @@ const useDiscover = <
     });
   }
 
-  const isEmpty = !isLoadingInitialData && titles?.length === 0;
-  const lastPage = data?.[data.length - 1];
-  const isReachingEnd =
-    isEmpty ||
-    // No page past the last one the server counts is ever asked for. A page
-    // can hold more than 20 (search adds collections to each), so the
-    // counts below alone could leave this waiting for a page never asked.
-    (!!data && !!lastPage && data.length >= lastPage.totalPages) ||
-    (!!data && (data[data?.length - 1]?.results.length ?? 0) < 20) ||
-    (!!data && (data[data?.length - 1]?.totalResults ?? 0) <= size * 20) ||
-    (!!data && (data[data?.length - 1]?.totalResults ?? 0) < 41);
+  const { starting, isEmpty, isReachingEnd } = listProgress({
+    pages: data,
+    loadingFirst: isLoadingInitialData,
+    size,
+    titlesShown: titles.length,
+    shortPages,
+  });
+
+  // Once the first page shows, request the rest of the initial pages.
+  useEffect(() => {
+    if (starting && size < START_PAGES) {
+      setSize(START_PAGES);
+    }
+  }, [starting, size, setSize]);
+
+  // Coming back to the list: the pages it had, then where it was scrolled.
+  const loadedPages = data?.length ?? 0;
+  const returnPages = usePageReturn('list', {
+    pages: loadedPages,
+    isReady: (wanted) =>
+      !isLoadingInitialData &&
+      (!!error || isReachingEnd || loadedPages >= (wanted ?? 0)),
+  });
+  useEffect(() => {
+    if (
+      returnPages &&
+      returnPages > START_PAGES &&
+      loadedPages > 0 &&
+      size < returnPages &&
+      !isReachingEnd &&
+      !error
+    ) {
+      setSize(returnPages);
+    }
+  }, [returnPages, loadedPages, size, isReachingEnd, error, setSize]);
+
+  // Initial pages count as loading more, so scrolling doesn't re-request page 2.
+  const isLoadingMore = loadingPages || (starting && !error);
+
+  const fetchMore = () => {
+    setSize(starting ? Math.max(size, START_PAGES) : size + 1);
+  };
+
+  // Too few titles to scroll: request the next page now (a few pages at most).
+  useEffect(() => {
+    if (
+      shortPages &&
+      !starting &&
+      !isReachingEnd &&
+      !isLoadingMore &&
+      !error &&
+      titles.length < 20 &&
+      size < 5
+    ) {
+      setSize(size + 1);
+    }
+  }, [
+    shortPages,
+    starting,
+    isReachingEnd,
+    isLoadingMore,
+    error,
+    titles.length,
+    size,
+    setSize,
+  ]);
 
   useEffect(() => {
     if (error && titles.length) {
@@ -201,6 +265,7 @@ const useDiscover = <
     isReachingEnd,
     error: error && titles.length ? null : error,
     titles,
+    pagesLoaded: loadedPages,
     firstResultData: data?.[0],
     mutate,
   };

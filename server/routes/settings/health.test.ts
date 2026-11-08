@@ -1,22 +1,36 @@
 import DelugeAPI from '@server/api/downloadclients/deluge';
 import NzbgetAPI from '@server/api/downloadclients/nzbget';
+import { musicBrainzQueue } from '@server/api/musicbrainz';
+import type { PlexLibraryItem } from '@server/api/plexapi';
+import PlexAPI from '@server/api/plexapi';
 import TheMovieDb from '@server/api/themoviedb';
 import {
   MediaRequestStatus,
   MediaStatus,
   MediaType,
 } from '@server/constants/media';
+import { MediaServerType } from '@server/constants/server';
 import dataSource, { getRepository } from '@server/datasource';
+import AgentRun from '@server/entity/AgentRun';
+import AlbumRequest from '@server/entity/AlbumRequest';
 import BackfillJob from '@server/entity/BackfillJob';
 import BackfillSeries from '@server/entity/BackfillSeries';
+import DownloadCheck from '@server/entity/DownloadCheck';
 import Media from '@server/entity/Media';
 import MediaEvent from '@server/entity/MediaEvent';
 import { MediaRequest } from '@server/entity/MediaRequest';
+import MusicAlbum from '@server/entity/MusicAlbum';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import { Permission } from '@server/lib/permissions';
-import plexMatchCheck from '@server/lib/plexMatchCheck';
-import type { RadarrSettings } from '@server/lib/settings';
+import {
+  FIXES_PATH,
+  forgetFixesForTests,
+  setFixTimingForTests,
+} from '@server/lib/plexFixMatch';
+import type { PlexMatchProblem } from '@server/lib/plexMatchCheck';
+import plexMatchCheck, { problemKey } from '@server/lib/plexMatchCheck';
+import type { LidarrSettings, RadarrSettings } from '@server/lib/settings';
 import { BACKFILL_DEFAULTS, getSettings } from '@server/lib/settings';
 import mediaRoutes from '@server/routes/media';
 import settingsRoutes from '@server/routes/settings';
@@ -24,15 +38,24 @@ import { setupTestDb } from '@server/test/db';
 import express from 'express';
 import * as OpenApiValidator from 'express-openapi-validator';
 import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
 import type { Server } from 'node:http';
 import http from 'node:http';
 import path from 'node:path';
-import { after, before, beforeEach, describe, it, mock } from 'node:test';
+import {
+  after,
+  afterEach,
+  before,
+  beforeEach,
+  describe,
+  it,
+  mock,
+} from 'node:test';
 
 /*
- * The admin health page's checks, against a real database and real HTTP:
- * services that answer and one that does not, and requests, titles and users
- * in each problem state alongside ones that must not be flagged.
+ * Admin health checks against a real database and real HTTP: answering and
+ * unreachable services, and requests, titles and users in each problem state
+ * beside ones that must not be flagged.
  */
 
 setupTestDb();
@@ -41,14 +64,16 @@ const HOUR = 60 * 60 * 1000;
 const GB = 1024 ** 3;
 const DAY = 24 * HOUR;
 
+/** TMDB film lookups (for names). */
+let movieLookups = 0;
 Object.defineProperty(TheMovieDb.prototype, 'getMovie', {
   configurable: true,
   set() {},
   get() {
-    return async ({ movieId }: { movieId: number }) => ({
-      id: movieId,
-      title: `Movie ${movieId}`,
-    });
+    return async ({ movieId }: { movieId: number }) => {
+      movieLookups++;
+      return { id: movieId, title: `Movie ${movieId}` };
+    };
   },
 });
 Object.defineProperty(TheMovieDb.prototype, 'getTvShow', {
@@ -62,25 +87,34 @@ Object.defineProperty(TheMovieDb.prototype, 'getTvShow', {
   },
 });
 
-// A service that answers the status calls Seerr makes, and Radarr's and
-// Sonarr's catalogues as their APIs return them.
+// Fake service answering Seerr's status calls, plus Radarr and Sonarr
+// catalogues as their APIs return them.
 let radarrMovies: unknown[] = [];
 let sonarrSeries: unknown[] = [];
 let sonarrEpisodes: unknown[] = [];
-let commands: { name: string; episodeIds?: number[]; movieIds?: number[] }[] =
-  [];
-// What the fake Radarr says on its health page, and its disks.
+let commands: {
+  name: string;
+  episodeIds?: number[];
+  movieIds?: number[];
+  albumIds?: number[];
+}[] = [];
+// The fake Radarr's health page and disks.
 let arrHealth: unknown[] | null = [];
 let rootFolders: unknown[] = [];
 // The fake Prowlarr's indexers and their failures.
 let indexers: unknown[] = [];
 let indexerStatus: unknown[] = [];
+// The fake Lidarr's download queue.
+let lidarrQueue: unknown[] = [];
 // The fake Bazarr's status page and providers.
 let bazarrHealth: unknown[] = [];
 let bazarrProviders: unknown[] = [];
 const fake = http.createServer((req, res) => {
   const url = req.url ?? '';
-  if (req.method === 'POST' && url.startsWith('/api/v3/command')) {
+  if (
+    req.method === 'POST' &&
+    (url.startsWith('/api/v3/command') || url.startsWith('/api/v1/command'))
+  ) {
     let raw = '';
     req.on('data', (c) => (raw += c));
     req.on('end', () => {
@@ -96,13 +130,22 @@ const fake = http.createServer((req, res) => {
     ['/api/v3/rootfolder', rootFolders],
     ['/api/v1/health', []],
     ['/api/v1/indexerstatus', indexerStatus],
+    [
+      '/api/v1/queue',
+      {
+        page: 1,
+        pageSize: lidarrQueue.length,
+        totalRecords: lidarrQueue.length,
+        records: lidarrQueue,
+      },
+    ],
     ['/api/v1/indexer', indexers],
     ['/api/system/status', { data: { bazarr_version: '1.5.3' } }],
     ['/api/system/health', { data: bazarrHealth }],
     ['/api/providers', { data: bazarrProviders }],
   ];
   const answer = answers.find(([prefix]) => url.startsWith(prefix));
-  // null: the request gets no answer at all.
+  // null: the request gets no answer.
   if (answer && answer[1] === null) {
     req.socket.destroy();
     return;
@@ -138,7 +181,7 @@ type Check = {
   count: number;
   detail?: string;
   partial?: boolean;
-  items: { title: string; detail?: string; href?: string }[];
+  items: { title: string; detail?: string; href?: string; fix?: string }[];
 };
 const health = () =>
   new Promise<Check[]>((resolve, reject) => {
@@ -178,7 +221,7 @@ const radarr = (id: number, name: string, portNumber: number): RadarrSettings =>
   }) as unknown as RadarrSettings;
 
 before(async () => {
-  // The match check's last report is a file other tests may have left.
+  // The match check's last report is a file other tests may leave behind.
   mock.method(plexMatchCheck, 'lastReport', async () => ({
     finishedAt: null,
     running: false,
@@ -236,6 +279,7 @@ beforeEach(() => {
   settings.plex = { ...settings.plex, ip: '' };
   settings.radarr = [radarr(0, 'Radarr', fakePort), radarr(1, 'Radarr 4K', 1)];
   settings.sonarr = [];
+  settings.lidarr = [];
   settings.tautulli = {};
   settings.maintainerr = [
     {
@@ -270,7 +314,7 @@ const backdate = async (
 
 describe('services', () => {
   it('reports each configured service, answering or not, by name', async () => {
-    // The database is listed too on Postgres; it has a test of its own.
+    // On Postgres the database is listed too; it has its own test.
     const checks = (await health()).filter(
       (c) => c.group === 'services' && c.id !== 'database'
     );
@@ -281,6 +325,26 @@ describe('services', () => {
     ]);
     assert.match(byId(checks, 'radarr:0').detail!, /^\d+ ms · 500 GB free$/);
     assert.ok(byId(checks, 'radarr:1').detail, 'says why it failed');
+  });
+
+  it('checks Lidarr like Radarr, unless music is turned off for everyone', async () => {
+    const settings = getSettings();
+    settings.lidarr = [
+      {
+        ...radarr(0, 'Lidarr', fakePort),
+        activeMetadataProfileId: 1,
+        activeMetadataProfileName: 'Standard',
+      } as unknown as LidarrSettings,
+    ];
+    try {
+      const lidarr = byId(await health(), 'lidarr:0');
+      assert.equal(lidarr.name, 'Lidarr');
+      assert.equal(lidarr.status, 'ok');
+      settings.main.disabledFeatures = ['music'];
+      assert.equal(byId(await health(), 'lidarr:0'), undefined);
+    } finally {
+      settings.main.disabledFeatures = [];
+    }
   });
 
   it('names the subtitle providers Bazarr has paused, such as WhisperAI', async () => {
@@ -452,7 +516,7 @@ describe('services', () => {
         deluge.items.map((i) => [i.title, i.href]),
         [["Deluge's Label plugin is off", '/settings/backfill']]
       );
-      // Not one Backfill uses: only whether it answers.
+      // Not used by Backfill: only checked for an answer.
       const nzbget = byId(checks, 'downloadClient:9');
       assert.equal(nzbget.status, 'ok');
       assert.match(nzbget.detail!, /NZBGet 24\.3/);
@@ -473,6 +537,50 @@ describe('services', () => {
     const database = byId(await health(), 'database');
     assert.equal(database.status, 'ok');
     assert.match(database.detail!, /\d+ of \d+ connections/);
+  });
+});
+
+describe('media servers', () => {
+  it('checks each connected media server, and only those', async (t) => {
+    const settings = getSettings();
+    const kept = {
+      type: settings.main.mediaServerType,
+      plex: settings.plex,
+      jellyfin: settings.jellyfin,
+      emby: settings.emby,
+    };
+    t.after(() => {
+      settings.main.mediaServerType = kept.type;
+      settings.plex = kept.plex;
+      settings.jellyfin = kept.jellyfin;
+      settings.emby = kept.emby;
+    });
+    // Nothing answers on port 1: each is listed as not answering.
+    const nowhere = { ip: '127.0.0.1', port: 1, useSsl: false };
+    settings.main.mediaServerType = MediaServerType.JELLYFIN;
+    settings.plex = { ...settings.plex, ...nowhere, connected: true };
+    settings.jellyfin = { ...settings.jellyfin, ...nowhere, apiKey: 'jk' };
+    settings.emby = {
+      ...settings.emby,
+      ...nowhere,
+      apiKey: 'ek',
+      connected: true,
+    };
+
+    const names = async () =>
+      (await health())
+        .filter((c) => ['plex', 'jellyfin', 'emby'].includes(c.id))
+        .map((c) => `${c.name}:${c.status}`)
+        .sort();
+
+    assert.deepEqual(await names(), [
+      'Emby:error',
+      'Jellyfin:error',
+      'Plex:error',
+    ]);
+
+    settings.emby.connected = false;
+    assert.deepEqual(await names(), ['Jellyfin:error', 'Plex:error']);
   });
 });
 
@@ -529,6 +637,192 @@ describe('Backfill', () => {
     const checks = await health();
     assert.equal(checks.filter((c) => c.group === 'backfill').length, 0);
   });
+
+  it('lists what Download Check and the agent wait on, and says what both did this week', async () => {
+    const settings = getSettings();
+    const ai = settings.ai;
+    const disabled = settings.main.disabledFeatures;
+    settings.backfill = {
+      ...BACKFILL_DEFAULTS,
+      enabled: true,
+      downloadCheck: { mode: 'on' },
+    };
+    // The stand-in as a local model server, so the AI check queries it.
+    settings.ai = {
+      enabled: true,
+      provider: 'openai',
+      apiKey: '',
+      baseUrl: `http://127.0.0.1:${fakePort}/v1`,
+      model: 'local-test',
+      featureModels: {},
+      dailyLimit: 0,
+    };
+    settings.main.disabledFeatures = [];
+    try {
+      const now = new Date();
+      const checks = getRepository(DownloadCheck);
+      let key = 0;
+      const finding = (over: Partial<DownloadCheck>) =>
+        checks.save(
+          new DownloadCheck({
+            app: 'sonarr',
+            serverId: 0,
+            downloadKey: `key${++key}`,
+            stage: 'grab',
+            title: 'Remote.Reach.S08E01.720p-GRP',
+            itemId: 77,
+            itemTitle: 'Remote Reach',
+            episodes: 'S08E01',
+            finding: 'early',
+            action: 'reject',
+            status: 'done',
+            params: '{}',
+            detail: '',
+            createdAt: now,
+            updatedAt: now,
+            ...over,
+          })
+        );
+      await finding({});
+      await finding({ action: 'import', finding: 'renumbered' });
+      await finding({ action: 'clear', finding: 'alreadyImported' });
+      await finding({ status: 'failed' });
+      await finding({
+        action: 'review',
+        finding: 'unsureTitle',
+        status: 'waiting',
+        title: 'Remote.Reach.Revisited.S01E02-GRP',
+      });
+      // From last week, so not counted.
+      await finding({ createdAt: new Date(Date.now() - 8 * DAY) });
+
+      const runs = getRepository(AgentRun);
+      const waiting = await runs.save(
+        new AgentRun({
+          trigger: 'ask',
+          status: 'waiting',
+          title: 'Remote Reach',
+          question: 'Should I take the 1080p pack?\nIt replaces 3 files.',
+          finishedAt: now,
+        })
+      );
+      const done = await runs.save(
+        new AgentRun({
+          trigger: 'auto',
+          status: 'done',
+          title: 'Far Afield',
+          finishedAt: now,
+          actions: [
+            {
+              at: now.toISOString(),
+              type: 'change',
+              title: 'Far Afield',
+              detail: 'Deleted the wrong file',
+            },
+          ],
+        })
+      );
+      const title = await getRepository(BackfillSeries).save(
+        new BackfillSeries({
+          kind: 'series',
+          serverId: 0,
+          arrId: 77,
+          title: 'Far Afield',
+          status: 'downloading',
+        })
+      );
+      const job = (status: BackfillJob['status'], imported: number) =>
+        new BackfillJob({
+          seriesId: title.id,
+          title: 'Far.Afield.S01E01-GRP',
+          status,
+          mode: 'missing',
+          protocol: 'torrent',
+          clientId: 1,
+          files: [],
+          imported,
+          agentRunId: done.id,
+          finishedAt: now,
+        });
+      await getRepository(BackfillJob).save([
+        job('done', 1),
+        job('failed', 0),
+        job('downloading', 0),
+      ]);
+
+      const body = await new Promise<{
+        checks: Check[];
+        activity: Record<string, Record<string, unknown>>;
+      }>((resolve, reject) => {
+        http
+          .get(
+            { host: '127.0.0.1', port, path: '/api/v1/settings/health' },
+            (res) => {
+              let raw = '';
+              res.on('data', (c) => (raw += c));
+              res.on('end', () => resolve(JSON.parse(raw)));
+            }
+          )
+          .on('error', reject);
+      });
+      const byId = new Map(body.checks.map((c) => [c.id, c]));
+      const findings = byId.get('downloadCheckWaiting')!;
+      assert.equal(findings.status, 'warning');
+      assert.equal(findings.count, 1);
+      assert.equal(findings.items[0].title, 'Remote Reach S08E01');
+      assert.match(
+        findings.items[0].detail!,
+        /^Remote\.Reach\.Revisited\.S01E02-GRP · /
+      );
+      assert.equal(findings.items[0].href, '/backfill#download-check');
+      const asking = byId.get('agentWaiting')!;
+      assert.equal(asking.count, 1);
+      assert.equal(asking.items[0].href, `/backfill/agent/${waiting.id}`);
+      assert.match(
+        asking.items[0].detail!,
+        /^Should I take the 1080p pack\? · /
+      );
+
+      assert.deepEqual(body.activity, {
+        downloadCheck: {
+          mode: 'on',
+          rejected: 1,
+          imported: 1,
+          cleared: 1,
+          wouldHave: 0,
+          failed: 1,
+        },
+        agent: {
+          conversations: 2,
+          downloads: 3,
+          imported: 1,
+          failed: 1,
+          changes: 1,
+        },
+      });
+    } finally {
+      settings.ai = ai;
+      settings.main.disabledFeatures = disabled;
+      await getRepository(DownloadCheck)
+        .createQueryBuilder()
+        .delete()
+        .execute();
+      await getRepository(BackfillJob).createQueryBuilder().delete().execute();
+      await getRepository(AgentRun).createQueryBuilder().delete().execute();
+    }
+  });
+
+  it('leaves Download Check and the agent out while they are off', async () => {
+    getSettings().backfill = { ...BACKFILL_DEFAULTS, enabled: true };
+    const ids = (await health())
+      .filter((c) => c.group === 'backfill')
+      .map((c) => c.id);
+    assert.deepEqual(ids, [
+      'backfillSearchErrors',
+      'backfillAwaiting',
+      'backfillFailed',
+    ]);
+  });
 });
 
 describe('requests, titles and users', () => {
@@ -555,10 +849,9 @@ describe('requests, titles and users', () => {
     const media = await getRepository(Media).save(
       new Media({ tmdbId, mediaType: type, status: mediaStatus, tvdbId })
     );
-    // Saved as pending, then moved to the wanted status without the save
-    // hooks: an approved save tries to send it straight away, and with no
-    // default Radarr here that marks it failed. Approved-but-unsent really
-    // arises from a send that errors, such as Radarr being down.
+    // Saved as pending, then set to the wanted status without save hooks: an
+    // approved save sends at once and, with no default Radarr, fails.
+    // Approved-but-unsent really comes from a send error (e.g. Radarr down).
     const request = await getRepository(MediaRequest).save(
       new MediaRequest({
         type,
@@ -604,7 +897,7 @@ describe('requests, titles and users', () => {
       MediaStatus.PROCESSING,
       MediaRequestStatus.APPROVED
     );
-    // Radarr added it, and gave it an id.
+    // Radarr added it and gave it an id.
     await getRepository(Media).update(sent.media.id, { externalServiceId: 77 });
     await backdate(
       'media_request',
@@ -798,8 +1091,8 @@ describe('requests, titles and users', () => {
   });
 
   it('keeps requests with no title out of the other checks, listed on their own', async () => {
-    // What the live page showed: every "never sent" row was a request no
-    // longer linked to a title.
+    // Seen live: every "never sent" row was a request no longer linked to a
+    // title.
     const orphan = async (status: MediaRequestStatus) => {
       const inserted = await getRepository(MediaRequest)
         .createQueryBuilder()
@@ -1004,7 +1297,7 @@ describe('requests, titles and users', () => {
               try {
                 parsed = raw ? JSON.parse(raw) : {};
               } catch {
-                // An error page rather than JSON; the status is what matters.
+                // An error page, not JSON; only the status matters.
               }
               resolve({ status: res.statusCode ?? 0, body: parsed });
             });
@@ -1382,18 +1675,30 @@ describe('requests, titles and users', () => {
     );
     assert.deepEqual([failed.body.count, failed.body.items.length], [11, 1]);
 
-    assert.equal(
-      (await get('/api/v1/settings/health/checks/nonsense')).status,
-      404
+    // Another check's page runs only that check: no film lookups.
+    movieLookups = 0;
+    const tvdb = await get('/api/v1/settings/health/checks/missingTvdb?page=2');
+    assert.deepEqual([tvdb.status, movieLookups], [200, 0]);
+
+    for (const id of ['nonsense', 'constructor', 'toString', '__proto__']) {
+      assert.equal(
+        (await get(`/api/v1/settings/health/checks/${id}`)).status,
+        404,
+        id
+      );
+    }
+    const far = await get(
+      '/api/v1/settings/health/checks/failedRequests?page=99999999999999999999999'
     );
+    assert.deepEqual([far.status, far.body.items.length], [200, 0]);
   });
 
   it('lists folders Plex matched to another title, opening the right one', async (t) => {
     await getRepository(Media).save(
       new Media({
         mediaType: MediaType.TV,
-        tmdbId: 288673,
-        tvdbId: 455755,
+        tmdbId: 375182,
+        tvdbId: 577104,
         status: MediaStatus.PARTIALLY_AVAILABLE,
       })
     );
@@ -1405,17 +1710,17 @@ describe('requests, titles and users', () => {
       problems: [
         {
           kind: 'series' as const,
-          folder: 'Carrie',
+          folder: 'Wrenna',
           reason: 'other' as const,
           expected: {
-            title: 'Carrie',
+            title: 'Wrenna',
             year: 2026,
-            tvdbId: 455755,
+            tvdbId: 577104,
             server: 'Sonarr',
           },
           mediaServer: 'Plex',
           matched: {
-            title: 'The Carrie Diaries',
+            title: 'The Wrenna Diaries',
             year: 2013,
             key: '126741',
           },
@@ -1428,9 +1733,9 @@ describe('requests, titles and users', () => {
       check.items.map((i) => [i.title, i.detail, i.href]),
       [
         [
-          'Plex matched "Carrie" to The Carrie Diaries (2013)',
-          'Sonarr has Carrie (2026) there (Sonarr: TVDB 455755) · Fix Match in Plex, searching tvdb-455755',
-          '/tv/288673',
+          'Plex matched "Wrenna" to The Wrenna Diaries (2013)',
+          'Sonarr has Wrenna (2026) there (Sonarr: TVDB 577104) · Fix Match in Plex, searching tvdb-577104',
+          '/tv/375182',
         ],
       ]
     );
@@ -1452,5 +1757,516 @@ describe('requests, titles and users', () => {
         'plexSignIn:ok',
       ]
     );
+  });
+});
+
+describe('fixing a wrong Plex match', () => {
+  const wrong: PlexMatchProblem = {
+    kind: 'movie',
+    folder: 'Static Garden (2024)',
+    reason: 'other',
+    expected: {
+      title: 'Static Garden',
+      year: 2024,
+      tmdbId: 846213,
+      server: 'Radarr',
+    },
+    mediaServer: 'Plex',
+    matched: {
+      title: 'Jardín Estático',
+      year: 2024,
+      key: '70',
+      tmdbId: 1427986,
+    },
+  };
+  const key = problemKey(wrong);
+
+  const call = (method: 'GET' | 'POST', route: string, body?: unknown) =>
+    new Promise<{ status: number; body: Record<string, unknown> }>(
+      (resolve, reject) => {
+        const payload = body === undefined ? '' : JSON.stringify(body);
+        const req = http.request(
+          {
+            host: '127.0.0.1',
+            port,
+            path: route,
+            method,
+            headers: payload
+              ? {
+                  'Content-Type': 'application/json',
+                  'Content-Length': Buffer.byteLength(payload),
+                }
+              : {},
+          },
+          (res) => {
+            let raw = '';
+            res.on('data', (c) => (raw += c));
+            res.on('end', () => {
+              // This app answers errors as HTML; only the status matters.
+              let parsed: Record<string, unknown> = {};
+              try {
+                parsed = JSON.parse(raw);
+              } catch {
+                parsed = {};
+              }
+              resolve({ status: res.statusCode ?? 0, body: parsed });
+            });
+          }
+        );
+        req.on('error', reject);
+        req.end(payload);
+      }
+    );
+
+  let forgotten: string[][];
+  // Restored one by one so the file-level lastReport mock stays.
+  let mocked: { mock: { restore: () => void } }[] = [];
+  const stub = <T extends object>(
+    target: T,
+    name: keyof T & string,
+    fn: (...args: never[]) => unknown
+  ) => {
+    mocked.push(mock.method(target, name, fn as never));
+  };
+
+  beforeEach(async () => {
+    forgotten = [];
+    setFixTimingForTests(50, 1);
+    actingAs = await getRepository(User).findOneByOrFail({ id: 1 });
+    await getRepository(User).update(1, { plexToken: 'token' });
+    const settings = getSettings();
+    settings.plex = { ...settings.plex, ip: 'plex.invalid' };
+    settings.main.matchFix = true;
+    stub(plexMatchCheck, 'lastReport', async () => ({
+      finishedAt: new Date().toISOString(),
+      running: false,
+      checked: 1,
+      notChecked: 0,
+      problems: [wrong],
+    }));
+    stub(plexMatchCheck, 'forget', async (keys: string[]) => {
+      forgotten.push(keys);
+    });
+    let item = {
+      ratingKey: '70',
+      title: 'Jardín Estático',
+      year: 2024,
+      guid: 'plex://movie/wrong',
+      Guid: [{ id: 'tmdb://1427986' }],
+      type: 'movie',
+      Media: [],
+    } as unknown as PlexLibraryItem;
+    stub(PlexAPI.prototype, 'getMatchItem', async () => item);
+    stub(PlexAPI.prototype, 'getLibraries', async () => []);
+    stub(
+      PlexAPI.prototype,
+      'findMatches',
+      async (_key: string, term: string) =>
+        term === 'tmdb-846213'
+          ? [{ guid: 'plex://movie/right', name: 'Static Garden', year: 2024 }]
+          : []
+    );
+    stub(
+      PlexAPI.prototype,
+      'setMatch',
+      async (_key: string, to: { guid: string }) => {
+        item = {
+          ...item,
+          title: 'Static Garden',
+          guid: to.guid,
+          Guid: [{ id: 'tmdb://846213' }],
+        };
+      }
+    );
+  });
+
+  afterEach(async () => {
+    for (const m of mocked) m.mock.restore();
+    mocked = [];
+    forgetFixesForTests();
+    await fs.rm(FIXES_PATH, { force: true });
+    getSettings().main.matchFix = true;
+  });
+
+  it('offers a fix for each it can put right, and fixes it by its key', async () => {
+    const [listed] = byId(await health(), 'plexMatches').items;
+    assert.equal(listed.fix, key);
+
+    const fixed = await call('POST', '/api/v1/settings/health/fix-match', {
+      key,
+    });
+    assert.equal(fixed.status, 200);
+    assert.equal(fixed.body.state, 'fixed');
+    assert.deepEqual(forgotten, [[key]], 'off the nightly list');
+
+    const { body } = await call('GET', '/api/v1/settings/health/match-fixes');
+    const [fix] = body.fixes as {
+      id: string;
+      by: number;
+      byName: string;
+      to: { title: string };
+    }[];
+    assert.equal(fix.by, 1);
+    assert.equal(fix.byName, actingAs?.displayName);
+    assert.equal(fix.to.title, 'Static Garden');
+
+    const undone = await call(
+      'POST',
+      `/api/v1/settings/health/match-fixes/${fix.id}/undo`
+    );
+    assert.equal(undone.status, 200);
+    assert.ok(undone.body.undoneAt);
+  });
+
+  it('offers no fix, and fixes nothing, with fixing turned off', async () => {
+    getSettings().main.matchFix = false;
+    const [listed] = byId(await health(), 'plexMatches').items;
+    assert.equal(listed.fix, undefined);
+    const refused = await call('POST', '/api/v1/settings/health/fix-match', {
+      key,
+    });
+    assert.equal(refused.status, 403);
+  });
+
+  it('says so for a problem no longer listed', async () => {
+    const gone = await call('POST', '/api/v1/settings/health/fix-match', {
+      key: 'Plex|movie|tmdb:1|5,,,',
+    });
+    assert.equal(gone.status, 404);
+  });
+});
+
+describe('music', () => {
+  const ARTIST = '3c9e5f21-8d47-4b6a-a1e3-5f7d2c90b844';
+  const album = (n: number) =>
+    `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+
+  beforeEach(async () => {
+    commands = [];
+    const settings = getSettings();
+    settings.main.disabledFeatures = [];
+    // A default Lidarr makes music ready.
+    settings.lidarr = [
+      {
+        ...radarr(0, 'Lidarr', fakePort),
+        isDefault: true,
+        activeMetadataProfileId: 1,
+        activeMetadataProfileName: 'Standard',
+      } as unknown as LidarrSettings,
+    ];
+    // Plex with a music library enabled, so the media server decides whether
+    // an album is present.
+    settings.main.mediaServerType = MediaServerType.PLEX;
+    settings.plex = {
+      ...settings.plex,
+      connected: true,
+      musicLibraries: [
+        { id: '7', name: 'Music', enabled: true, type: 'artist' },
+      ],
+    };
+    actingAs = await getRepository(User).findOneByOrFail({ id: 1 });
+  });
+
+  const resetSettings = () => {
+    const settings = getSettings();
+    settings.lidarr = [];
+    settings.main.disabledFeatures = [];
+    settings.plex = { ...settings.plex, musicLibraries: [] };
+  };
+
+  /** Seeds Glasswing, their albums, and a request for some of them. */
+  const seed = async (
+    albums: Partial<MusicAlbum>[],
+    {
+      approvedAgo = 8 * DAY,
+      changedAgo = 2 * DAY,
+    }: { approvedAgo?: number; changedAgo?: number } = {}
+  ) => {
+    const media = await dataSource.manager.save(
+      new Media({
+        mediaType: MediaType.MUSIC,
+        tmdbId: 0,
+        foreignId: ARTIST,
+        foreignTitle: 'Glasswing',
+        status: MediaStatus.PROCESSING,
+        serviceId: 0,
+        externalServiceId: 7,
+        externalServiceSlug: ARTIST,
+      }),
+      { listeners: false }
+    );
+    for (const row of albums) {
+      await getRepository(MusicAlbum).insert(
+        new MusicAlbum({
+          mediaId: media.id,
+          secondaryTypes: [],
+          status: MediaStatus.PROCESSING,
+          ...row,
+        })
+      );
+    }
+    await getRepository(MusicAlbum)
+      .createQueryBuilder()
+      .update()
+      .set({ updatedAt: new Date(Date.now() - changedAgo) })
+      .execute();
+    const request = await dataSource.manager.save(
+      new MediaRequest({
+        type: MediaType.MUSIC,
+        status: MediaRequestStatus.APPROVED,
+        media,
+        requestedBy: await getRepository(User).findOneByOrFail({ id: 2 }),
+        is4k: false,
+        albums: albums.map(
+          (row) =>
+            new AlbumRequest({
+              albumMbid: row.mbId as string,
+              title: row.title as string,
+              status: MediaRequestStatus.APPROVED,
+            })
+        ),
+      }),
+      { listeners: false }
+    );
+    await getRepository(MediaRequest)
+      .createQueryBuilder()
+      .update()
+      .set({ updatedAt: new Date(Date.now() - approvedAgo) })
+      .where('id = :id', { id: request.id })
+      .callListeners(false)
+      .execute();
+    return media;
+  };
+
+  it('flags albums Lidarr has that no media server lists after a day', async () => {
+    try {
+      await seed([
+        {
+          mbId: album(1),
+          title: 'Sing to the Ferryman',
+          trackCount: 14,
+          trackFileCount: 14,
+        },
+        // Lidarr has no files yet: not this check's concern.
+        { mbId: album(2), title: 'Fog B', trackFileCount: 0 },
+      ]);
+      // In Lidarr only an hour: the media server may not have scanned it.
+      const fresh = await getRepository(MusicAlbum).save(
+        new MusicAlbum({
+          mediaId: (
+            await getRepository(Media).findOneByOrFail({
+              foreignId: ARTIST,
+            })
+          ).id,
+          mbId: album(3),
+          title: 'Somnolent',
+          secondaryTypes: [],
+          status: MediaStatus.PROCESSING,
+          trackFileCount: 11,
+        })
+      );
+      assert.ok(fresh.id);
+
+      const check = byId(await health(), 'musicNotOnServer');
+      assert.equal(check.status, 'warning');
+      assert.equal(check.count, 1);
+      assert.equal(check.items[0].title, 'Sing to the Ferryman — Glasswing');
+      assert.match(check.items[0].detail!, /^14 of 14 tracks in Lidarr · /);
+      assert.equal(check.items[0].href, `/music/album/${album(1)}`);
+
+      // With no music library enabled anywhere, Lidarr's files decide, so
+      // nothing waits on a media server.
+      getSettings().plex.musicLibraries = [];
+      assert.equal(byId(await health(), 'musicNotOnServer').count, 0);
+    } finally {
+      resetSettings();
+    }
+  });
+
+  it('flags requested albums with no release a week after approval, ready to search', async () => {
+    try {
+      const media = await seed([
+        { mbId: album(1), title: 'Fog B', lidarrAlbumId: 71, trackCount: 10 },
+        { mbId: album(2), title: 'Somnolent', lidarrAlbumId: 72 },
+        // Not released yet: nothing to find.
+        {
+          mbId: album(3),
+          title: 'Next Year',
+          lidarrAlbumId: 73,
+          releaseDate: '2999',
+        },
+        // Lidarr already has files for it.
+        { mbId: album(4), title: 'Velvet Clay', trackFileCount: 4 },
+      ]);
+
+      const check = byId(await health(), 'musicNoRelease');
+      assert.equal(check.status, 'warning');
+      assert.equal(check.count, 1);
+      assert.equal(check.items[0].title, 'Glasswing — 2 albums');
+      assert.match(
+        check.items[0].detail!,
+        /^Fog B, Somnolent · approved 8 days ago$/
+      );
+      assert.equal(check.items[0].href, `/music/artist/${ARTIST}`);
+      assert.deepEqual(
+        (check.items[0] as { searchable?: unknown }).searchable,
+        { mediaId: media.id, is4k: false, mediaType: MediaType.MUSIC }
+      );
+
+      // Search asks Lidarr for the albums it has no files for.
+      const searched = await new Promise<{
+        status: number;
+        body: { service: string; searched: number };
+      }>((resolve, reject) => {
+        const req = http.request(
+          {
+            host: '127.0.0.1',
+            port,
+            path: `/api/v1/media/${media.id}/search-missing`,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+          },
+          (res) => {
+            let raw = '';
+            res.on('data', (c) => (raw += c));
+            res.on('end', () =>
+              resolve({ status: res.statusCode ?? 0, body: JSON.parse(raw) })
+            );
+          }
+        );
+        req.on('error', reject);
+        req.end('{}');
+      });
+      assert.equal(searched.status, 200);
+      assert.deepEqual(searched.body, {
+        service: 'Lidarr',
+        searched: 3,
+        seasons: 0,
+      });
+      assert.deepEqual(commands, [
+        { name: 'AlbumSearch', albumIds: [71, 72, 73] },
+      ]);
+      const events = await getRepository(MediaEvent).find();
+      assert.deepEqual(
+        events.map((e) => [e.foreignId, e.type, e.detail]),
+        [[ARTIST, 'searched', '3 missing albums, in Lidarr']]
+      );
+    } finally {
+      resetSettings();
+    }
+  });
+
+  it('leaves alone a request approved this week', async () => {
+    try {
+      await seed([{ mbId: album(1), title: 'Fog B', lidarrAlbumId: 71 }], {
+        approvedAgo: 2 * DAY,
+      });
+      assert.equal(byId(await health(), 'musicNoRelease').count, 0);
+    } finally {
+      resetSettings();
+    }
+  });
+
+  it('judges MusicBrainz by how its line has fared, without asking it anything', async (t) => {
+    const fared = (over: Partial<ReturnType<typeof musicBrainzQueue.health>>) =>
+      t.mock.method(musicBrainzQueue, 'health', () => ({
+        waiting: 0,
+        busy: 0,
+        rateLimited: 0,
+        failed: 0,
+        failingInARow: 0,
+        ...over,
+      }));
+    try {
+      fared({ lastSuccessAt: Date.now() - 5 * 60_000 });
+      let check = byId(await health(), 'musicbrainz');
+      assert.equal(check.name, 'MusicBrainz');
+      assert.equal(check.status, 'ok');
+
+      t.mock.restoreAll();
+      fared({ rateLimited: 4, failed: 1, lastError: 'timeout of 15000ms' });
+      check = byId(await health(), 'musicbrainz');
+      assert.equal(check.status, 'warning');
+      assert.deepEqual(
+        check.items.map((item) => item.title),
+        [
+          'Over its limit 4 times in the last hour',
+          '1 request failed in the last hour',
+        ]
+      );
+
+      t.mock.restoreAll();
+      fared({ failingInARow: 3, lastError: 'connect ECONNREFUSED' });
+      check = byId(await health(), 'musicbrainz');
+      assert.equal(check.status, 'error');
+      assert.equal(
+        check.detail,
+        'The last 3 requests failed: connect ECONNREFUSED'
+      );
+    } finally {
+      resetSettings();
+    }
+  });
+
+  it('lists downloads Lidarr won’t import, with its reason', async () => {
+    try {
+      lidarrQueue = [
+        {
+          id: 1,
+          title: 'Glasswing - Fog B (Single) [MP3]',
+          downloadId: 'H1',
+          trackedDownloadStatus: 'warning',
+          trackedDownloadState: 'importBlocked',
+          outputPath: '/data/torrents/music/Fog B',
+          artistId: 7,
+          albumId: 40,
+          artist: { id: 7, artistName: 'Glasswing', foreignArtistId: ARTIST },
+          album: { id: 40, title: 'Fog B', foreignAlbumId: album(1) },
+          statusMessages: [
+            { title: 'Fog B.mp3', messages: ['Has missing tracks'] },
+          ],
+        },
+        // Still downloading: nothing wrong yet.
+        {
+          id: 2,
+          title: 'Glasswing - Fog C',
+          downloadId: 'H2',
+          trackedDownloadStatus: 'ok',
+          trackedDownloadState: 'downloading',
+          artistId: 7,
+          albumId: 41,
+        },
+      ];
+      const check = byId(await health(), 'musicImportBlocked');
+      assert.equal(check.status, 'warning');
+      assert.equal(check.count, 1);
+      assert.match(check.items[0].title, /Fog B/);
+      assert.equal(
+        check.items[0].detail,
+        'Has missing tracks · Lidarr: Activity → Queue'
+      );
+      assert.equal(check.items[0].href, `/music/album/${album(1)}`);
+    } finally {
+      lidarrQueue = [];
+      resetSettings();
+    }
+  });
+
+  it('is left off the page while music is off for everyone', async () => {
+    try {
+      await seed([{ mbId: album(1), title: 'Fog B', lidarrAlbumId: 71 }]);
+      getSettings().main.disabledFeatures = ['music'];
+      const ids = (await health()).map((c) => c.id);
+      for (const id of [
+        'musicbrainz',
+        'musicNotOnServer',
+        'musicNoRelease',
+        'musicImportBlocked',
+      ]) {
+        assert.ok(!ids.includes(id), id);
+      }
+    } finally {
+      resetSettings();
+    }
   });
 });

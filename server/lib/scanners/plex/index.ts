@@ -9,6 +9,10 @@ import type {
 } from '@server/api/themoviedb/interfaces';
 import { getRepository } from '@server/datasource';
 import { User } from '@server/entity/User';
+import { detectAnime } from '@server/lib/animeDecision';
+import type { SeenQuality } from '@server/lib/mediaQuality';
+import { combineQuality, plexVersionQuality } from '@server/lib/mediaQuality';
+import { isConnected } from '@server/lib/mediaServers';
 import type {
   MediaIds,
   ProcessableSeason,
@@ -16,10 +20,15 @@ import type {
   StatusBase,
 } from '@server/lib/scanners/baseScanner';
 import BaseScanner from '@server/lib/scanners/baseScanner';
+import { LibraryItems } from '@server/lib/scanners/libraryItems';
 import { RecentRetries, titleKey } from '@server/lib/scanners/plex/recent';
+import type { ItemLabel } from '@server/lib/scanners/unidentified';
+import {
+  NotIdentifiedError,
+  UnidentifiedTitles,
+} from '@server/lib/scanners/unidentified';
 import type { Library } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
-import { isAnime } from '@server/utils/isAnime';
 import { uniqWith } from 'lodash';
 
 const imdbRegex = new RegExp(/imdb:\/\/(tt[0-9]+)/);
@@ -30,11 +39,29 @@ const plexRegex = new RegExp(/plex:\/\//);
 const plexCustomProviderRegex = new RegExp(
   /tv\.plex\.agents\.custom(\.[a-zA-Z0-9]+)+:\/\//
 );
-// Hama agent uses ASS naming, see details here:
+// The Hama agent uses ASS naming:
 // https://github.com/ZeroQI/Absolute-Series-Scanner/blob/master/README.md#forcing-the-movieseries-id
 const hamaTvdbRegex = new RegExp(/hama:\/\/tvdb[0-9]?-([0-9]+)/);
 const hamaAnidbRegex = new RegExp(/hama:\/\/anidb[0-9]?-([0-9]+)/);
 const HAMA_AGENT = 'com.plexapp.agents.hama';
+
+/**
+ * An item as the log names it; never Plex's whole record. An episode (from
+ * a recently added scan) is named by its show.
+ */
+const labelOf = (item: PlexLibraryItem): ItemLabel =>
+  item.type === 'episode' && item.grandparentTitle
+    ? {
+        name: item.grandparentTitle,
+        type: 'show',
+        id: item.grandparentRatingKey ?? item.ratingKey,
+      }
+    : {
+        name: item.title,
+        ...(item.year ? { year: item.year } : {}),
+        type: item.type,
+        id: item.ratingKey,
+      };
 
 type SyncStatus = StatusBase & {
   currentLibrary: Library;
@@ -49,12 +76,21 @@ class PlexScanner
   private libraries: Library[];
   private currentLibrary: Library;
   private isRecentOnly = false;
-  /** Titles a recently added scan could not place yet, for another look. */
+  /** Titles a recently added scan couldn't place yet, to retry. */
   public readonly retries = new RecentRetries();
+  /** Titles in the current library that failed for a real reason. */
+  private failures = 0;
+  /** Titles this scan skipped because Plex hasn't matched them yet. */
+  private unidentified = new UnidentifiedTitles({
+    server: 'Plex',
+    verb: 'matched',
+    hint: "refresh the library's metadata, or use Match on a title",
+  });
 
   public constructor(isRecentOnly = false) {
     super('Plex Scan', { bundleSize: 50 });
     this.isRecentOnly = isRecentOnly;
+    this.libraryItems = new LibraryItems('plex');
   }
 
   public status(): SyncStatus {
@@ -68,8 +104,14 @@ class PlexScanner
   }
 
   public async run(): Promise<void> {
+    // Scan Plex only while Seerr is connected to it.
+    if (!isConnected('plex')) {
+      return;
+    }
+
     const settings = getSettings();
     const sessionId = this.startRun();
+    this.unidentified.clear();
     try {
       const userRepository = getRepository(User);
       const admin = await userRepository.findOne({
@@ -101,14 +143,15 @@ class PlexScanner
             'info',
             { lastScan: library.lastScan }
           );
-          // The window's next start is when this one was asked for, not
-          // when it ended: anything added while it ran is in the next.
+          // The next window starts when this one was requested, not when it
+          // ended, so items added during the run fall in the next.
           const askedAt = Date.now();
+          await this.libraryItems?.begin(library.id);
           const libraryItems = await this.plexClient.getRecentlyAdded(
             library.id,
             library.lastScan
               ? {
-                  // We remove 10 minutes from the last scan as a buffer
+                  // 10-minute buffer before the last scan.
                   addedAt: library.lastScan - 1000 * 60 * 10,
                 }
               : undefined,
@@ -119,7 +162,7 @@ class PlexScanner
             this.retries.due(library.id, askedAt).map((entry) => entry.item)
           );
 
-          // Bundle items up by the title they belong to
+          // One entry per title.
           this.items = uniqWith(
             [...libraryItems, ...due],
             (a, b) => titleKey(a) === titleKey(b)
@@ -145,6 +188,7 @@ class PlexScanner
             },
             { sessionId }
           );
+          this.libraryItems?.end();
           this.log(
             `${library.name}: ${libraryItems.length} recently added, ${due.length} looked at again`,
             'info',
@@ -154,7 +198,6 @@ class PlexScanner
             }
           );
 
-          // After run completes, update last scan time
           const newLibraries = settings.plex.libraries.map((lib) => {
             if (lib.id === library.id) {
               return {
@@ -173,9 +216,17 @@ class PlexScanner
           if (!this.stillEnabled(library)) continue;
           this.currentLibrary = library;
           this.log(`Beginning to process library: ${library.name}`, 'info');
+          this.failures = 0;
+          await this.libraryItems?.begin(library.id);
           await this.paginateLibrary(library, { sessionId });
+          await this.settleLibraryItems(library);
         }
       }
+      const skipped = this.unidentified.summary();
+      if (skipped) {
+        this.log(skipped.message, 'info', { examples: skipped.examples });
+      }
+
       this.log(
         this.isRecentOnly
           ? 'Recently Added Scan Complete'
@@ -187,14 +238,37 @@ class PlexScanner
         errorMessage: e.message,
       });
     } finally {
+      this.libraryItems?.end();
       this.endRun(sessionId);
     }
   }
 
   /**
-   * Whether a library is still switched on. The list is read when a scan
-   * starts, and a full scan takes a while: one switched off since is
-   * skipped, or stopped at its next page, rather than scanned anyway.
+   * After a full pass of a library, forgets titles it no longer holds. A pass
+   * with failures or one stopped part-way through forgets nothing: a title it
+   * missed would otherwise look gone from the library.
+   */
+  private async settleLibraryItems(library: Library): Promise<void> {
+    if (
+      this.failures > 0 ||
+      !getSettings().plex.libraries.find((l) => l.id === library.id)?.enabled
+    ) {
+      this.libraryItems?.end();
+      return;
+    }
+    const forgotten = (await this.libraryItems?.prune()) ?? 0;
+    if (forgotten) {
+      this.log(
+        `${library.name} no longer holds ${forgotten} title(s) it held`,
+        'info'
+      );
+    }
+  }
+
+  /**
+   * Whether a library is still enabled. The list is read at scan start and
+   * full scans are long, so a library disabled mid-scan is skipped or stopped
+   * at its next page.
    */
   private stillEnabled(library: Library): boolean {
     const now = getSettings().plex.libraries.find((l) => l.id === library.id);
@@ -215,7 +289,7 @@ class PlexScanner
       throw new Error('New session was started. Old session aborted.');
     }
 
-    // Switched off part-way through: the rest of it is left alone.
+    // Disabled part-way through: leave the rest.
     if (start > 0 && !this.stillEnabled(library)) return;
 
     const response = await this.plexClient.getLibraryContents(library.id, {
@@ -252,7 +326,7 @@ class PlexScanner
     );
   }
 
-  /** Places one item; answers why it could not, or null. */
+  /** Processes one item; returns the error message, or null on success. */
   private async processItem(plexitem: PlexLibraryItem): Promise<string | null> {
     try {
       if (plexitem.type === 'movie') {
@@ -266,17 +340,26 @@ class PlexScanner
       }
       return null;
     } catch (e) {
-      this.log('Failed to process Plex media', 'error', {
-        errorMessage: e.message,
-        title: plexitem.title,
-      });
+      // An unmatched title is normal for new files: counted, not an error.
+      // It is still retried like any other.
+      if (e instanceof NotIdentifiedError) {
+        this.log(this.unidentified.add(e.kind, e.item), 'debug', {
+          item: e.item,
+        });
+      } else {
+        this.failures += 1;
+        this.log('Failed to process Plex media', 'error', {
+          errorMessage: e.message,
+          item: labelOf(plexitem),
+        });
+      }
       return e instanceof Error ? e.message : String(e);
     }
   }
 
   /**
-   * Titles to look at again, as Plex has them now: a movie's match may have
-   * arrived since. A title Plex no longer has is forgotten.
+   * Retry titles with current Plex metadata, since a movie may have been
+   * matched since. Titles Plex no longer has are forgotten.
    */
   private async refreshed(
     library: Library,
@@ -285,7 +368,7 @@ class PlexScanner
     const fresh: PlexLibraryItem[] = [];
     for (const item of items) {
       if (item.type !== 'movie') {
-        // A show is read afresh from Plex as it is placed.
+        // Shows are re-read from Plex when processed.
         fresh.push(item);
         continue;
       }
@@ -316,10 +399,9 @@ class PlexScanner
   }
 
   /**
-   * One Plex item can hold several versions of a movie. Each counts for the
-   * quality it is: a 1080p and a 4K version side by side make the movie
-   * available in both. Without a 4K Radarr there is only one quality, and
-   * any version counts for it.
+   * One Plex item can hold several versions of a movie, each counting for
+   * its own quality: 1080p and 4K versions make it available in both.
+   * Without a 4K Radarr any version counts for the single quality.
    */
   private async processPlexMovieByTmdbId(
     plexitem: PlexLibraryItem | PlexMetadata,
@@ -335,13 +417,27 @@ class PlexScanner
       ratingKey: plexitem.ratingKey,
       title: plexitem.title,
     };
+    const qualityOf = (is4k: boolean) =>
+      combineQuality(
+        plexitem.Media.filter(
+          (media) => !has4k || (media.videoResolution === '4k') === is4k
+        ).map(plexVersionQuality)
+      );
 
     if (hasStandard) {
-      await this.processMovie(tmdbId, { ...details, is4k: false });
+      await this.processMovie(tmdbId, {
+        ...details,
+        is4k: false,
+        quality: qualityOf(false),
+      });
     }
 
     if (has4k) {
-      await this.processMovie(tmdbId, { ...details, is4k: true });
+      await this.processMovie(tmdbId, {
+        ...details,
+        is4k: true,
+        quality: qualityOf(true),
+      });
     }
   }
 
@@ -366,7 +462,7 @@ class PlexScanner
       throw new Error('No ID provided');
     }
 
-    const metadataProvider = isAnime(tvShow)
+    const metadataProvider = detectAnime(tvShow)
       ? await getMetadataProvider('anime')
       : await getMetadataProvider('tv');
 
@@ -390,15 +486,13 @@ class PlexScanner
 
     const mediaIds = await this.getMediaIds(metadata);
 
-    // If the media is from HAMA, and doesn't have a TVDb ID, we will treat it
-    // as a special HAMA movie
+    // HAMA media without a TVDB ID is a HAMA movie.
     if (mediaIds.tmdbId && !mediaIds.tvdbId && mediaIds.isHama) {
-      this.processHamaMovie(metadata, mediaIds.tmdbId);
+      await this.processHamaMovie(metadata, mediaIds.tmdbId);
       return;
     }
 
-    // If the media is from HAMA and we have a TVDb ID, we will attempt
-    // to process any specials that may exist
+    // HAMA media with a TVDB ID may have specials.
     if (mediaIds.tvdbId && mediaIds.isHama) {
       await this.processHamaSpecials(metadata, mediaIds.tvdbId);
     }
@@ -409,6 +503,10 @@ class PlexScanner
 
     const seasons = tvShow.seasons;
     const processableSeasons: ProcessableSeason[] = [];
+    const seen: Record<'standard' | '4k', (SeenQuality | undefined)[]> = {
+      standard: [],
+      '4k': [],
+    };
 
     const settings = getSettings();
     const filteredSeasons = settings.main.enableSpecialEpisodes
@@ -421,23 +519,29 @@ class PlexScanner
       );
 
       if (matchedPlexSeason) {
-        // If we have a matched Plex season, get its children metadata so we can check details
         const episodes = await this.plexClient.getChildrenMetadata(
           matchedPlexSeason.ratingKey
         );
-        // Total episodes that are in standard definition (not 4k)
-        const totalStandard = episodes.filter((episode) =>
-          !this.enable4kShow
-            ? true
-            : episode.Media.some((media) => media.videoResolution !== '4k')
+        // Non-4K episodes (all of them when 4K is disabled).
+        const totalStandard = episodes.filter(
+          (episode) =>
+            !this.enable4kShow ||
+            episode.Media.some((media) => media.videoResolution !== '4k')
         ).length;
 
-        // Total episodes that are in 4k
         const total4k = this.enable4kShow
           ? episodes.filter((episode) =>
               episode.Media.some((media) => media.videoResolution === '4k')
             ).length
           : 0;
+
+        for (const media of episodes.flatMap((episode) => episode.Media)) {
+          seen[
+            this.enable4kShow && media.videoResolution === '4k'
+              ? '4k'
+              : 'standard'
+          ].push(plexVersionQuality(media));
+        }
 
         processableSeasons.push({
           seasonNumber: season.season_number,
@@ -463,13 +567,17 @@ class PlexScanner
         mediaAddedAt: new Date(metadata.addedAt * 1000),
         ratingKey: ratingKey,
         title: metadata.title,
+        qualities: {
+          standard: combineQuality(seen.standard),
+          '4k': combineQuality(seen['4k']),
+        },
       }
     );
   }
 
   private async getMediaIds(plexitem: PlexLibraryItem): Promise<MediaIds> {
     const mediaIds: Partial<MediaIds> = {};
-    // Check if item is using new plex movie/tv agent
+    // New Plex movie/TV agent.
     if (
       plexitem.guid.match(plexRegex) ||
       plexitem.guid.match(plexCustomProviderRegex)
@@ -479,14 +587,14 @@ class PlexScanner
           ? plexitem
           : await this.plexClient.getMetadata(plexitem.ratingKey);
 
-      // If there is no Guid field at all, then we bail
       if (!metadata.Guid) {
-        throw new Error(
+        throw new NotIdentifiedError(
+          plexitem.type === 'movie' ? 'film' : 'series',
+          labelOf(plexitem),
           'No Guid metadata for this title. Skipping. (Try refreshing the metadata in Plex for this media!)'
         );
       }
 
-      // Map all IDs to MediaId object
       metadata.Guid.forEach((ref) => {
         if (ref.id.match(imdbRegex)) {
           mediaIds.imdbId = ref.id.match(imdbRegex)?.[1] ?? undefined;
@@ -499,7 +607,6 @@ class PlexScanner
         }
       });
 
-      // If we got an IMDb ID, but no TMDB ID, lookup the TMDB ID with the IMDb ID
       if (mediaIds.imdbId && !mediaIds.tmdbId) {
         mediaIds.tmdbId = await this.tmdb.resolveImdbIdForScan({
           imdbId: mediaIds.imdbId,
@@ -512,8 +619,6 @@ class PlexScanner
         });
         mediaIds.tmdbId = show.id;
       }
-
-      // Check if the agent is IMDb
     } else if (plexitem.guid.match(imdbRegex)) {
       const imdbMatch = plexitem.guid.match(imdbRegex);
       if (imdbMatch) {
@@ -522,17 +627,14 @@ class PlexScanner
           imdbId: mediaIds.imdbId,
         });
       }
-      // Check if the agent is TMDB
     } else if (plexitem.guid.match(tmdbRegex)) {
       const tmdbMatch = plexitem.guid.match(tmdbRegex);
       if (tmdbMatch) {
         mediaIds.tmdbId = Number(tmdbMatch[1]);
       }
-      // Check if the agent is TVDb
     } else if (plexitem.guid.match(tvdbRegex)) {
       const matchedtvdb = plexitem.guid.match(tvdbRegex);
 
-      // If we can find a tvdb Id, use it to resolve the tmdb id
       if (matchedtvdb) {
         const show = await this.tmdb.getShowByTvdbIdForScan({
           tvdbId: Number(matchedtvdb[1]),
@@ -541,13 +643,11 @@ class PlexScanner
         mediaIds.tvdbId = Number(matchedtvdb[1]);
         mediaIds.tmdbId = show.id;
       }
-      // Check if the agent (for shows) is TMDB
     } else if (plexitem.guid.match(tmdbShowRegex)) {
       const matchedtmdb = plexitem.guid.match(tmdbShowRegex);
       if (matchedtmdb) {
         mediaIds.tmdbId = Number(matchedtmdb[1]);
       }
-      // Check for HAMA (with TVDb guid)
     } else if (plexitem.guid.match(hamaTvdbRegex)) {
       const matchedtvdb = plexitem.guid.match(hamaTvdbRegex);
 
@@ -558,10 +658,8 @@ class PlexScanner
 
         mediaIds.tvdbId = Number(matchedtvdb[1]);
         mediaIds.tmdbId = show.id;
-        // Set isHama to true, so we can know to add special processing to this item
         mediaIds.isHama = true;
       }
-      // Check for HAMA (with anidb guid)
     } else if (plexitem.guid.match(hamaAnidbRegex)) {
       const matchedhama = plexitem.guid.match(hamaAnidbRegex);
 
@@ -576,10 +674,9 @@ class PlexScanner
         const result = animeList.getFromAnidbId(anidbId);
         let tvShow: TmdbTvScanDetails | TmdbTvDetails | null = null;
 
-        // Set isHama to true, so we can know to add special processing to this item
         mediaIds.isHama = true;
 
-        // First try to lookup the show by TVDb ID
+        // Try the show by TVDB ID first.
         if (result?.tvdbId) {
           const extResponse = await this.tmdb.getByExternalIdForScan({
             externalId: result.tvdbId,
@@ -599,8 +696,8 @@ class PlexScanner
         }
 
         if (!tvShow) {
-          // if lookup of tvshow above failed, then try movie with tmdbid/imdbid
-          // note - some tv shows have imdbid set too, that's why this need to go second
+          // Fall back to a movie by TMDB/IMDb ID. Some shows have an IMDb ID
+          // too, so this must come second.
           if (result?.tmdbId) {
             mediaIds.tmdbId = result.tmdbId;
             mediaIds.imdbId = result?.imdbId;
@@ -615,16 +712,22 @@ class PlexScanner
     }
 
     if (!mediaIds.tmdbId) {
-      throw new Error('Unable to find TMDB ID');
+      // A HAMA AniDB id missing from the anime list is a real gap; anything
+      // else without an id is a title Plex hasn't matched yet.
+      if (plexitem.guid.match(hamaAnidbRegex)) {
+        throw new Error('Unable to find TMDB ID');
+      }
+      throw new NotIdentifiedError(
+        plexitem.type === 'movie' ? 'film' : 'series',
+        labelOf(plexitem)
+      );
     }
 
-    // We check above if we have the TMDB ID, so we can safely assert the type below
     return mediaIds as MediaIds;
   }
 
-  // movies with hama agent actually are tv shows with at least one episode in it
-  // try to get first episode of any season - cannot hardcode season or episode number
-  // because sometimes user can have it in other season/ep than s01e01
+  // HAMA movies are shows with at least one episode. Use the first episode
+  // of the first season; it isn't always S01E01.
   private async processHamaMovie(metadata: PlexMetadata, tmdbId: number) {
     const season = metadata.Children?.Metadata[0];
     if (season) {
@@ -637,7 +740,7 @@ class PlexScanner
     }
   }
 
-  // this adds all movie episodes from specials season for Hama agent
+  // Adds movie episodes from a HAMA show's specials season.
   private async processHamaSpecials(metadata: PlexMetadata, tvdbId: number) {
     const specials = metadata.Children?.Metadata.find(
       (md) => Number(md.index) === 0
@@ -664,7 +767,6 @@ class PlexScanner
     }
   }
 
-  // checks if any of this.libraries has Hama agent set in Plex
   private async hasHamaAgent() {
     const plexLibraries = await this.plexClient.getLibraries();
     return this.libraries.some((library) =>

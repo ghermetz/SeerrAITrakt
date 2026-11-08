@@ -15,18 +15,18 @@ import { User } from '@server/entity/User';
 import notificationManager, { Notification } from '@server/lib/notifications';
 import type { NotificationPayload } from '@server/lib/notifications/agents/agent';
 import { Permission } from '@server/lib/permissions';
+import { MediaSubscriber } from '@server/subscriber/MediaSubscriber';
 import { setupTestDb } from '@server/test/db';
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it } from 'node:test';
+import type { EntityManager } from 'typeorm';
 
-/*
- * When a scan marks an approved title available, "now available" should go
- * out during that save — not minutes later from the reconciler — and once.
- *
- * Suspected: the notification reads the title on a connection that cannot
- * see the save's own uncommitted status on Postgres, skips, and is later
- * delivered by the reconciler.
- */
+// When a scan marks an approved title available, "now available" must go out
+// during that save, not minutes later from the reconciler, and only once.
+//
+// The failure mode: on Postgres the notification read the title on a connection
+// that couldn't see the save's uncommitted status, skipped, and the reconciler
+// delivered it later.
 
 setupTestDb();
 
@@ -81,8 +81,8 @@ beforeEach(async () => {
   );
 });
 
-// Approved and sent, as a request is by the time its title arrives. Moved to
-// approved without the save hooks, so no dispatch is attempted here.
+// Approved and sent, as a request is by the time its title arrives. Set
+// approved without save hooks, so no dispatch is attempted.
 const approvedRequest = async (media: Media, seasons?: number[]) => {
   const request = await getRepository(MediaRequest).save(
     new MediaRequest({
@@ -235,5 +235,213 @@ describe('"now available" when a scan marks the title available', () => {
       'watcher-one',
       'watcher-two',
     ]);
+  });
+});
+
+// Several household members requesting the same title is common. On arrival,
+// all their requests complete in the same save, and each must be notified once.
+describe('several requests for the same title completing together', () => {
+  const otherUsers = async (names: string[]) =>
+    Promise.all(
+      names.map((name) =>
+        getRepository(User).save(
+          new User({
+            email: `${name}@test.local`,
+            plexUsername: name,
+            permissions: Permission.REQUEST,
+            avatar: '',
+          })
+        )
+      )
+    );
+
+  const requestBy = async (
+    media: Media,
+    requester: User,
+    seasons?: number[]
+  ) => {
+    const original = user;
+    user = requester;
+    try {
+      return await approvedRequest(media, seasons);
+    } finally {
+      user = original;
+    }
+  };
+
+  it('completes every request for a movie and tells each requester once', async () => {
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 9301,
+        mediaType: MediaType.MOVIE,
+        status: MediaStatus.PROCESSING,
+        externalServiceId: 8,
+      })
+    );
+    const requesters = [user, ...(await otherUsers(['two', 'three']))];
+    const requests = [];
+    for (const requester of requesters) {
+      requests.push(await requestBy(media, requester));
+    }
+    sent = [];
+    payloads = [];
+
+    const fresh = await getRepository(Media).findOneOrFail({
+      where: { id: media.id },
+    });
+    fresh.status = MediaStatus.AVAILABLE;
+    await getRepository(Media).save(fresh);
+
+    const after = await getRepository(MediaRequest).find({
+      where: { media: { id: media.id } },
+      order: { id: 'ASC' },
+    });
+    assert.deepEqual(
+      after.map((r) => r.status),
+      requests.map(() => MediaRequestStatus.COMPLETED),
+      'every request completed'
+    );
+    assert.deepEqual(
+      payloads.map((p) => p.notifyUser?.plexUsername).sort(),
+      ['avail', 'three', 'two'],
+      'each requester told once'
+    );
+    for (const request of requests) {
+      assert.equal(
+        await getRepository(NotificationDelivery).countBy({
+          requestId: request.id,
+          type: Notification.MEDIA_AVAILABLE,
+        }),
+        1,
+        `request ${request.id} claimed once`
+      );
+    }
+    const title = await getRepository(Media).findOneOrFail({
+      where: { id: media.id },
+    });
+    assert.equal(title.status, MediaStatus.AVAILABLE, 'the scan was kept');
+  });
+
+  it('completes every request for a season and tells each requester once', async () => {
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 9302,
+        mediaType: MediaType.TV,
+        status: MediaStatus.PROCESSING,
+        externalServiceId: 9,
+        seasons: [
+          new Season({ seasonNumber: 1, status: MediaStatus.PROCESSING }),
+        ],
+      })
+    );
+    const [second] = await otherUsers(['two']);
+    const requests = [
+      await requestBy(media, user, [1]),
+      await requestBy(media, second, [1]),
+    ];
+    sent = [];
+    payloads = [];
+
+    const fresh = await getRepository(Media).findOneOrFail({
+      where: { id: media.id },
+      relations: { seasons: true },
+    });
+    fresh.status = MediaStatus.AVAILABLE;
+    fresh.seasons[0].status = MediaStatus.AVAILABLE;
+    await getRepository(Media).save(fresh);
+
+    const after = await getRepository(MediaRequest).find({
+      where: { media: { id: media.id } },
+      order: { id: 'ASC' },
+    });
+    assert.deepEqual(
+      after.map((r) => r.status),
+      requests.map(() => MediaRequestStatus.COMPLETED),
+      'every request completed'
+    );
+    assert.deepEqual(
+      payloads.map((p) => p.notifyUser?.plexUsername).sort(),
+      ['avail', 'two'],
+      'each requester told once'
+    );
+    const title = await getRepository(Media).findOneOrFail({
+      where: { id: media.id },
+      relations: { seasons: true },
+    });
+    assert.equal(title.status, MediaStatus.AVAILABLE, 'the scan was kept');
+    assert.equal(title.seasons[0].status, MediaStatus.AVAILABLE);
+  });
+
+  // The hook saves completed requests one at a time. This restores the single
+  // save of all of them that broke on Postgres: their hooks' nested
+  // transactions must take turns on their own.
+  it('completes them all even when they are saved together', async () => {
+    type Hook = (
+      manager: EntityManager,
+      event: Media,
+      databaseEvent: Media,
+      is4k: boolean
+    ) => Promise<void>;
+    const hooks = MediaSubscriber.prototype as unknown as {
+      updateRelatedMediaRequest: Hook;
+    };
+    const oneAtATime = hooks.updateRelatedMediaRequest;
+    hooks.updateRelatedMediaRequest = async (manager, event, _old, is4k) => {
+      const repository = manager.getRepository(MediaRequest);
+      const requests = await repository.find({
+        relations: { media: true, requestedBy: true },
+        where: {
+          media: { id: event.id },
+          status: MediaRequestStatus.APPROVED,
+          is4k,
+        },
+      });
+      requests.forEach((request) => {
+        request.status = MediaRequestStatus.COMPLETED;
+      });
+      await repository.save(requests);
+    };
+
+    try {
+      const media = await getRepository(Media).save(
+        new Media({
+          tmdbId: 9303,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.PROCESSING,
+          externalServiceId: 10,
+        })
+      );
+      const requesters = [user, ...(await otherUsers(['two', 'three']))];
+      for (const requester of requesters) {
+        await requestBy(media, requester);
+      }
+      payloads = [];
+
+      const fresh = await getRepository(Media).findOneOrFail({
+        where: { id: media.id },
+      });
+      fresh.status = MediaStatus.AVAILABLE;
+      await getRepository(Media).save(fresh);
+
+      const after = await getRepository(MediaRequest).find({
+        where: { media: { id: media.id } },
+      });
+      assert.deepEqual(
+        after.map((r) => r.status),
+        requesters.map(() => MediaRequestStatus.COMPLETED),
+        'every request completed'
+      );
+      assert.deepEqual(
+        payloads.map((p) => p.notifyUser?.plexUsername).sort(),
+        ['avail', 'three', 'two'],
+        'each requester told once'
+      );
+      const title = await getRepository(Media).findOneOrFail({
+        where: { id: media.id },
+      });
+      assert.equal(title.status, MediaStatus.AVAILABLE, 'the scan was kept');
+    } finally {
+      hooks.updateRelatedMediaRequest = oneAtATime;
+    }
   });
 });

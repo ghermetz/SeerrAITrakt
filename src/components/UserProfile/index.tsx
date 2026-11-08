@@ -6,10 +6,14 @@ import RequestCard from '@app/components/RequestCard';
 import Slider from '@app/components/Slider';
 import TmdbTitleCard from '@app/components/TitleCard/TmdbTitleCard';
 import ProfileHeader from '@app/components/UserProfile/ProfileHeader';
-import { Permission, UserType, useUser } from '@app/hooks/useUser';
+import useFeature from '@app/hooks/useFeature';
+import useSettings from '@app/hooks/useSettings';
+import { Permission, useUser } from '@app/hooks/useUser';
 import ErrorPage from '@app/pages/_error';
 import defineMessages from '@app/utils/defineMessages';
+import { connectedAccountServers } from '@app/utils/mediaServerAccounts';
 import { ArrowRightCircleIcon } from '@heroicons/react/24/outline';
+import type { VideoMediaType } from '@server/constants/media';
 import type { WatchlistResponse } from '@server/interfaces/api/discoverInterfaces';
 import type {
   QuotaResponse,
@@ -33,11 +37,12 @@ const messages = defineMessages('components.UserProfile', {
   pastdays: '{type} (past {days} days)',
   movierequests: 'Movie Requests',
   seriesrequest: 'Series Requests',
+  musicrequests: 'Album Requests',
   recentlywatched: 'Recently Watched',
   plexwatchlist: 'Plex Watchlist',
   localWatchlist: "{username}'s Watchlist",
   emptywatchlist:
-    'Media added to your <PlexWatchlistSupportLink>Plex Watchlist</PlexWatchlistSupportLink> will appear here.',
+    'Titles on your <PlexWatchlistSupportLink>Plex Watchlist</PlexWatchlistSupportLink> show here.',
 });
 
 type MediaTitle = MovieDetails | TvDetails;
@@ -45,6 +50,9 @@ type MediaTitle = MovieDetails | TvDetails;
 const UserProfile = () => {
   const intl = useIntl();
   const router = useRouter();
+  const settings = useSettings();
+  // Music adds an album quota.
+  const showMusic = useFeature('music');
   const { user, error } = useUser({
     id: Number(router.query.userId),
   });
@@ -73,9 +81,18 @@ const UserProfile = () => {
       ? `/api/v1/user/${user.id}/quota`
       : null
   );
+  // Watch history (Tautulli) and Plex watchlist need a linked account on a
+  // connected Plex.
+  const hasPlex =
+    !!user &&
+    connectedAccountServers(
+      user,
+      settings.currentSettings.mediaServers
+    ).includes('plex');
   const { data: watchData, error: watchDataError } =
     useSWR<UserWatchDataResponse>(
-      user?.userType === UserType.PLEX &&
+      hasPlex &&
+        user &&
         (user.id === currentUser?.id || currentHasPermission(Permission.ADMIN))
         ? `/api/v1/user/${user.id}/watch_data`
         : null
@@ -120,9 +137,7 @@ const UserProfile = () => {
   }
 
   const watchlistSliderTitle = intl.formatMessage(
-    user.userType === UserType.PLEX
-      ? messages.plexwatchlist
-      : messages.localWatchlist,
+    hasPlex ? messages.plexwatchlist : messages.localWatchlist,
     { username: user.displayName }
   );
 
@@ -152,12 +167,16 @@ const UserProfile = () => {
             { type: 'and' }
           )) && (
           <div className="relative z-40">
-            <dl className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-3">
-              <div className="overflow-hidden rounded-lg bg-gray-800/50 px-4 py-5 shadow ring-1 ring-gray-700 sm:p-6">
-                <dt className="truncate text-sm font-bold text-gray-300">
+            <dl
+              className={`mt-5 grid grid-cols-1 gap-5 ${
+                showMusic ? 'lg:grid-cols-4' : 'lg:grid-cols-3'
+              }`}
+            >
+              <div className="overflow-hidden rounded-lg bg-gray-800/50 px-4 py-5 shadow ring-1 ring-gray-700 light:bg-surface/90 sm:p-6">
+                <dt className="break-words text-sm font-bold text-gray-300">
                   {intl.formatMessage(messages.totalrequests)}
                 </dt>
-                <dd className="mt-1 text-3xl font-semibold text-white">
+                <dd className="mt-1 text-3xl font-semibold text-strong">
                   <Link
                     href={
                       currentHasPermission(
@@ -173,14 +192,14 @@ const UserProfile = () => {
                 </dd>
               </div>
               <div
-                className={`overflow-hidden rounded-lg bg-gray-800/50 px-4 py-5 shadow ring-1 ${
+                className={`overflow-hidden rounded-lg bg-gray-800/50 px-4 py-5 shadow ring-1 light:bg-surface/90 ${
                   quota.movie.restricted
                     ? 'bg-gradient-to-t from-red-900 to-transparent ring-red-500'
                     : 'ring-gray-700'
                 } sm:p-6`}
               >
                 <dt
-                  className={`truncate text-sm font-bold ${
+                  className={`break-words text-sm font-bold ${
                     quota.movie.restricted ? 'text-red-500' : 'text-gray-300'
                   }`}
                 >
@@ -193,7 +212,7 @@ const UserProfile = () => {
                 </dt>
                 <dd
                   className={`mt-1 flex items-center text-sm ${
-                    quota.movie.restricted ? 'text-red-500' : 'text-white'
+                    quota.movie.restricted ? 'text-danger-text' : 'text-strong'
                   }`}
                 >
                   {quota.movie.limit ? (
@@ -228,14 +247,14 @@ const UserProfile = () => {
                 </dd>
               </div>
               <div
-                className={`overflow-hidden rounded-lg bg-gray-800/50 px-4 py-5 shadow ring-1 ${
+                className={`overflow-hidden rounded-lg bg-gray-800/50 px-4 py-5 shadow ring-1 light:bg-surface/90 ${
                   quota.tv.restricted
                     ? 'bg-gradient-to-t from-red-900 to-transparent ring-red-500'
                     : 'ring-gray-700'
                 } sm:p-6`}
               >
                 <dt
-                  className={`truncate text-sm font-bold ${
+                  className={`break-words text-sm font-bold ${
                     quota.tv.restricted ? 'text-red-500' : 'text-gray-300'
                   }`}
                 >
@@ -248,7 +267,7 @@ const UserProfile = () => {
                 </dt>
                 <dd
                   className={`mt-1 flex items-center text-sm ${
-                    quota.tv.restricted ? 'text-red-500' : 'text-white'
+                    quota.tv.restricted ? 'text-danger-text' : 'text-strong'
                   }`}
                 >
                   {quota.tv.limit ? (
@@ -282,6 +301,65 @@ const UserProfile = () => {
                   )}
                 </dd>
               </div>
+              {showMusic && (
+                <div
+                  className={`overflow-hidden rounded-lg bg-gray-800/50 px-4 py-5 shadow ring-1 light:bg-surface/90 ${
+                    quota.music.restricted
+                      ? 'bg-gradient-to-t from-red-900 to-transparent ring-red-500'
+                      : 'ring-gray-700'
+                  } sm:p-6`}
+                >
+                  <dt
+                    className={`break-words text-sm font-bold ${
+                      quota.music.restricted ? 'text-red-500' : 'text-gray-300'
+                    }`}
+                  >
+                    {quota.music.limit
+                      ? intl.formatMessage(messages.pastdays, {
+                          type: intl.formatMessage(messages.musicrequests),
+                          days: quota?.music.days,
+                        })
+                      : intl.formatMessage(messages.musicrequests)}
+                  </dt>
+                  <dd
+                    className={`mt-1 flex items-center text-sm ${
+                      quota.music.restricted
+                        ? 'text-danger-text'
+                        : 'text-strong'
+                    }`}
+                  >
+                    {quota.music.limit ? (
+                      <>
+                        <ProgressCircle
+                          progress={Math.round(
+                            ((quota?.music.remaining ?? 0) /
+                              (quota?.music.limit ?? 1)) *
+                              100
+                          )}
+                          useHeatLevel
+                          className="mr-2 h-8 w-8"
+                        />
+                        <div>
+                          {intl.formatMessage(messages.requestsperdays, {
+                            limit: (
+                              <span className="text-3xl font-semibold">
+                                {intl.formatMessage(messages.limit, {
+                                  remaining: quota.music.remaining,
+                                  limit: quota.music.limit,
+                                })}
+                              </span>
+                            ),
+                          })}
+                        </div>
+                      </>
+                    ) : (
+                      <span className="text-3xl font-semibold">
+                        {intl.formatMessage(messages.unlimited)}
+                      </span>
+                    )}
+                  </dd>
+                </div>
+              )}
             </dl>
           </div>
         )}
@@ -356,7 +434,7 @@ const UserProfile = () => {
                 PlexWatchlistSupportLink: (msg: React.ReactNode) => (
                   <a
                     href="https://support.plex.tv/articles/universal-watchlist/"
-                    className="text-white transition duration-300 hover:underline"
+                    className="text-strong transition duration-300 hover:underline"
                     target="_blank"
                     rel="noreferrer"
                   >
@@ -375,7 +453,7 @@ const UserProfile = () => {
             />
           </>
         )}
-      {user.userType === UserType.PLEX &&
+      {hasPlex &&
         (user.id === currentUser?.id ||
           currentHasPermission(Permission.ADMIN)) &&
         (!watchData || !!watchData.recentlyWatched?.length) &&
@@ -395,7 +473,8 @@ const UserProfile = () => {
                   id={item.id}
                   tmdbId={item.tmdbId}
                   tvdbId={item.tvdbId}
-                  type={item.mediaType}
+                  // Watch history is video only.
+                  type={item.mediaType as VideoMediaType}
                 />
               ))}
             />

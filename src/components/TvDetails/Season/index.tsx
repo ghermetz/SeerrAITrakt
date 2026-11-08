@@ -4,6 +4,7 @@ import Button from '@app/components/Common/Button';
 import CachedImage from '@app/components/Common/CachedImage';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import StatusBadgeMini from '@app/components/Common/StatusBadgeMini';
+import { stageBadge } from '@app/components/DownloadBlock';
 import {
   EpisodeSubtitlePanel,
   EpisodeSubtitleTag,
@@ -12,7 +13,7 @@ import {
 import defineMessages from '@app/utils/defineMessages';
 import { ArrowDownTrayIcon } from '@heroicons/react/24/outline';
 import { MediaStatus } from '@server/constants/media';
-import type { SeasonWithEpisodes } from '@server/models/Tv';
+import type { EpisodeDownload, SeasonWithEpisodes } from '@server/models/Tv';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR from 'swr';
@@ -27,12 +28,31 @@ const messages = defineMessages('components.TvDetails.Season', {
     '{count, plural, one {# episode is} other {# episodes are}} not in the library yet.',
 });
 
+/** Download stage and progress for an incoming episode. */
+const DownloadPill = ({ download }: { download: EpisodeDownload }) => {
+  const intl = useIntl();
+  const { label, badgeType } = stageBadge(intl, download.stage);
+  const done =
+    download.size > 0
+      ? Math.min(1, Math.max(0, 1 - download.sizeLeft / download.size))
+      : 0;
+  return (
+    <Badge badgeType={badgeType}>
+      {download.stage === 'downloading' || download.stage === 'stalled'
+        ? `${label} · ${intl.formatNumber(Math.floor(done * 100) / 100, {
+            style: 'percent',
+          })}`
+        : label}
+    </Badge>
+  );
+};
+
 type SeasonProps = {
   seasonNumber: number;
   tvId: number;
-  /** Given when the whole season can be requested. */
+  /** Set when the whole season can be requested. */
   onRequestSeason?: () => void;
-  /** Given when the user may request; offered per episode that needs it. */
+  /** Set when the user may request; offered per episode that needs it. */
   onRequestEpisode?: (episodeNumber: number) => void;
 };
 
@@ -44,9 +64,19 @@ const Season = ({
 }: SeasonProps) => {
   const intl = useIntl();
   const { data, error } = useSWR<SeasonWithEpisodes>(
-    `/api/v1/tv/${tvId}/season/${seasonNumber}`
+    `/api/v1/tv/${tvId}/season/${seasonNumber}`,
+    {
+      // Poll while anything is downloading so progress shows live.
+      refreshInterval: (latest) =>
+        latest?.episodes.some(
+          (episode) =>
+            episode.download || (episode.requested && !episode.available)
+        )
+          ? 15_000
+          : 0,
+    }
   );
-  // The episode whose subtitles are open under it.
+  // Episode number with its subtitle panel open.
   const [subtitlesOpen, setSubtitlesOpen] = useState<number | null>(null);
 
   if (!data && !error) {
@@ -57,17 +87,16 @@ const Season = ({
     return <div>{intl.formatMessage(messages.somethingwentwrong)}</div>;
   }
 
-  // Available, or already requested, means there is nothing to ask for.
   const needsRequest = (episode: SeasonWithEpisodes['episodes'][number]) =>
     !episode.available && !episode.requested;
   const missing = data.episodes.filter(needsRequest).length;
 
   return (
-    <div className="flex flex-col justify-center divide-y divide-gray-700">
+    <div className="flex flex-col justify-center divide-y divide-subtle">
       <SeasonMissingBar tvId={tvId} seasonNumber={seasonNumber} />
       {onRequestSeason && missing > 0 && (
         <div className="flex flex-col items-start justify-between gap-2 pb-4 sm:flex-row sm:items-center">
-          <p className="text-sm text-gray-400">
+          <p className="text-sm text-muted">
             {intl.formatMessage(messages.missing, { count: missing })}
           </p>
           <Button
@@ -114,12 +143,19 @@ const Season = ({
                           )}
                         </div>
                       )}
-                      {episode.requested && !episode.available && (
+                      {episode.download && !episode.available ? (
                         <div className="flex items-center">
-                          <Badge badgeType="primary">
-                            {intl.formatMessage(messages.requested)}
-                          </Badge>
+                          <DownloadPill download={episode.download} />
                         </div>
+                      ) : (
+                        episode.requested &&
+                        !episode.available && (
+                          <div className="flex items-center">
+                            <Badge badgeType="primary">
+                              {intl.formatMessage(messages.requested)}
+                            </Badge>
+                          </div>
+                        )
                       )}
                       <EpisodeSubtitleTag
                         tvId={tvId}
@@ -163,7 +199,7 @@ const Season = ({
                     </div>
                   )}
                 </div>
-                {/* Under the whole episode, still and all. */}
+                {/* Spans the whole episode row, still included. */}
                 {subtitlesOpen === episode.episodeNumber && (
                   <EpisodeSubtitlePanel
                     tvId={tvId}

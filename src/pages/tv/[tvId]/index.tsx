@@ -3,13 +3,16 @@ import { getHostAndPort } from '@app/utils/urlHelper';
 import type { TvDetails as TvDetailsType } from '@server/models/Tv';
 import axios from 'axios';
 import type { GetServerSideProps, NextPage } from 'next';
+import { useRouter } from 'next/router';
 
 interface TvPageProps {
   tv?: TvDetailsType;
 }
 
 const TvPage: NextPage<TvPageProps> = ({ tv }) => {
-  return <TvDetails tv={tv} />;
+  const router = useRouter();
+  // Keyed by title so navigating between series resets state.
+  return <TvDetails key={String(router.query.tvId)} tv={tv} />;
 };
 
 export const getServerSideProps: GetServerSideProps<TvPageProps> = async (

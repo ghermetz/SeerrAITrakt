@@ -1,4 +1,6 @@
-import { initI18n } from '@server/i18n';
+import type { MediaRequest } from '@server/entity/MediaRequest';
+import { getIntl, initI18n } from '@server/i18n';
+import globalMessages from '@server/i18n/globalMessages';
 import { Notification } from '@server/lib/notifications';
 import type { NotificationPayload } from '@server/lib/notifications/agents/agent';
 import TelegramAgent from '@server/lib/notifications/agents/telegram';
@@ -7,10 +9,9 @@ import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 
 /**
- * Reads a message the way Telegram reads MarkdownV2, returning the words a
- * person sees and the links in it, and throwing where Telegram would refuse
- * the message: a reserved character left unescaped outside the bold and link
- * markup, or a link address with an unescaped ")" or "\".
+ * Parses MarkdownV2 as Telegram does, returning visible text and links. Throws
+ * where Telegram would reject: a bare reserved character, or a link URL with
+ * an unescaped ")" or "\".
  */
 const readMarkdownV2 = (text: string) => {
   const reserved = '_*[]()~`>#+-=|{}.!\\';
@@ -26,7 +27,7 @@ const readMarkdownV2 = (text: string) => {
       if (label !== null) label += next;
       else shown += next;
     } else if (ch === '*') {
-      // Bold on or off: markup, not words.
+      // Bold toggle, not text.
     } else if (ch === '[' && label === null) {
       label = '';
     } else if (ch === ']' && label !== null) {
@@ -162,5 +163,54 @@ describe('Telegram messages', () => {
 
     assert.ok(built.caption, 'sent as a photo with a caption');
     assert.equal(readMarkdownV2(built.caption!).shown, 'Poster `Film`\\');
+  });
+
+  it('says why a request was declined, escaped', () => {
+    const reason =
+      'Already on *Netflix* (4K) - see [here](https://e.vil) \\ `x`';
+    const { shown, links } = readMarkdownV2(
+      textOf(
+        {
+          subject: 'Film (2020)',
+          notifySystem: true,
+          notifyAdmin: false,
+          request: {
+            requestedBy: { displayName: 'Friend' },
+            declineReason: reason,
+          } as unknown as MediaRequest,
+        },
+        Notification.MEDIA_DECLINED
+      )
+    );
+
+    assert.ok(
+      shown.includes(
+        `${getIntl().formatMessage(globalMessages.declineReason)}: ${reason}`
+      ),
+      shown
+    );
+    assert.deepEqual(links, []);
+  });
+
+  it('sends a message too long for a poster caption as text instead', () => {
+    const built = new TelegramAgent()['getNotificationPayload'](
+      Notification.MEDIA_DECLINED,
+      {
+        subject: 'Film (2020)',
+        message: 'o'.repeat(500),
+        image: 'https://image.tmdb.org/t/p/w600_and_h900_bestv2/x.jpg',
+        notifySystem: true,
+        notifyAdmin: false,
+        request: {
+          requestedBy: { displayName: 'Friend' },
+          declineReason: 'r.'.repeat(250),
+        } as unknown as MediaRequest,
+      }
+    ) as { text?: string; caption?: string; photo?: string };
+
+    // Telegram rejects captions over 1024 characters.
+    assert.equal(built.photo, undefined);
+    assert.equal(built.caption, undefined);
+    assert.ok(readMarkdownV2(built.text!).shown.includes('r.'.repeat(250)));
   });
 });

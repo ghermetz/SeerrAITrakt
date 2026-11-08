@@ -1,3 +1,4 @@
+import type { UserDefaultProfile } from '@server/constants/requestDefaults';
 import type { NotificationAgentKey } from '@server/lib/settings';
 
 export interface UserSettingsGeneralResponse {
@@ -11,13 +12,19 @@ export interface UserSettingsGeneralResponse {
   movieQuotaDays?: number;
   tvQuotaLimit?: number;
   tvQuotaDays?: number;
+  musicQuotaLimit?: number | null;
+  musicQuotaDays?: number | null;
   globalMovieQuotaDays?: number;
   globalMovieQuotaLimit?: number;
   globalTvQuotaLimit?: number;
   globalTvQuotaDays?: number;
+  globalMusicQuotaLimit?: number;
+  globalMusicQuotaDays?: number;
   watchlistSyncMovies?: boolean;
   watchlistSyncTv?: boolean;
   traktUsername?: string | null;
+  /** Quality profiles picked for one's own requests, per server. */
+  defaultProfiles?: UserDefaultProfile[];
 }
 
 export type NotificationAgentTypes = Record<NotificationAgentKey, number>;

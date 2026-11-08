@@ -1,5 +1,6 @@
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
+import SaveBar from '@app/components/Common/SaveBar';
 import NotificationTypeSelector from '@app/components/NotificationTypeSelector';
 import { availableLanguages } from '@app/context/LanguageContext';
 import useSettings from '@app/hooks/useSettings';
@@ -23,11 +24,9 @@ const messages = defineMessages('components.Settings.Notifications', {
   webhookUrlTip:
     'Create a <DiscordWebhookLink>webhook integration</DiscordWebhookLink> in your server',
   webhookRoleId: 'Notification Role ID',
-  webhookRoleIdTip:
-    'The role ID to mention in the webhook message. Leave empty to disable mentions',
+  webhookRoleIdTip: 'Role to mention in each message. Empty for no mentions',
   webhookThreadId: 'Thread ID',
-  webhookThreadIdTip:
-    'The ID of the thread channel to post notifications in. Leave empty to post in the webhook channel',
+  webhookThreadIdTip: 'Thread to post in. Empty posts in the webhook’s channel',
   useUserLocale: 'Use Notification Recipient Locale',
   discordsettingssaved: 'Discord notification settings saved successfully!',
   discordsettingsfailed: 'Discord notification settings failed to save.',
@@ -212,7 +211,7 @@ const NotificationsDiscord = () => {
               </div>
             </div>
             <div className="form-row">
-              <label htmlFor="name" className="text-label">
+              <label htmlFor="webhookUrl" className="text-label">
                 {intl.formatMessage(messages.webhookUrl)}
                 <span className="label-required">*</span>
                 <span className="label-tip">
@@ -220,7 +219,7 @@ const NotificationsDiscord = () => {
                     DiscordWebhookLink: (msg: React.ReactNode) => (
                       <a
                         href="https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks"
-                        className="text-white transition duration-300 hover:underline"
+                        className="text-strong transition duration-300 hover:underline"
                         target="_blank"
                         rel="noreferrer"
                       >
@@ -394,7 +393,7 @@ const NotificationsDiscord = () => {
                   : undefined
               }
             />
-            <div className="actions">
+            <SaveBar>
               <div className="flex justify-end">
                 <span className="ml-3 inline-flex rounded-md shadow-sm">
                   <Button
@@ -433,7 +432,7 @@ const NotificationsDiscord = () => {
                   </Button>
                 </span>
               </div>
-            </div>
+            </SaveBar>
           </Form>
         );
       }}

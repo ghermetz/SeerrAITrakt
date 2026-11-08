@@ -5,11 +5,13 @@ import {
   MediaType,
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
+import AlbumRequest from '@server/entity/AlbumRequest';
 import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import { Permission } from '@server/lib/permissions';
+import { getSettings } from '@server/lib/settings';
 import { setupTestDb } from '@server/test/db';
 import assert from 'node:assert/strict';
 import { beforeEach, describe, it } from 'node:test';
@@ -34,9 +36,8 @@ const stubTmdb = () => {
 };
 
 /**
- * Quota accounting counts *seasons* for series, not requests — asking for four
- * seasons uses four of the allowance. This is the behaviour the UI and the
- * request path both depend on, and it had no coverage.
+ * Quotas count seasons for series, not requests: requesting four seasons uses
+ * four of the allowance. The UI and the request path both depend on this.
  */
 describe('user request quotas', () => {
   setupTestDb();
@@ -110,6 +111,8 @@ describe('user request quotas', () => {
         movieQuotaDays: 7,
         tvQuotaLimit: 10,
         tvQuotaDays: 7,
+        musicQuotaLimit: 10,
+        musicQuotaDays: 7,
       })
     );
 
@@ -165,6 +168,101 @@ describe('user request quotas', () => {
     assert.equal(quota.tv.used, 0);
   });
 
+  // Requested while pending, so nothing is sent to Lidarr.
+  const addMusicRequest = async (albums: number) => {
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 0,
+        foreignId: `artist-${tmdbId++}`,
+        mediaType: MediaType.MUSIC,
+        status: MediaStatus.PENDING,
+      })
+    );
+
+    const request = await getRepository(MediaRequest).save(
+      new MediaRequest({
+        media,
+        requestedBy: user,
+        type: MediaType.MUSIC,
+        status: MediaRequestStatus.PENDING,
+        is4k: false,
+      })
+    );
+
+    for (let i = 0; i < albums; i++) {
+      await getRepository(AlbumRequest).save(
+        new AlbumRequest({
+          albumMbid: `album-${request.id}-${i}`,
+          title: `Album ${i}`,
+          request,
+        })
+      );
+    }
+
+    return request;
+  };
+
+  it('counts requests from the first day of the window, and none before it', async (t) => {
+    // The window is the last seven days: from noon on 8 July.
+    t.mock.timers.enable({
+      apis: ['Date'],
+      now: new Date('2026-07-15T12:00:00Z'),
+    });
+    const inside = new Date('2026-07-08T13:00:00Z');
+    const before = new Date('2026-07-08T11:00:00Z');
+
+    for (const createdAt of [inside, before]) {
+      const movie = await addMovieRequest();
+      const series = await addSeriesRequest([1, 2]);
+      const music = await addMusicRequest(3);
+      await getRepository(MediaRequest).update(
+        [movie.id, series.id, music.id],
+        { createdAt }
+      );
+      // Seasons and albums count from when each was asked for.
+      await getRepository(SeasonRequest).update(
+        { request: { id: series.id } },
+        { createdAt }
+      );
+      await getRepository(AlbumRequest).update(
+        { request: { id: music.id } },
+        { createdAt }
+      );
+    }
+
+    const quota = await user.getQuota();
+
+    assert.equal(quota.movie.used, 1);
+    assert.equal(quota.tv.used, 2);
+    assert.equal(quota.music.used, 3);
+  });
+
+  it('counts a season or album added later from when it was added', async (t) => {
+    t.mock.timers.enable({
+      apis: ['Date'],
+      now: new Date('2026-07-15T12:00:00Z'),
+    });
+    const long = new Date('2026-06-01T12:00:00Z');
+    const series = await addSeriesRequest([1, 2]);
+    const music = await addMusicRequest(2);
+    await getRepository(MediaRequest).update([series.id, music.id], {
+      createdAt: long,
+    });
+    const [season] = await getRepository(SeasonRequest).find({
+      where: { request: { id: series.id } },
+    });
+    await getRepository(SeasonRequest).update(season.id, { createdAt: long });
+    const [album] = await getRepository(AlbumRequest).find({
+      where: { request: { id: music.id } },
+    });
+    await getRepository(AlbumRequest).update(album.id, { createdAt: long });
+
+    const quota = await user.getQuota();
+
+    assert.equal(quota.tv.used, 1);
+    assert.equal(quota.music.used, 1);
+  });
+
   it('ignores declined requests', async () => {
     const request = await addSeriesRequest([1, 2, 3]);
     request.status = MediaRequestStatus.DECLINED;
@@ -173,5 +271,16 @@ describe('user request quotas', () => {
     const quota = await user.getQuota();
 
     assert.equal(quota.tv.used, 0);
+  });
+
+  it('says whether requests past a limit wait for an admin', async () => {
+    const main = getSettings().main;
+    assert.equal((await user.getQuota()).overQuotaWaits, false);
+    main.overQuotaRequests = true;
+    try {
+      assert.equal((await user.getQuota()).overQuotaWaits, true);
+    } finally {
+      main.overQuotaRequests = false;
+    }
   });
 });

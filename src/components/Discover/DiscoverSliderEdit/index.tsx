@@ -7,6 +7,7 @@ import CreateSlider from '@app/components/Discover/CreateSlider';
 import { sliderTitles } from '@app/components/Discover/constants';
 import GenreTag from '@app/components/GenreTag';
 import KeywordTag from '@app/components/KeywordTag';
+import { WatchProviderTags } from '@app/components/Selector';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
@@ -32,6 +33,8 @@ const messages = defineMessages('components.Discover.DiscoverSliderEdit', {
   deletesuccess: 'Sucessfully deleted slider.',
   deletefail: 'Failed to delete slider.',
   remove: 'Remove',
+  moveUp: 'Move up',
+  moveDown: 'Move down',
   enable: 'Shown to everyone',
   showForMe: 'Show on my home page',
   hideForMe: 'Hide for me only',
@@ -56,9 +59,9 @@ type DiscoverSliderEditProps = {
   children: React.ReactNode;
   disableUpButton: boolean;
   disableDownButton: boolean;
-  /** Not an admin: only showing or hiding it for themselves. */
+  /** Non-admin: can only show or hide it for themselves. */
   personalOnly?: boolean;
-  /** This person hid it for themselves. */
+  /** Hidden by the current user for themselves. */
   hiddenForMe?: boolean;
   onToggleMine?: () => void;
 };
@@ -168,6 +171,22 @@ const DiscoverSliderEdit = ({
         return intl.formatMessage(sliderTitles.upcomingtv);
       case DiscoverSliderType.NETWORKS:
         return intl.formatMessage(sliderTitles.networks);
+      case DiscoverSliderType.ANIME:
+        return intl.formatMessage(sliderTitles.anime);
+      case DiscoverSliderType.MUSIC_RECENTLY_ADDED:
+        return intl.formatMessage(sliderTitles.musicRecentlyAdded);
+      case DiscoverSliderType.MUSIC_RECENT_REQUESTS:
+        return intl.formatMessage(sliderTitles.musicRecentRequests);
+      case DiscoverSliderType.MUSIC_NEW_RELEASES:
+        return intl.formatMessage(sliderTitles.musicNewReleases);
+      case DiscoverSliderType.MUSIC_TOP_SONGS:
+        return intl.formatMessage(sliderTitles.musicTopSongs);
+      case DiscoverSliderType.MUSIC_TRENDING:
+        return intl.formatMessage(sliderTitles.musicTrending);
+      case DiscoverSliderType.MUSIC_POPULAR_ALBUMS:
+        return intl.formatMessage(sliderTitles.musicTopAlbums);
+      case DiscoverSliderType.MUSIC_POPULAR_ARTISTS:
+        return intl.formatMessage(sliderTitles.musicTopArtists);
       case DiscoverSliderType.TMDB_MOVIE_KEYWORD:
         return intl.formatMessage(sliderTitles.tmdbmoviekeyword);
       case DiscoverSliderType.TMDB_TV_KEYWORD:
@@ -195,7 +214,7 @@ const DiscoverSliderEdit = ({
     <div
       key={`discover-slider-${slider.id}-editing`}
       data-testid="discover-slider-edit-mode"
-      className={`relative mb-4 rounded-lg bg-gray-800 shadow-md ${
+      className={`relative mb-4 rounded-lg bg-surface shadow-md ${
         isDragging ? 'opacity-0' : 'opacity-100'
       }`}
       {...(personalOnly ? {} : dragProps)}
@@ -212,12 +231,12 @@ const DiscoverSliderEdit = ({
           className={`absolute -bottom-2 left-0 w-full border-t-4 border-indigo-500`}
         />
       )}
-      <div className="flex w-full flex-col rounded-t-lg border-l border-r border-t border-gray-800 bg-gray-900 p-4 text-gray-400 md:flex-row md:items-center md:space-x-2">
+      <div className="flex w-full flex-col rounded-t-lg border-l border-r border-t border-gray-800 bg-page p-4 text-muted md:flex-row md:items-center md:space-x-2">
         <div
           className={`${slider.data ? 'mb-4' : 'mb-0'} flex space-x-2 md:mb-0`}
         >
           {!personalOnly && <Bars3Icon className="h-6 w-6" />}
-          <div className="w-7/12 truncate md:w-full">
+          <div className="w-7/12 min-w-0 break-words md:w-full">
             {getSliderTitle(slider)}
           </div>
         </div>
@@ -262,6 +281,17 @@ const DiscoverSliderEdit = ({
           {slider.type === DiscoverSliderType.TMDB_SEARCH && (
             <Tag iconSvg={<MagnifyingGlassIcon />}>{slider.data}</Tag>
           )}
+          {(slider.type === DiscoverSliderType.TMDB_MOVIE_STREAMING_SERVICES ||
+            slider.type === DiscoverSliderType.TMDB_TV_STREAMING_SERVICES) && (
+            <WatchProviderTags
+              type={
+                slider.type === DiscoverSliderType.TMDB_MOVIE_STREAMING_SERVICES
+                  ? 'movie'
+                  : 'tv'
+              }
+              data={slider.data}
+            />
+          )}
         </div>
         {personalOnly ? (
           <div className="absolute right-4 top-4 md:relative md:right-0 md:top-0">
@@ -285,7 +315,9 @@ const DiscoverSliderEdit = ({
               <button
                 type="button"
                 className={`absolute right-36 top-4 md:relative md:right-0 md:top-0 ${
-                  hiddenForMe ? 'text-indigo-400' : 'hover:text-white'
+                  hiddenForMe
+                    ? 'text-accent-soft light:text-accent-text'
+                    : 'hover:text-strong'
                 }`}
                 aria-label={intl.formatMessage(
                   hiddenForMe ? messages.hiddenForMe : messages.hideForMe
@@ -340,20 +372,22 @@ const DiscoverSliderEdit = ({
             )}
             <div className="absolute right-14 top-4 flex px-2 md:relative md:right-0 md:top-0">
               <button
-                className={'hover:text-white disabled:text-gray-800'}
+                className={'hover:text-strong disabled:text-gray-800'}
                 onClick={() =>
                   onPositionUpdate(Number(slider.id), Position.Above, true)
                 }
                 disabled={disableUpButton}
+                aria-label={intl.formatMessage(messages.moveUp)}
               >
                 <ChevronUpIcon className="h-7 w-7 md:h-6 md:w-6" />
               </button>
               <button
-                className={'hover:text-white disabled:text-gray-800'}
+                className={'hover:text-strong disabled:text-gray-800'}
                 onClick={() =>
                   onPositionUpdate(Number(slider.id), Position.Below, true)
                 }
                 disabled={disableDownButton}
+                aria-label={intl.formatMessage(messages.moveDown)}
               >
                 <ChevronDownIcon className="h-7 w-7 md:h-6 md:w-6" />
               </button>

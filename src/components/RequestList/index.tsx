@@ -6,6 +6,7 @@ import { CardListSkeleton } from '@app/components/Common/PageSkeleton';
 import PageTitle from '@app/components/Common/PageTitle';
 import Tooltip from '@app/components/Common/Tooltip';
 import RequestItem from '@app/components/RequestList/RequestItem';
+import useFeature from '@app/hooks/useFeature';
 import useRequestEtas from '@app/hooks/useRequestEtas';
 import { useUpdateQueryParams } from '@app/hooks/useUpdateQueryParams';
 import { Permission, useUser } from '@app/hooks/useUser';
@@ -13,15 +14,16 @@ import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import { ExclamationTriangleIcon } from '@heroicons/react/24/outline';
 import {
-  ArrowDownIcon,
-  ArrowUpIcon,
-  Bars3BottomLeftIcon,
+  BarsArrowDownIcon,
+  BarsArrowUpIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   CircleStackIcon,
   FunnelIcon,
+  MagnifyingGlassIcon,
   UserIcon,
 } from '@heroicons/react/24/solid';
+import { MediaType } from '@server/constants/media';
 import type { BackfillStatus } from '@server/interfaces/api/backfillStatus';
 import type { RequestResultsResponse } from '@server/interfaces/api/requestInterfaces';
 import Link from 'next/link';
@@ -38,8 +40,8 @@ const messages = defineMessages('components.RequestList', {
   sortAdded: 'Most Recent',
   sortModified: 'Last Modified',
   sortDirection: 'Toggle Sort Direction',
-  unableToConnect:
-    'Unable to connect to {services}. Some information may be unavailable.',
+  searchRequests: 'Search requests',
+  unableToConnect: 'Can’t reach {services}, so some details may be missing.',
 });
 
 enum Filter {
@@ -65,6 +67,7 @@ const RequestList = () => {
     id: Number(router.query.userId),
   });
   const { user: currentUser, hasPermission } = useUser();
+  const musicOn = useFeature('music');
   const [currentFilters, setCurrentFilters] = useState<string[]>([
     Filter.PENDING,
   ]);
@@ -74,14 +77,15 @@ const RequestList = () => {
   const [currentSortDirection, setCurrentSortDirection] =
     useState<SortDirection>('desc');
   const [currentPageSize, setCurrentPageSize] = useState<number>(10);
+  // Raw input, and the debounced search term.
+  const [searchText, setSearchText] = useState('');
+  const [search, setSearch] = useState('');
 
   const page = router.query.page ? Number(router.query.page) : 1;
   const pageIndex = page - 1;
   const updateQueryParams = useUpdateQueryParams({ page: page.toString() });
 
-  // The user picker is only shown where the list is not already scoped to a
-  // single person, so it never conflicts with the profile view.
-  // Changing a filter returns to the first page, as the selects did.
+  // Back to page one on filter change, keeping a userId scope.
   const resetPage = () => {
     router.push({
       pathname: router.pathname,
@@ -89,18 +93,41 @@ const RequestList = () => {
     });
   };
 
-  // Only people who see everyone's requests can pick whose; everyone else
-  // only ever sees their own, and the server refuses a filter for others.
+  // The user picker is hidden when scoped to one user, and only shown to
+  // those who can view all requests; the server refuses it for others.
   const canFilterByUser =
     !router.pathname.startsWith('/profile') &&
     !router.query.userId &&
     hasPermission([Permission.MANAGE_REQUESTS, Permission.REQUEST_VIEW], {
       type: 'or',
     });
+  // Even columns: the filters share a row under the search, and sit beside
+  // the title in one row of equal widths on wide screens.
+  const filterGrid = canFilterByUser
+    ? {
+        columns:
+          'sm:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-[repeat(5,12.5rem)]',
+        search: 'sm:col-span-2 xl:col-span-4 2xl:col-span-1',
+      }
+    : {
+        columns: 'sm:grid-cols-3 2xl:grid-cols-[repeat(4,12.5rem)]',
+        search: 'sm:col-span-3 2xl:col-span-1',
+      };
 
   const { data: userData } = useSWR<{
     results: { id: number; displayName: string }[];
   }>(canFilterByUser ? '/api/v1/user?take=100&sort=displayname' : null);
+
+  useEffect(() => {
+    const words = searchText.trim();
+    if (words === search) return;
+    const timer = setTimeout(() => {
+      setSearch(words);
+      if (router.query.page && router.query.page !== '1') resetPage();
+    }, 350);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchText]);
 
   const {
     data,
@@ -109,48 +136,59 @@ const RequestList = () => {
   } = useSWR<RequestResultsResponse>(
     `/api/v1/request?take=${currentPageSize}&skip=${
       pageIndex * currentPageSize
-    }&filter=${currentFilters.join(',') || 'all'}&mediaType=${
-      currentMediaTypes.join(',') || 'all'
-    }&sort=${currentSort}&sortDirection=${currentSortDirection}${
+    }&filter=${encodeURIComponent(
+      currentFilters.join(',') || 'all'
+    )}&mediaType=${encodeURIComponent(currentMediaTypes.join(',') || 'all')}&sort=${currentSort}&sortDirection=${currentSortDirection}${
       router.pathname.startsWith('/profile')
         ? `&requestedBy=${currentUser?.id}`
         : router.query.userId
           ? `&requestedBy=${router.query.userId}`
-          : // Also ignores a filter saved on this device by someone else.
+          : // Also drops a filter another user saved on this device.
             canFilterByUser && currentRequestedBy.length
-            ? `&requestedBy=${currentRequestedBy.join(',')}`
+            ? `&requestedBy=${encodeURIComponent(currentRequestedBy.join(','))}`
             : ''
-    }`
+    }${search ? `&search=${encodeURIComponent(search)}` : ''}`,
+    // Keep the list (and the box's focus) while the next search loads.
+    { keepPreviousData: true }
   );
-  // Every card's estimate in one call, rather than one per card.
+  // One ETA call for the page, not one per card.
   const etaFor = useRequestEtas(
     data?.results.map((request) => request.id) ?? []
   );
-  // Backfill's state for the titles on this page, in one call; admins only.
+  // Admin Backfill lookup for the page in one call. Backfill doesn't cover
+  // music.
   const tmdbIds = [
-    ...new Set((data?.results ?? []).map((request) => request.media.tmdbId)),
+    ...new Set(
+      (data?.results ?? [])
+        .filter((request) => request.type !== MediaType.MUSIC)
+        .map((request) => request.media.tmdbId)
+    ),
   ];
   const { data: backfill } = useSWR<BackfillLookup[]>(
     hasPermission(Permission.ADMIN) && tmdbIds.length
       ? `/api/v1/backfill/lookup?tmdbIds=${tmdbIds.join(',')}`
       : null,
     {
-      refreshInterval: (latest) => (latest?.some((row) => row.job) ? 5000 : 0),
+      refreshInterval: (latest) =>
+        latest?.some((row) => row.job)
+          ? 5000
+          : latest?.some((row) => row.workingRunId)
+            ? 10000
+            : 0,
     }
   );
 
-  // Everyone else: whether Backfill is looking for their own requests.
+  // Non-admins: Backfill status of their own requests.
   const { data: backfillStatus } = useSWR<BackfillStatus[]>(
     !hasPermission(Permission.ADMIN) && tmdbIds.length
       ? `/api/v1/backfill-status?tmdbIds=${tmdbIds.join(',')}`
       : null,
     {
       refreshInterval: (latest) =>
-        latest?.some((s) => s.state === 'downloading') ? 10000 : 0,
+        latest?.some((s) => s.state === 'downloading' || s.agent) ? 10000 : 0,
     }
   );
 
-  // Restore last set filter values on component mount
   useEffect(() => {
     const filterString = window.localStorage.getItem('rl-filter-settings');
 
@@ -160,7 +198,7 @@ const RequestList = () => {
       if (Array.isArray(filterSettings.currentFilters)) {
         setCurrentFilters(filterSettings.currentFilters);
       } else if (filterSettings.currentFilter) {
-        // Saved by an earlier version as a single value.
+        // Legacy single-value format.
         setCurrentFilters([filterSettings.currentFilter]);
       }
 
@@ -184,13 +222,12 @@ const RequestList = () => {
       }
     }
 
-    // If filter value is provided in query, use that instead
+    // A filter in the query overrides the saved one.
     if (Object.values(Filter).includes(router.query.filter as Filter)) {
       setCurrentFilters([router.query.filter as Filter]);
     }
   }, [router.query.filter]);
 
-  // Set filter values to local storage any time they are changed
   useEffect(() => {
     window.localStorage.setItem(
       'rl-filter-settings',
@@ -231,7 +268,7 @@ const RequestList = () => {
           router.query.userId ? user?.displayName : '',
         ]}
       />
-      <div className="mb-4 flex flex-col justify-between lg:flex-row lg:items-end">
+      <div className="mb-4 flex flex-col justify-between 2xl:flex-row 2xl:items-end 2xl:gap-4">
         <Header
           subtext={
             router.pathname.startsWith('/profile') ? (
@@ -249,8 +286,21 @@ const RequestList = () => {
         >
           {intl.formatMessage(messages.requests)}
         </Header>
-        <div className="mt-2 flex flex-grow flex-col sm:flex-row lg:flex-grow-0">
-          <div className="mb-2 flex flex-grow sm:mb-0 sm:mr-2 lg:flex-grow-0">
+        <div className={`mt-2 grid grid-cols-1 gap-2 ${filterGrid.columns}`}>
+          <div className={`flex min-w-0 ${filterGrid.search}`}>
+            <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-sm text-gray-100">
+              <MagnifyingGlassIcon className="h-6 w-6" />
+            </span>
+            <input
+              type="text"
+              aria-label={intl.formatMessage(messages.searchRequests)}
+              placeholder={intl.formatMessage(messages.searchRequests)}
+              className="rounded-r-only"
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+            />
+          </div>
+          <div className="flex min-w-0">
             <MultiSelectFilter
               icon={<CircleStackIcon className="h-6 w-6" />}
               name="mediaType"
@@ -267,12 +317,20 @@ const RequestList = () => {
                   value: 'tv',
                   label: intl.formatMessage(globalMessages.tvshows),
                 },
+                ...(musicOn
+                  ? [
+                      {
+                        value: 'music',
+                        label: intl.formatMessage(globalMessages.music),
+                      },
+                    ]
+                  : []),
               ]}
               selected={currentMediaTypes}
             />
           </div>
           {canFilterByUser && (
-            <div className="mb-2 flex flex-grow sm:mb-0 sm:mr-2 lg:flex-grow-0">
+            <div className="flex min-w-0">
               <MultiSelectFilter
                 allLabel={intl.formatMessage(messages.allusers)}
                 icon={<UserIcon className="h-6 w-6" />}
@@ -289,7 +347,7 @@ const RequestList = () => {
               />
             </div>
           )}
-          <div className="mb-2 flex flex-grow sm:mb-0 sm:mr-2 lg:flex-grow-0">
+          <div className="flex min-w-0">
             <MultiSelectFilter
               icon={<FunnelIcon className="h-6 w-6" />}
               name="filter"
@@ -330,10 +388,25 @@ const RequestList = () => {
               selected={currentFilters}
             />
           </div>
-          <div className="mb-2 flex flex-grow sm:mb-0 lg:flex-grow-0">
-            <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-gray-100 sm:text-sm">
-              <Bars3BottomLeftIcon className="h-6 w-6" />
-            </span>
+          <div className="flex min-w-0">
+            <Tooltip content={intl.formatMessage(messages.sortDirection)}>
+              <button
+                type="button"
+                aria-label={intl.formatMessage(messages.sortDirection)}
+                className="inline-flex flex-none items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-gray-100 transition hover:bg-gray-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                onClick={() =>
+                  setCurrentSortDirection(
+                    currentSortDirection === 'asc' ? 'desc' : 'asc'
+                  )
+                }
+              >
+                {currentSortDirection === 'asc' ? (
+                  <BarsArrowUpIcon className="h-6 w-6" />
+                ) : (
+                  <BarsArrowDownIcon className="h-6 w-6" />
+                )}
+              </button>
+            </Tooltip>
             <select
               id="sort"
               aria-label={intl.formatMessage(globalMessages.sortBy)}
@@ -348,7 +421,7 @@ const RequestList = () => {
                 });
               }}
               value={currentSort}
-              className="rounded-none border-r-0"
+              className="rounded-r-only pr-8"
             >
               <option value="added">
                 {intl.formatMessage(messages.sortAdded)}
@@ -357,24 +430,6 @@ const RequestList = () => {
                 {intl.formatMessage(messages.sortModified)}
               </option>
             </select>
-            <Tooltip content={intl.formatMessage(messages.sortDirection)}>
-              <Button
-                buttonType="default"
-                className="z-40 mr-2 rounded-l-none border !border-gray-500 !bg-gray-800 !px-3 !text-gray-500 hover:!bg-gray-400 hover:!text-white"
-                buttonSize="md"
-                onClick={() =>
-                  setCurrentSortDirection(
-                    currentSortDirection === 'asc' ? 'desc' : 'asc'
-                  )
-                }
-              >
-                {currentSortDirection === 'asc' ? (
-                  <ArrowUpIcon className="h-6 w-6" />
-                ) : (
-                  <ArrowDownIcon className="h-6 w-6" />
-                )}
-              </Button>
-            </Tooltip>
           </div>
         </div>
       </div>
@@ -399,7 +454,7 @@ const RequestList = () => {
 
       {data.results.map((request) => {
         return (
-          <div className="py-2" key={`request-list-${request.id}`}>
+          <div className="list-row py-2" key={`request-list-${request.id}`}>
             <RequestItem
               eta={etaFor(request.id)}
               backfill={backfill?.find(
@@ -420,7 +475,7 @@ const RequestList = () => {
       })}
 
       {data.results.length === 0 && (
-        <div className="flex w-full flex-col items-center justify-center py-24 text-white">
+        <div className="flex w-full flex-col items-center justify-center py-24 text-strong">
           <span className="text-2xl text-gray-400">
             {intl.formatMessage(globalMessages.noresults)}
           </span>
@@ -464,7 +519,7 @@ const RequestList = () => {
             </p>
           </div>
           <div className="flex justify-center sm:flex-1 sm:justify-start lg:justify-center">
-            <span className="-mt-3 items-center truncate text-sm sm:mt-0">
+            <span className="-mt-3 items-center text-sm sm:mt-0">
               {intl.formatMessage(globalMessages.resultsperpage, {
                 pageSize: (
                   <select

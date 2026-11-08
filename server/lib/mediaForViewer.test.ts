@@ -1,7 +1,9 @@
+import { MediaRequestStatus } from '@server/constants/media';
 import Issue from '@server/entity/Issue';
 import IssueComment from '@server/entity/IssueComment';
 import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
+import SeasonRequest from '@server/entity/SeasonRequest';
 import { User } from '@server/entity/User';
 import mediaForViewer from '@server/lib/mediaForViewer';
 import { Permission } from '@server/lib/permissions';
@@ -9,8 +11,8 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 /*
- * What a title page reveals about the people who requested it or reported
- * problems with it, depending on who is looking.
+ * What a title page reveals about requesters and issue reporters, depending on
+ * the viewer.
  */
 
 const person = (id: number, email: string, permissions = Permission.REQUEST) =>
@@ -90,5 +92,107 @@ describe('a title seen by different people', () => {
       (media?.issues[0].createdBy as Partial<User>).email,
       'reporter@example.com'
     );
+  });
+
+  it('keeps what the title page lists of each request for anyone', () => {
+    // The page's "Requested by": who, with avatar, for what, its status and
+    // when.
+    const requester = person(1, 'requester@example.com');
+    requester.avatar = '/avatar/1.png';
+    requester.setDisplayName();
+    const createdAt = new Date('2026-10-01T12:00:00Z');
+    const media = mediaForViewer(
+      new Media({
+        requests: [
+          new MediaRequest({
+            id: 7,
+            requestedBy: requester,
+            status: MediaRequestStatus.APPROVED,
+            is4k: true,
+            createdAt,
+            seasons: [
+              new SeasonRequest({ seasonNumber: 1 }),
+              new SeasonRequest({ seasonNumber: 2 }),
+            ],
+          }),
+        ],
+        issues: [],
+      }),
+      person(3, 'viewer@example.com')
+    );
+    const [request] = media?.requests ?? [];
+    const shown = request.requestedBy as Partial<User>;
+    assert.equal(shown.id, 1);
+    assert.equal(shown.displayName, 'user1');
+    assert.equal(shown.avatar, '/avatar/1.png');
+    assert.equal(request.status, MediaRequestStatus.APPROVED);
+    assert.equal(request.is4k, true);
+    assert.equal(request.createdAt, createdAt);
+    assert.deepEqual(
+      request.seasons.map((s) => s.seasonNumber),
+      [1, 2]
+    );
+  });
+});
+
+describe('why a request was declined, on a title page', () => {
+  const declined = () => {
+    const requester = person(1, 'requester@example.com');
+    const other = person(2, 'other@example.com');
+    return new Media({
+      requests: [
+        new MediaRequest({
+          requestedBy: requester,
+          declineReason: 'Already on Netflix',
+        }),
+        new MediaRequest({
+          requestedBy: other,
+          declineReason: 'Not this one',
+        }),
+      ],
+      issues: [],
+    });
+  };
+
+  it('shows the requester the reason for their own request only', () => {
+    const media = mediaForViewer(
+      declined(),
+      person(1, 'requester@example.com')
+    );
+    assert.equal(media?.requests[0].declineReason, 'Already on Netflix');
+    assert.equal(media?.requests[1].declineReason, undefined);
+  });
+
+  it('keeps the reasons from anyone else who opens the title', () => {
+    const media = mediaForViewer(declined(), person(3, 'viewer@example.com'));
+    assert.deepEqual(
+      media?.requests.map((r) => r.declineReason),
+      [undefined, undefined]
+    );
+  });
+
+  it('keeps them from someone who is not signed in', () => {
+    const media = mediaForViewer(declined(), undefined);
+    assert.deepEqual(
+      media?.requests.map((r) => r.declineReason),
+      [undefined, undefined]
+    );
+  });
+
+  it('shows every reason to those who may see all requests', () => {
+    for (const permissions of [
+      Permission.MANAGE_REQUESTS,
+      Permission.REQUEST_VIEW,
+      Permission.ADMIN,
+    ]) {
+      const media = mediaForViewer(
+        declined(),
+        person(3, 'manager@example.com', permissions)
+      );
+      assert.deepEqual(
+        media?.requests.map((r) => r.declineReason),
+        ['Already on Netflix', 'Not this one']
+      );
+    }
   });
 });

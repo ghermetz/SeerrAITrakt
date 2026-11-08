@@ -24,12 +24,10 @@ import http from 'node:http';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
 /*
- * Watch history from Jellyfin and Emby, against a stand-in that answers
- * /Items, /Users and /System/Info the way a real Jellyfin 12 and Emby 4.10
- * did when tried by hand: each person's items carry their own UserData
- * (Played, PlayCount, PlaybackPositionTicks, PlayedPercentage,
- * LastPlayedDate), filtered by IsPlayed or IsResumable and sorted by
- * DatePlayed.
+ * Against a fake /Items, /Users and /System/Info modeled on real Jellyfin 12
+ * and Emby 4.10: per-user UserData (Played, PlayCount, PlaybackPositionTicks,
+ * PlayedPercentage, LastPlayedDate), IsPlayed/IsResumable filters, DatePlayed
+ * sort.
  */
 
 setupTestDb();
@@ -51,7 +49,7 @@ interface FakeItem {
   ProviderIds?: Record<string, string>;
 }
 
-/** Items on the server, and what each account has done with them. */
+/** Server items and each account's UserData for them. */
 let items: FakeItem[] = [];
 let userData: Record<string, Record<string, Record<string, unknown>>> = {};
 let accounts: { Id: string; Name: string; Policy: Record<string, unknown> }[] =
@@ -150,18 +148,18 @@ beforeEach(async () => {
     { Id: 'g3', Name: 'Guest', Policy: { IsDisabled: false } },
   ];
   items = [
-    { Id: 'm1', Name: '1917 (2019)', Type: 'Movie', ProductionYear: 2019 },
-    { Id: 's1', Name: 'The Apothecary Diaries', Type: 'Series' },
+    { Id: 'm1', Name: '1863 (2019)', Type: 'Movie', ProductionYear: 2019 },
+    { Id: 's1', Name: 'The Herbalist Ledgers', Type: 'Series' },
     ...[1, 2, 3].map((n) => ({
       Id: `e${n}`,
       Name: `Episode ${n}`,
       Type: 'Episode' as const,
       SeriesId: 's1',
-      SeriesName: 'The Apothecary Diaries',
+      SeriesName: 'The Herbalist Ledgers',
       ParentIndexNumber: 1,
       IndexNumber: n,
     })),
-    // Seen on a real server mid-scan: an episode not placed in a series.
+    // Seen mid-scan on a real server: an episode with no series.
     { Id: 'x9', Name: 'Show - S02E24 - The Beginning', Type: 'Episode' },
   ];
   userData = {
@@ -172,7 +170,7 @@ beforeEach(async () => {
       e3: {
         Played: false,
         PlaybackPositionTicks: 6_000_000_000,
-        // Past the end, as a real server reported for a short special.
+        // Over 100%, as a real server reported for a short special.
         PlayedPercentage: 612.1,
         LastPlayedDate: iso(1),
       },
@@ -226,17 +224,16 @@ describe('watch history from Jellyfin and Emby', () => {
         p.percent,
       ]),
       [
-        ['episode', 's1', 'The Apothecary Diaries', 1, 3, false, 84],
-        ['episode', 's1', 'The Apothecary Diaries', 1, 2, true, 100],
-        ['episode', 's1', 'The Apothecary Diaries', 1, 1, true, 100],
-        ['movie', 'm1', '1917 (2019)', null, null, true, 100],
+        ['episode', 's1', 'The Herbalist Ledgers', 1, 3, false, 84],
+        ['episode', 's1', 'The Herbalist Ledgers', 1, 2, true, 100],
+        ['episode', 's1', 'The Herbalist Ledgers', 1, 1, true, 100],
+        ['movie', 'm1', '1863 (2019)', null, null, true, 100],
       ],
       'the unplaced episode is left out, and 612% part-watched is not read as finished'
     );
     assert.equal(plays[3].year, 2019);
     assert.equal(plays[0].viewerId, 'a1');
-    // Finished and part-watched are asked apart, as the server's filters
-    // must all match when given together.
+    // Separate queries: combined Filters must all match.
     assert.ok(asked.some((a) => a.includes('Filters=IsPlayed')));
     assert.ok(asked.some((a) => a.includes('Filters=IsResumable')));
   });
@@ -264,7 +261,7 @@ describe('watch history from Jellyfin and Emby', () => {
     };
     try {
       const film = await saveMedia({
-        tmdbId: 530915,
+        tmdbId: 641826,
         mediaType: MediaType.MOVIE,
         jellyfinMediaId: 'm1',
       });
@@ -278,7 +275,7 @@ describe('watch history from Jellyfin and Emby', () => {
       );
 
       const series = await saveMedia({
-        tmdbId: 220542,
+        tmdbId: 331675,
         mediaType: MediaType.TV,
         jellyfinMediaId: 's1',
       });
@@ -297,7 +294,7 @@ describe('watch history from Jellyfin and Emby', () => {
 
   it('reads plays of one title since a moment, for lists and progress', async () => {
     const series = await saveMedia({
-      tmdbId: 220543,
+      tmdbId: 331676,
       mediaType: MediaType.TV,
       jellyfinMediaId: 's1',
     });
@@ -313,10 +310,10 @@ describe('watch history from Jellyfin and Emby', () => {
   });
 
   it('counts a title marked watched by hand, which Emby keeps no date for', async () => {
-    // As seen on a real Emby server: Played, but no LastPlayedDate.
+    // Real Emby behavior: Played with no LastPlayedDate.
     userData.j2.e2 = { Played: true, PlayCount: 1 };
     const series = await saveMedia({
-      tmdbId: 220544,
+      tmdbId: 331677,
       mediaType: MediaType.TV,
       jellyfinMediaId: 's1',
     });
@@ -332,8 +329,7 @@ describe('watch history from Jellyfin and Emby', () => {
       'kept, after the dated plays'
     );
 
-    // Since the beginning, it counts; since a moment, it cannot be shown to
-    // be after it.
+    // Undated plays count from epoch 0, not after a real cutoff.
     assert.deepEqual(
       (await source().playsSince(jordan, series, new Date(0))).map(
         (p) => p.episode
@@ -351,9 +347,24 @@ describe('watch history from Jellyfin and Emby', () => {
       [1]
     );
 
+    // Same on Emby, with its own settings and user/title ids.
+    await getRepository(User).update(jordan.id, {
+      jellyfinUserId: null,
+      embyUserId: 'j2',
+    });
+    await getRepository(User).update(alex.id, {
+      jellyfinUserId: null,
+      embyUserId: 'a1',
+    });
+    series.jellyfinMediaId = null;
+    series.embyMediaId = 's1';
+    await getRepository(Media).update(series.id, {
+      jellyfinMediaId: null,
+      embyMediaId: 's1',
+    });
     getSettings().main.mediaServerType = MediaServerType.EMBY;
-    getSettings().jellyfin = {
-      ...getSettings().jellyfin,
+    getSettings().emby = {
+      ...getSettings().emby,
       ip: '127.0.0.1',
       port,
       useSsl: false,
@@ -380,7 +391,7 @@ describe('watch history from Jellyfin and Emby', () => {
 
   it('maps the server’s ids back to the library, regular and 4K', async () => {
     const film = await saveMedia({
-      tmdbId: 530916,
+      tmdbId: 641827,
       mediaType: MediaType.MOVIE,
       jellyfinMediaId: 'm-reg',
       jellyfinMediaId4k: 'm-4k',
@@ -389,15 +400,29 @@ describe('watch history from Jellyfin and Emby', () => {
     assert.equal(found.get('m-4k')?.id, film.id);
     assert.equal(found.has('nope'), false);
     assert.deepEqual(source().titleIdsOf(film), ['m-reg', 'm-4k']);
+    // Regular and 4K as one item: read and counted once.
+    assert.deepEqual(
+      source().titleIdsOf(
+        new Media({ jellyfinMediaId: 'm-both', jellyfinMediaId4k: 'm-both' })
+      ),
+      ['m-both']
+    );
     const users = await source().usersFor(['j2', 'unknown']);
     assert.equal(users.get('j2')?.id, jordan.id);
     assert.equal(users.size, 1);
   });
 
   it('works out where someone is in a series', async () => {
+    // Emby uses its own user and title ids.
+    await getRepository(User).update(alex.id, {
+      jellyfinUserId: null,
+      embyUserId: 'a1',
+    });
+    alex.jellyfinUserId = null;
+    alex.embyUserId = 'a1';
     getSettings().main.mediaServerType = MediaServerType.EMBY;
-    getSettings().jellyfin = {
-      ...getSettings().jellyfin,
+    getSettings().emby = {
+      ...getSettings().emby,
       ip: '127.0.0.1',
       port,
       useSsl: false,
@@ -407,9 +432,9 @@ describe('watch history from Jellyfin and Emby', () => {
     try {
       assert.equal(watchSource()?.label, 'Emby');
       const media = await saveMedia({
-        tmdbId: 220544,
+        tmdbId: 331677,
         mediaType: MediaType.TV,
-        jellyfinMediaId: 's1',
+        embyMediaId: 's1',
       });
       const season = await getRepository(Season).save(
         new Season({
@@ -427,8 +452,8 @@ describe('watch history from Jellyfin and Emby', () => {
           })
         );
       }
-      const progress = await getSeriesProgress(alex, [220544]);
-      assert.deepEqual(progress[220544], {
+      const progress = await getSeriesProgress(alex, [331677]);
+      assert.deepEqual(progress[331677], {
         state: 'up_next',
         next: { season: 1, episode: 3 },
         remaining: 1,
@@ -503,9 +528,9 @@ describe('Match Check on Jellyfin and Emby', () => {
   it('reads the ids the server matched, whatever their case', () => {
     assert.deepEqual(
       jellyfinIds({
-        ProviderIds: { Imdb: 'tt26743760', Tmdb: '220542', Tvdb: '431162' },
+        ProviderIds: { Imdb: 'tt27854871', Tmdb: '331675', Tvdb: '542683' },
       } as never),
-      { imdbId: 'tt26743760', tmdbId: 220542, tvdbId: 431162 }
+      { imdbId: 'tt27854871', tmdbId: 331675, tvdbId: 542683 }
     );
     assert.deepEqual(
       jellyfinIds({ ProviderIds: { TMDB: 'x', imdb: 'nope' } } as never),
@@ -516,19 +541,19 @@ describe('Match Check on Jellyfin and Emby', () => {
   it('finds a folder matched to another title, and says how to Identify it', () => {
     const byFolder = new Map([
       [
-        'carrie (2026)',
-        [{ title: 'Carrie', year: 2026, tmdbId: 1, server: 'Radarr' }],
+        'wrenna (2026)',
+        [{ title: 'Wrenna', year: 2026, tmdbId: 1, server: 'Radarr' }],
       ],
     ]);
     const item = jellyfinMatchItem('movie', {
       Id: 'abc',
-      Name: 'The Carrie Diaries',
+      Name: 'The Wrenna Diaries',
       Type: 'Movie',
       ProductionYear: 2013,
-      Path: '/media/movies/Carrie (2026)/Carrie (2026).mkv',
+      Path: '/media/movies/Wrenna (2026)/Wrenna (2026).mkv',
       ProviderIds: { Tmdb: '2' },
     } as never);
-    assert.deepEqual(item.folders, ['Carrie (2026)']);
+    assert.deepEqual(item.folders, ['Wrenna (2026)']);
     const { checked, problem } = compareMatch(
       'movie',
       item,

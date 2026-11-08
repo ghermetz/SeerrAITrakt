@@ -1,6 +1,7 @@
 import { runRefreshMs } from '@app/components/Backfill/Agent/refresh';
 import Badge from '@app/components/Common/Badge';
 import Button from '@app/components/Common/Button';
+import useMediaQuery from '@app/hooks/useMediaQuery';
 import defineMessages from '@app/utils/defineMessages';
 import {
   ArrowDownTrayIcon,
@@ -25,21 +26,20 @@ import useSWR from 'swr';
 export const messages = defineMessages('components.Backfill.Agent', {
   agent: 'Admin agent',
   description:
-    'An AI that works like you would: it reads why releases were turned down, tries other searches, opens packs to check their files, and downloads only what is missing.',
-  placeholder: 'Ask it to find something: “Get the missing Casper episodes”',
+    'An AI that digs deeper: it tries other searches, checks pack contents and downloads only what’s missing.',
+  placeholder: 'Ask it to find something: “Get the missing Wendle episodes”',
+  placeholderShort: 'Ask it to find something',
   ask: 'Ask',
   asking: 'Starting…',
   askFailed: 'The agent could not start.',
   autoOn:
-    'It also steps in on its own when Backfill finds nothing for a requested title, or for a title reported missing.',
+    'It also steps in when Backfill finds nothing for a requested or reported title.',
   autoOff: 'It only works when asked; running on its own is off in Settings.',
   settings: 'Settings',
   allRuns: 'All runs',
-  noRuns:
-    'Nothing yet. Ask it something, or it starts on its own when Backfill comes up empty.',
+  noRuns: 'Nothing yet. Ask it something to get started.',
   held: 'Waiting on the search',
-  heldNote:
-    "It looks once Sonarr's or Radarr's search and Backfill's are over, if they found nothing.",
+  heldNote: 'It starts if Sonarr, Radarr and Backfill find nothing.',
   reportedBy: 'Reported by {name}',
   queued: 'Waiting',
   running: 'Working',
@@ -56,9 +56,11 @@ export const messages = defineMessages('components.Backfill.Agent', {
   working: 'Working on it…',
   forTitle: 'Ask the admin agent',
   autoRan:
-    'It looked for this on its own on {date}. It does that only once per title; from now on it looks only when an admin asks. Sonarr, Radarr and Backfill’s own search keep going without it.',
+    'It looked for this on its own on {date}, which it does once per title. Now it looks only when asked.',
   forTitleTip:
-    'It looks further than Sonarr and Radarr: other searches, packs and collections, checking each file and the language. Left empty, it gets whatever is missing.',
+    'It looks further than Sonarr and Radarr. Left empty, it gets whatever is missing.',
+  forAlbumTip:
+    'It looks further than Lidarr. Left empty, it gets whatever is missing.',
   titlePlaceholder: 'What to do (optional)',
   earlier: 'Earlier conversations',
   allConversations: 'All conversations',
@@ -89,21 +91,23 @@ export const RunStatusIcon = ({
 }) => {
   if (status === 'running') {
     return (
-      <SparklesIcon className="h-5 w-5 flex-none animate-pulse text-indigo-300" />
+      <SparklesIcon className="h-5 w-5 flex-none animate-pulse text-indigo-300 light:text-accent-text" />
     );
   }
   if (status === 'waiting') {
     return (
-      <QuestionMarkCircleIcon className="h-5 w-5 flex-none text-yellow-300" />
+      <QuestionMarkCircleIcon className="h-5 w-5 flex-none text-yellow-300 light:text-warning-text" />
     );
   }
   if (status === 'queued' || status === 'held') {
     return <ClockIcon className="h-5 w-5 flex-none text-gray-400" />;
   }
   if (status === 'failed') {
-    return <ExclamationCircleIcon className="h-5 w-5 flex-none text-red-400" />;
+    return (
+      <ExclamationCircleIcon className="h-5 w-5 flex-none text-red-400 light:text-danger-text" />
+    );
   }
-  return <CheckCircleIcon className="h-5 w-5 flex-none text-green-400" />;
+  return <CheckCircleIcon className="h-5 w-5 flex-none text-success-text" />;
 };
 
 export const Ago = ({ at }: { at: string }) => (
@@ -137,7 +141,7 @@ export const RunMeta = ({ run }: { run: AgentRunSummary }) => {
       {grabs > 0 && (
         <>
           <span aria-hidden>·</span>
-          <span className="inline-flex items-center gap-1 text-green-300">
+          <span className="inline-flex items-center gap-1 text-green-300 light:text-success-text">
             <ArrowDownTrayIcon className="h-3.5 w-3.5" />
             {intl.formatMessage(messages.downloads, { count: grabs })}
           </span>
@@ -146,7 +150,7 @@ export const RunMeta = ({ run }: { run: AgentRunSummary }) => {
       {requests > 0 && (
         <>
           <span aria-hidden>·</span>
-          <span className="text-indigo-300">
+          <span className="text-indigo-300 light:text-accent-text">
             {intl.formatMessage(messages.requests, { count: requests })}
           </span>
         </>
@@ -155,7 +159,7 @@ export const RunMeta = ({ run }: { run: AgentRunSummary }) => {
   );
 };
 
-/** One run in a list; on a title's page, by what was asked instead. */
+/** One run in a list; on a title's page it is labelled by what was asked. */
 export const RunRow = ({
   run,
   byAsk = false,
@@ -179,13 +183,15 @@ export const RunRow = ({
         </span>
         <span className="min-w-0 flex-1">
           <span className="flex items-start justify-between gap-2">
-            <span className="truncate font-semibold text-white">{heading}</span>
+            <span className="min-w-0 break-words font-semibold text-strong">
+              {heading}
+            </span>
             <span className="flex-none">
               <RunStatusBadge status={run.status} />
             </span>
           </span>
           {!byAsk && run.title && run.ask && (
-            <span className="block truncate text-sm text-gray-400">
+            <span className="block break-words text-sm text-gray-400">
               “{run.ask}”
             </span>
           )}
@@ -193,13 +199,13 @@ export const RunRow = ({
             <RunMeta run={run} />
           </span>
           {run.status === 'waiting' && run.question ? (
-            <span className="mt-1 line-clamp-2 text-sm text-yellow-200">
+            <span className="mt-1 block break-words text-sm text-yellow-200 light:text-warning-text sm:line-clamp-2">
               {run.question}
             </span>
           ) : (
             (run.summary || run.error) && (
               <span
-                className={`mt-1 line-clamp-2 text-sm ${
+                className={`mt-1 block break-words text-sm sm:line-clamp-2 ${
                   run.error ? 'text-red-300' : 'text-gray-300'
                 }`}
               >
@@ -213,7 +219,7 @@ export const RunRow = ({
             </span>
           )}
           {!run.summary && !run.error && run.status === 'running' && (
-            <span className="mt-1 block text-sm text-indigo-200">
+            <span className="mt-1 block text-sm text-indigo-200 light:text-accent-text">
               {intl.formatMessage(messages.working)}
             </span>
           )}
@@ -223,7 +229,7 @@ export const RunRow = ({
   );
 };
 
-/** What the agent is doing, refreshed often while it works. */
+/** Agent overview, polled while it works. */
 export const useAgent = (page = 0) =>
   useSWR<AgentOverview>(`/api/v1/agent${page ? `?page=${page}` : ''}`, {
     refreshInterval: (latest) =>
@@ -234,14 +240,14 @@ export const useAgent = (page = 0) =>
   });
 
 export interface AgentTitle {
-  kind: 'series' | 'movie';
+  kind: 'series' | 'movie' | 'album';
   serverId: number;
   arrId: number;
 }
 
 /**
- * The box an admin asks the agent in; the new run opens to watch. From a
- * title's page it is about that title, and may be sent empty.
+ * Ask box; opens the new run. With `title` it is about that title and may be
+ * sent empty.
  */
 export const AskAgent = ({
   problem,
@@ -256,6 +262,8 @@ export const AskAgent = ({
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string>();
   const ready = !!title || text.trim().length >= 3;
+  // The example placeholder does not fit on phones.
+  const wide = useMediaQuery('(min-width: 640px)');
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -291,10 +299,14 @@ export const AskAgent = ({
           maxLength={1000}
           onChange={(e) => setText(e.target.value)}
           placeholder={intl.formatMessage(
-            title ? messages.titlePlaceholder : messages.placeholder
+            title
+              ? messages.titlePlaceholder
+              : wide
+                ? messages.placeholder
+                : messages.placeholderShort
           )}
           disabled={!!problem || busy}
-          className="min-w-0 flex-1 rounded-md border border-gray-500 bg-gray-700 px-3 py-2 text-sm text-white placeholder:text-gray-400 disabled:opacity-60"
+          className="min-w-0 flex-1 rounded-md border border-field-border bg-field px-3 py-2 text-sm text-strong placeholder:text-gray-400 disabled:opacity-60"
         />
         <Button
           buttonType="primary"
@@ -309,13 +321,15 @@ export const AskAgent = ({
         </Button>
       </div>
       {(problem || failed) && (
-        <p className="text-sm text-yellow-300">{problem ?? failed}</p>
+        <p className="text-sm text-yellow-300 light:text-warning-text">
+          {problem ?? failed}
+        </p>
       )}
     </form>
   );
 };
 
-/** On the Backfill page: ask, and the latest few runs. */
+/** Backfill page panel: ask box and the latest runs. */
 export const AgentPanel = () => {
   const intl = useIntl();
   const { data } = useAgent();
@@ -323,13 +337,13 @@ export const AgentPanel = () => {
   return (
     <section className="rounded-lg bg-gray-800 ring-1 ring-gray-700">
       <div className="flex flex-col gap-1 border-b border-gray-700 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="flex items-center gap-2 text-lg font-semibold text-white">
-          <SparklesIcon className="h-5 w-5 text-indigo-300" />
+        <h3 className="flex items-center gap-2 text-lg font-semibold text-strong">
+          <SparklesIcon className="h-5 w-5 text-indigo-300 light:text-accent-text" />
           {intl.formatMessage(messages.agent)}
         </h3>
         <Link
           href="/backfill/agent"
-          className="text-sm font-medium text-indigo-300 hover:text-indigo-200"
+          className="text-sm font-medium text-indigo-300 hover:text-indigo-200 light:text-accent-text light:hover:text-accent-text"
         >
           {intl.formatMessage(messages.allRuns)} ({data.total})
         </Link>
@@ -362,26 +376,23 @@ export const AgentPanel = () => {
   );
 };
 
-/**
- * On a title's page, for admins: ask the agent about this title, and its
- * earlier conversations about it.
- */
+/** Admin panel on a title's page: ask about the title and see earlier runs. */
 export const AgentForTitle = ({
   title,
   card,
   autoRanAt,
 }: {
   title: AgentTitle;
-  /** Framed as a card, among a Backfill page's sections. */
+  /** Render as a card among Backfill page sections. */
   card?: boolean;
-  /** When it looked on its own: it does that once per title. */
+  /** When it last ran unprompted; it does so once per title. */
   autoRanAt?: string | null;
 }) => {
   const intl = useIntl();
   const { data } = useSWR<AgentOverview>(
     `/api/v1/agent?kind=${title.kind}&serverId=${title.serverId}&arrId=${title.arrId}`
   );
-  // Nothing at all on the page when the agent cannot run.
+  // Render nothing when the agent cannot run.
   if (!data || data.problem) return null;
   return (
     <div
@@ -391,16 +402,18 @@ export const AgentForTitle = ({
           : undefined
       }
     >
-      <h3 className="mb-2 flex items-center gap-2 text-xl font-bold text-white">
-        <SparklesIcon className="h-5 w-5 text-indigo-300" />
+      <h3 className="mb-2 flex items-center gap-2 text-xl font-bold text-strong">
+        <SparklesIcon className="h-5 w-5 text-indigo-300 light:text-accent-text" />
         {intl.formatMessage(messages.forTitle)}
       </h3>
       <div className="space-y-3">
         <p className="text-sm text-gray-400">
-          {intl.formatMessage(messages.forTitleTip)}
+          {intl.formatMessage(
+            title.kind === 'album' ? messages.forAlbumTip : messages.forTitleTip
+          )}
         </p>
         {autoRanAt && (
-          <p className="text-sm text-yellow-200/90">
+          <p className="text-sm text-yellow-200/90 light:text-warning-text">
             {intl.formatMessage(messages.autoRan, {
               date: intl.formatDate(autoRanAt, { dateStyle: 'medium' }),
             })}
@@ -413,7 +426,7 @@ export const AgentForTitle = ({
               <span>{intl.formatMessage(messages.earlier)}</span>
               <Link
                 href="/backfill/agent"
-                className="font-medium normal-case tracking-normal text-indigo-300 hover:text-indigo-200"
+                className="font-medium normal-case tracking-normal text-indigo-300 hover:text-indigo-200 light:text-accent-text light:hover:text-accent-text"
               >
                 {intl.formatMessage(messages.allConversations)}
               </Link>

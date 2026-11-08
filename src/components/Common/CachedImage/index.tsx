@@ -1,30 +1,47 @@
+import { musicImageSrc } from '@app/components/Music/musicHelpers';
+import { NearScreen } from '@app/hooks/useNearScreen';
 import useSettings from '@app/hooks/useSettings';
-import { sourcesFor } from '@app/utils/imageSources';
+import { convertible, sourcesFor, tmdbImageSrc } from '@app/utils/imageSources';
+import { pictureLoading } from '@app/utils/nearScreen';
 import type { ImageLoader, ImageProps } from 'next/image';
 import Image from 'next/image';
+import { useContext } from 'react';
 
 const imageLoader: ImageLoader = ({ src }) => src;
 
-export type CachedImageProps = ImageProps & {
-  src: string;
-  type: 'tmdb' | 'avatar' | 'tvdb';
-};
+const PLEX_AVATAR =
+  /^https:\/\/plex\.tv\/users\/([0-9a-f]{8,64})\/avatar(?:\?c=([0-9]+))?/;
 
 /**
- * The CachedImage component should be used wherever
- * we want to offer the option to locally cache images.
- **/
+ * A Plex avatar served through Seerr AI's cache, as plex.tv doesn't always
+ * answer. The version number is kept, so a changed picture is refetched.
+ * Jellyfin and Emby avatars already go through it.
+ */
+export const avatarSrc = (src: string): string => {
+  const plex = PLEX_AVATAR.exec(src);
+  return plex
+    ? `/avatarproxy/plex/${plex[1]}${plex[2] ? `?c=${plex[2]}` : ''}`
+    : src;
+};
+
+export type CachedImageProps = ImageProps & {
+  src: string;
+  /**
+   * 'music': a Cover Art Archive cover, a fanart.tv or TheAudioDB picture,
+   * or the server's artist-picture address.
+   */
+  type: 'tmdb' | 'avatar' | 'tvdb' | 'music';
+};
+
+/** An image served through the local image cache when caching is on. */
 const CachedImage = ({ src, type, ...props }: CachedImageProps) => {
   const { currentSettings } = useSettings();
+  const nearness = useContext(NearScreen);
 
   let imageUrl: string;
 
   if (type === 'tmdb') {
-    // tmdb stuff
-    imageUrl =
-      currentSettings.cacheImages && !src.startsWith('/')
-        ? src.replace(/^https:\/\/image\.tmdb\.org\//, '/imageproxy/tmdb/')
-        : src;
+    imageUrl = tmdbImageSrc(src, currentSettings.cacheImages);
   } else if (type === 'tvdb') {
     imageUrl =
       currentSettings.cacheImages && !src.startsWith('/')
@@ -33,24 +50,33 @@ const CachedImage = ({ src, type, ...props }: CachedImageProps) => {
             '/imageproxy/tvdb/'
           )
         : src;
+  } else if (type === 'music') {
+    imageUrl = musicImageSrc(src, currentSettings.cacheImages);
   } else if (type === 'avatar') {
-    // jellyfin avatar (if any)
-    imageUrl = src;
+    imageUrl = avatarSrc(src);
   } else {
     return null;
   }
 
-  // Only what the proxy can convert: its JPEG and PNG pictures.
-  if (
-    !imageUrl.startsWith('/imageproxy/') ||
-    !/\.(jpe?g|png)$/i.test(imageUrl)
-  ) {
-    return <Image unoptimized loader={imageLoader} src={imageUrl} {...props} />;
+  // Loads early inside a card or row near the screen (see nearScreen).
+  const loading = pictureLoading(nearness, { loading: props.loading });
+
+  // The proxy can't convert it: no <picture> sources.
+  if (!convertible(imageUrl)) {
+    return (
+      <Image
+        unoptimized
+        loader={imageLoader}
+        src={imageUrl}
+        {...props}
+        {...(props.priority || props.preload ? {} : loading)}
+      />
+    );
   }
 
-  // Next would preload the <img>'s own address for a priority image, which
-  // a browser using a <source> never shows: it would be downloaded twice.
-  // Fetching it eagerly and first does the same job without that.
+  // Next would preload a priority image's <img> address, which a browser
+  // using a <source> never shows, so it would download twice. Eager, high
+  // priority loading does the same job.
   const { priority, preload, sizes, ...imageProps } = props;
   const urgent = !!(priority || preload);
 
@@ -71,7 +97,7 @@ const CachedImage = ({ src, type, ...props }: CachedImageProps) => {
         src={imageUrl}
         sizes={sizes}
         {...imageProps}
-        {...(urgent ? { loading: 'eager', fetchPriority: 'high' } : {})}
+        {...(urgent ? pictureLoading(null, { urgent }) : loading)}
       />
     </picture>
   );

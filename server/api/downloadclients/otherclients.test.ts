@@ -6,27 +6,28 @@ import NzbgetAPI, {
 } from '@server/api/downloadclients/nzbget';
 import RtorrentAPI, {
   rtorrentDownload,
+  rtorrentRemovals,
   xmlRpcCall,
   xmlRpcResult,
 } from '@server/api/downloadclients/rtorrent';
 import TransmissionAPI, {
   transmissionDownload,
+  transmissionTorrent,
 } from '@server/api/downloadclients/transmission';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { after, before, describe, it } from 'node:test';
+import { after, before, describe, it, mock } from 'node:test';
 
 /*
- * Transmission, Deluge, NZBGet and rTorrent, read for live progress: how
- * each one's states read as a download's stage, and each talked to through
- * a stand-in that speaks its protocol as the real one does.
+ * Transmission, Deluge, NZBGet and rTorrent live progress: how each maps its
+ * states to a download stage, against stand-ins speaking the real protocols.
  */
 
 const MB = 1024 * 1024;
 const HASH = 'ab'.repeat(20);
 const OTHER = 'cd'.repeat(20);
-/** How Sonarr names an NZB it sends NZBGet: a GUID without dashes. */
+/** Sonarr's drone id for an NZB sent to NZBGet: a dashless GUID. */
 const DRONE = '9f2c4e1ab7d34c0e8a5b6c7d8e9f0a1b';
 
 describe('reading each client’s states', () => {
@@ -60,6 +61,28 @@ describe('reading each client’s states', () => {
     assert.equal(t(4, { metadataPercentComplete: 0.5 }).step, 'metadata');
     assert.equal(t(4, { error: 3 }).stage, 'stalled');
     assert.equal(t(4, { eta: -1 }).secondsLeft, undefined);
+  });
+
+  it('Transmission: what the swarm lacks of what is wanted', () => {
+    const t = (extra = {}) =>
+      transmissionTorrent({
+        hashString: HASH,
+        name: 'pack',
+        status: 4,
+        error: 0,
+        percentDone: 0.4,
+        rateDownload: 10,
+        eta: 30,
+        downloadDir: '/downloads',
+        sizeWhenDone: 100,
+        leftUntilDone: 60,
+        ...extra,
+      }).unavailable;
+    assert.equal(t({ desiredAvailable: 45 }), 15);
+    assert.equal(t({ desiredAvailable: 60 }), 0);
+    assert.equal(t(), undefined);
+    // Web seeds have everything, though they aren't peers.
+    assert.equal(t({ desiredAvailable: 0, webseedsSendingToUs: 1 }), undefined);
   });
 
   it('Deluge', () => {
@@ -105,7 +128,7 @@ describe('reading each client’s states', () => {
       stage: 'downloading',
       secondsLeft: 20,
     });
-    // Several downloading share one speed: no time can be given to one.
+    // Several downloading share one speed, so no ETA for one.
     assert.equal(
       nzbgetQueueDownload(g('DOWNLOADING'), status, false).secondsLeft,
       undefined
@@ -162,6 +185,8 @@ describe('reading each client’s states', () => {
         downRate: 10,
         isHashChecking: 0,
         peersConnected: 4,
+        chunkSize: 10,
+        wantedChunks: 5,
         ...extra,
       });
     assert.deepEqual(r(), {
@@ -171,6 +196,20 @@ describe('reading each client’s states', () => {
       secondsLeft: 5,
     });
     assert.equal(r({ complete: 1, leftBytes: 0 }).stage, 'importing');
+    // A skipped file counts as left and never complete, as in rTorrent
+    // 0.9.8. The wanted files are in.
+    assert.deepEqual(r({ leftBytes: 30, wantedChunks: 0 }), {
+      size: 70,
+      sizeLeft: 0,
+      stage: 'importing',
+    });
+    // Still downloading wanted files: only their remainder counts.
+    assert.deepEqual(r({ leftBytes: 60, wantedChunks: 2 }), {
+      size: 60,
+      sizeLeft: 20,
+      stage: 'downloading',
+      secondsLeft: 2,
+    });
     assert.equal(r({ isActive: 0 }).stage, 'paused');
     assert.equal(r({ state: 0 }).stage, 'paused');
     assert.equal(r({ peersConnected: 0 }).step, 'noPeers');
@@ -200,6 +239,242 @@ describe('reading each client’s states', () => {
       ),
       /rTorrent: Method not defined/
     );
+  });
+
+  it('rTorrent: deletes only what is inside the torrent’s folder', () => {
+    assert.deepEqual(
+      rtorrentRemovals({ directory: '/dl/Pack', isMultiFile: 1 }, [
+        'Pack/S1/a.mkv',
+        'Pack/../../srv/app.db',
+        '/srv/app.db',
+      ]),
+      {
+        files: ['/dl/Pack/S1/a.mkv'],
+        folders: ['/dl/Pack/S1', '/dl/Pack'],
+        refused: ['Pack/../../srv/app.db', '/srv/app.db'],
+      }
+    );
+    // No folder from rTorrent: nothing under the root is removed.
+    assert.deepEqual(
+      rtorrentRemovals({ directory: '', isMultiFile: 0 }, ['a.mkv']),
+      { files: [], folders: [], refused: ['a.mkv'] }
+    );
+  });
+
+  it('rTorrent: keeps files another torrent in the client also has', async () => {
+    const torrent = (
+      hash: string,
+      name: string,
+      directory: string,
+      isMultiFile: number
+    ) => [
+      hash.toUpperCase(),
+      name,
+      ...Array(9).fill(0),
+      directory,
+      isMultiFile,
+      'backfill',
+      '',
+      0,
+      0,
+    ];
+    const listed = [
+      torrent(HASH, 'Harbour.Lights.S02', '/dl/Harbour.Lights.S02', 1),
+      torrent(OTHER, 'Harbour.Lights.S02', '/dl/Harbour.Lights.S02', 1),
+      torrent('ef'.repeat(20), 'Lantern.Song.mkv', '/dl', 0),
+      torrent(`${'12'.repeat(20)}.meta`, `${'12'.repeat(20)}.meta`, '/dl', 0),
+    ];
+    const run: string[][] = [];
+    const api = new RtorrentAPI({
+      hostname: '127.0.0.1',
+      port: 1,
+      useSsl: false,
+      urlBase: '',
+      username: '',
+      password: '',
+    } as never);
+    const rpc = api as unknown as {
+      call: (method: string, params: unknown[]) => Promise<unknown>;
+    };
+    const calls = async (
+      method: string,
+      params: unknown[],
+      files: string[]
+    ) => {
+      if (method === 'd.multicall2') return listed;
+      if (method === 'f.multicall') return files.map((path) => [path, 1, 1, 1]);
+      if (method === 'execute.throw') run.push(params.slice(1) as string[]);
+      return 0;
+    };
+
+    mock.method(rpc, 'call', (method: string, params: unknown[]) =>
+      calls(method, params, ['Harbour.Lights.S02E01.mkv', 'Extra/a.nfo'])
+    );
+    await api.deleteTorrent(HASH);
+    assert.deepEqual(run, []);
+
+    // A single file at another torrent's path is kept; its own are not.
+    listed[0] = torrent(HASH, 'Static.Garden', '/dl/Static.Garden', 1);
+    listed[1] = torrent(OTHER, 'Lantern.Song.mkv', '/dl/Static.Garden', 0);
+    mock.restoreAll();
+    mock.method(rpc, 'call', (method: string, params: unknown[]) =>
+      calls(method, params, ['Lantern.Song.mkv', 'Glasswing.mkv'])
+    );
+    await api.deleteTorrent(HASH);
+    assert.deepEqual(run, [
+      ['rm', '-f', '--', '/dl/Static.Garden/Glasswing.mkv'],
+    ]);
+    mock.restoreAll();
+  });
+});
+
+describe('adding and removing Backfill’s torrents', () => {
+  const settings = {
+    hostname: '127.0.0.1',
+    port: 1,
+    useSsl: false,
+    urlBase: '',
+    username: '',
+    password: '',
+  };
+  const rpcOf = (api: unknown) =>
+    api as { call: (method: string, params: unknown) => Promise<unknown> };
+
+  it('Transmission: refuses a torrent it already holds, and changes nothing on it', async () => {
+    const api = new TransmissionAPI(settings);
+    const sent: string[] = [];
+    mock.method(rpcOf(api), 'call', async (method: string) => {
+      sent.push(method);
+      return method === 'torrent-add'
+        ? { 'torrent-duplicate': { hashString: OTHER } }
+        : {};
+    });
+    await assert.rejects(
+      api.addTorrent({
+        magnet: `magnet:?xt=urn:btih:${OTHER}`,
+        hash: HASH,
+        category: 'backfill',
+        metadataOnly: true,
+      }),
+      /already in Transmission/
+    );
+    assert.deepEqual(sent, ['torrent-add']);
+    mock.restoreAll();
+  });
+
+  it('Transmission: removes a torrent added under another hash, without its data', async () => {
+    const api = new TransmissionAPI(settings);
+    const sent: [string, unknown][] = [];
+    mock.method(rpcOf(api), 'call', async (method: string, args: unknown) => {
+      sent.push([method, args]);
+      return method === 'torrent-add'
+        ? { 'torrent-added': { hashString: OTHER } }
+        : {};
+    });
+    await assert.rejects(
+      api.addTorrent({
+        magnet: `magnet:?xt=urn:btih:${OTHER}`,
+        hash: HASH,
+        category: 'backfill',
+      }),
+      /another hash/
+    );
+    assert.deepEqual(
+      sent.map(([method]) => method),
+      ['torrent-add', 'torrent-remove']
+    );
+    assert.deepEqual(sent[1][1], { ids: [OTHER] });
+    mock.restoreAll();
+  });
+
+  it('Transmission: removes data only when no other torrent shares it', async () => {
+    const api = new TransmissionAPI(settings);
+    let torrents: { hashString: string; name: string; downloadDir: string }[] =
+      [];
+    const removed: unknown[] = [];
+    mock.method(rpcOf(api), 'call', async (method: string, args: unknown) => {
+      if (method === 'torrent-get') return { torrents };
+      removed.push(args);
+      return {};
+    });
+    torrents = [
+      { hashString: HASH, name: 'Harbour.Lights.S01', downloadDir: '/dl' },
+      { hashString: OTHER, name: 'Harbour.Lights.S02', downloadDir: '/dl' },
+    ];
+    await api.deleteTorrent(HASH);
+    torrents[1].name = 'Harbour.Lights.S01';
+    await api.deleteTorrent(HASH);
+    assert.deepEqual(removed, [
+      { ids: [HASH], 'delete-local-data': true },
+      { ids: [HASH], 'delete-local-data': false },
+    ]);
+    mock.restoreAll();
+  });
+
+  it('Deluge: removes a torrent added under another hash, without its data', async () => {
+    const api = new DelugeAPI({ ...settings, password: 'x' } as never);
+    const sent: [string, unknown][] = [];
+    mock.method(rpcOf(api), 'call', async (method: string, params: unknown) => {
+      sent.push([method, params]);
+      return method === 'core.add_torrent_magnet' ? OTHER : true;
+    });
+    await assert.rejects(
+      api.addTorrent({
+        magnet: `magnet:?xt=urn:btih:${OTHER}`,
+        hash: HASH,
+        category: 'backfill',
+      }),
+      /another hash/
+    );
+    assert.deepEqual(sent.at(-1), ['core.remove_torrent', [OTHER, false]]);
+    mock.restoreAll();
+  });
+
+  it('Deluge: removes data only when no other torrent shares it', async () => {
+    const api = new DelugeAPI({ ...settings, password: 'x' } as never);
+    let all: Record<string, { name: string; save_path: string }> = {};
+    const removed: unknown[] = [];
+    mock.method(rpcOf(api), 'call', async (method: string, params: unknown) => {
+      if (method === 'core.get_torrents_status') return all;
+      removed.push(params);
+      return true;
+    });
+    all = {
+      [HASH]: { name: 'Lantern.Song.mkv', save_path: '/dl' },
+      [OTHER]: { name: 'Static.Garden', save_path: '/dl' },
+    };
+    await api.deleteTorrent(HASH);
+    all[OTHER] = { name: 'Lantern.Song.mkv', save_path: '/dl/' };
+    await api.deleteTorrent(HASH);
+    assert.deepEqual(removed, [
+      [HASH, true],
+      [HASH, false],
+    ]);
+    mock.restoreAll();
+  });
+
+  it('rTorrent: counts only labels stored exactly as Backfill writes them', async () => {
+    const api = new RtorrentAPI(settings as never);
+    const row = (hash: string, label: string) => [
+      hash.toUpperCase(),
+      'Glasswing',
+      ...Array(9).fill(0),
+      '/dl/Glasswing',
+      1,
+      label,
+      '',
+      0,
+      0,
+    ];
+    mock.method(rpcOf(api), 'call', async () => [
+      row(HASH, 'backfill'),
+      row(OTHER, 'backfil%6C'),
+    ]);
+    assert.deepEqual(
+      (await api.listCategory('backfill')).map((t) => t.hash),
+      [HASH]
+    );
+    mock.restoreAll();
   });
 });
 
@@ -231,7 +506,7 @@ describe('talking to them', () => {
     ).toString();
 
   before(async () => {
-    // Transmission: 409 with a session id first; that id is then required.
+    // Transmission: a 409 with a session id first, then that id is required.
     await listen('transmission', async (req, res) => {
       const { method, arguments: args } = JSON.parse(await body(req));
       calls.push(`transmission ${method}`);
@@ -270,8 +545,9 @@ describe('talking to them', () => {
       );
     });
 
-    // Deluge: signs in with its password, and is not yet connected to its
-    // daemon, as after a restart.
+    // Deluge: password sign-in, not yet connected to its daemon (as after a
+    // restart). Deluge 2 lists daemon.get_version and no daemon.info, as a
+    // real 2.x system.listMethods does; Deluge 1.3 (own port) the reverse.
     let delugeConnected = false;
     await listen('deluge', async (req, res) => {
       const { method, params, id } = JSON.parse(await body(req));
@@ -296,7 +572,12 @@ describe('talking to them', () => {
       }
       if (!delugeConnected)
         return answer(null, { message: 'Not connected', code: 2 });
-      if (method === 'daemon.info') return answer('2.1.1');
+      if (method === 'daemon.get_version' && req.url !== '/old/json') {
+        return answer('2.1.1');
+      }
+      if (method === 'daemon.info' && req.url === '/old/json') {
+        return answer('1.3.15');
+      }
       if (method === 'core.get_torrents_status') {
         return answer({
           [HASH]: {
@@ -310,8 +591,8 @@ describe('talking to them', () => {
       answer(null, { message: 'Unknown method', code: 2 });
     });
 
-    // NZBGet: basic auth; one job in the queue with Sonarr's drone id, one
-    // finished in the history known only by its NZBID.
+    // NZBGet: basic auth; one queued job with Sonarr's drone id, one in
+    // history known only by its NZBID.
     await listen('nzbget', async (req, res) => {
       const { method } = JSON.parse(await body(req));
       calls.push(`nzbget ${method}`);
@@ -426,14 +707,30 @@ describe('talking to them', () => {
     assert.ok(calls.includes('deluge web.connect'));
   });
 
+  it('Deluge: reads the version of a 1.3 daemon, which has no daemon.get_version', async () => {
+    const api = new DelugeAPI(
+      at('deluge', { password: 'deluge-pass', urlBase: '/old' })
+    );
+    assert.equal(await api.getVersion(), '1.3.15');
+  });
+
   it('Deluge: says so when the password is wrong', async () => {
     const api = new DelugeAPI({
       ...at('deluge', { password: 'wrong' }),
-      // A different address, so the session above is not reused.
+      // A different address, so the session above isn't reused.
       hostname: 'localhost',
     });
     await assert.rejects(
       api.getVersion(),
+      /Deluge did not accept the password/
+    );
+  });
+
+  it('Deluge: tests a wrong password as wrong, though the right one is signed in', async () => {
+    const right = new DelugeAPI(at('deluge', { password: 'deluge-pass' }));
+    assert.equal(await right.getVersion(), '2.1.1');
+    await assert.rejects(
+      new DelugeAPI(at('deluge', { password: 'wrong' })).getVersion(),
       /Deluge did not accept the password/
     );
   });

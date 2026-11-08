@@ -2,15 +2,19 @@ import Badge from '@app/components/Common/Badge';
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import PageTitle from '@app/components/Common/PageTitle';
+import SaveBar from '@app/components/Common/SaveBar';
 import MetadataSelector, {
   MetadataProviderType,
 } from '@app/components/MetadataSelector';
+import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import { ArrowDownOnSquareIcon, BeakerIcon } from '@heroicons/react/24/outline';
 import axios from 'axios';
 import { Form, Formik } from 'formik';
+import Link from 'next/link';
+import type { ReactNode } from 'react';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR from 'swr';
@@ -22,8 +26,7 @@ const messages = defineMessages('components.Settings', {
   seriesMetadataProvider: 'Series metadata provider',
   animeMetadataProvider: 'Anime metadata provider',
   metadataSettings: 'Settings for metadata provider',
-  clickTest:
-    'Click on the "Test" button to check connectivity with metadata providers',
+  clickTest: 'Use Test to check the metadata providers respond',
   notTested: 'Not Tested',
   failed: 'Does not work',
   operational: 'Operational',
@@ -31,17 +34,25 @@ const messages = defineMessages('components.Settings', {
   chooseProvider: 'Choose metadata providers for different content types',
   metadataProviderSelection: 'Metadata Provider Selection',
   tmdbProviderDoesnotWork:
-    'TMDB provider does not work, please select another metadata provider',
+    'TMDB isn’t working. Choose another metadata provider.',
   tvdbProviderDoesnotWork:
-    'TVDB provider does not work, please select another metadata provider',
+    'TVDB isn’t working. Choose another metadata provider.',
   allChosenProvidersAreOperational:
     'All chosen metadata providers are operational',
   connectionTestFailed: 'Connection test failed',
   failedToSaveMetadataSettings: 'Failed to save metadata provider settings',
   metadataSettingsSaved: 'Metadata provider settings saved',
+  musicMoved:
+    'Where music comes from is set under <link>Settings → Music</link>.',
 });
 
 type ProviderStatus = 'ok' | 'not tested' | 'failed';
+
+const mapStatusValue = (status: string): ProviderStatus => {
+  if (status === 'ok') return 'ok';
+  if (status === 'failed') return 'failed';
+  return 'not tested';
+};
 
 interface ProviderResponse {
   tvdb: ProviderStatus;
@@ -60,6 +71,7 @@ interface MetadataSettings {
 const SettingsMetadata = () => {
   const intl = useIntl();
   const { addToast } = useToasts();
+  const { currentSettings } = useSettings();
   const [isTesting, setIsTesting] = useState(false);
   const defaultStatus: ProviderResponse = {
     tmdb: 'not tested',
@@ -116,7 +128,6 @@ const SettingsMetadata = () => {
       return newStatus;
     } catch (error) {
       if (axios.isAxiosError(error) && error.response) {
-        // If we receive an error response with a valid format
         const errorData = error.response.data as {
           success: boolean;
           tests: ProviderResponse;
@@ -133,7 +144,6 @@ const SettingsMetadata = () => {
         }
       }
 
-      // In case of error without usable data
       throw new Error('Failed to test connection', { cause: error });
     }
   };
@@ -155,21 +165,13 @@ const SettingsMetadata = () => {
         anime: values.anime,
       });
 
-      // Update metadata provider status if available
       if (response.data.tests) {
-        const mapStatusValue = (status: string): ProviderStatus => {
-          if (status === 'ok') return 'ok';
-          if (status === 'failed') return 'failed';
-          return 'not tested';
-        };
-
         setProviderStatus({
           tmdb: mapStatusValue(response.data.tests.tmdb),
           tvdb: mapStatusValue(response.data.tests.tvdb),
         });
       }
 
-      // Adapt the response to the format expected by the component
       return {
         metadata: {
           tv: response.data.tv,
@@ -177,7 +179,6 @@ const SettingsMetadata = () => {
         },
       };
     } catch (error) {
-      // Retrieve test data in case of error
       if (axios.isAxiosError(error) && error.response?.data) {
         const errorData = error.response.data as {
           success: boolean;
@@ -187,15 +188,7 @@ const SettingsMetadata = () => {
           };
         };
 
-        // If test data is available in the error response
         if (errorData.tests) {
-          const mapStatusValue = (status: string): ProviderStatus => {
-            if (status === 'ok') return 'ok';
-            if (status === 'failed') return 'failed';
-            return 'not tested';
-          };
-
-          // Update metadata provider status with error data
           setProviderStatus({
             tmdb: mapStatusValue(errorData.tests.tmdb),
             tvdb: mapStatusValue(errorData.tests.tvdb),
@@ -212,9 +205,9 @@ const SettingsMetadata = () => {
       case 'ok':
         return 'text-green-500';
       case 'not tested':
-        return 'text-yellow-500';
+        return 'text-warning-text';
       case 'failed':
-        return 'text-red-500';
+        return 'text-danger-text';
     }
   };
 
@@ -357,6 +350,7 @@ const SettingsMetadata = () => {
                   <div className="form-input-area">
                     <MetadataSelector
                       testId="tv-metadata-provider-selector"
+                      inputId="tv-metadata-provider"
                       value={values.metadata.tv}
                       onChange={(value) => setFieldValue('metadata.tv', value)}
                       isDisabled={isSubmitting}
@@ -376,6 +370,7 @@ const SettingsMetadata = () => {
                   <div className="form-input-area">
                     <MetadataSelector
                       testId="anime-metadata-provider-selector"
+                      inputId="anime-metadata-provider"
                       value={values.metadata.anime}
                       onChange={(value) =>
                         setFieldValue('metadata.anime', value)
@@ -385,7 +380,7 @@ const SettingsMetadata = () => {
                   </div>
                 </div>
 
-                <div className="actions">
+                <SaveBar>
                   <div className="flex justify-end">
                     <span className="ml-3 inline-flex rounded-md shadow-sm">
                       <Button
@@ -466,12 +461,28 @@ const SettingsMetadata = () => {
                       </Button>
                     </span>
                   </div>
-                </div>
+                </SaveBar>
               </Form>
             );
           }}
         </Formik>
       </div>
+      {/* Points to music's sources, which moved to Settings → Music. */}
+      {currentSettings.musicReady && (
+        <p className="mt-10 text-sm text-gray-400">
+          {intl.formatMessage(messages.musicMoved, {
+            link: (text: ReactNode) => (
+              <Link
+                key="link"
+                href="/settings/music"
+                className="font-medium text-indigo-400 hover:underline light:text-accent-text"
+              >
+                {text}
+              </Link>
+            ),
+          })}
+        </p>
+      )}
     </>
   );
 };

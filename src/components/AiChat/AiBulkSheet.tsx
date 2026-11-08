@@ -49,6 +49,7 @@ const messages = defineMessages('components.AiChat.AiBulkSheet', {
 });
 
 interface ListSummary {
+  kind?: 'watch' | 'music';
   id: number;
   name: string;
 }
@@ -64,19 +65,19 @@ interface RequestResult {
   message?: string;
 }
 
-/** Titles one call to /request/missing takes. */
+/** Titles per /request/missing call. */
 const REQUEST_BATCH = 20;
 
 const keyOf = (title: Title) => `${title.mediaType}:${title.id}`;
 
-/** Released after today, or with no date yet. */
+/** Released after today, or undated. */
 const notOutYet = (title: Title) => {
   const date =
     title.mediaType === 'movie' ? title.releaseDate : title.firstAirDate;
   return !date || date > new Date().toISOString().slice(0, 10);
 };
 
-/** Whether the title still needs requesting, as far as the page knows. */
+/** Request status as far as the page knows. */
 const statusOf = (
   title: Title
 ): 'missing' | 'here' | 'coming' | 'asked' | 'blocked' => {
@@ -100,9 +101,9 @@ const statusOf = (
 };
 
 /**
- * Puts several titles AI Search found on a watch list, new or existing, or
- * requests the ones not here yet. Always confirmed here: the AI only sets it
- * up. Requests go through the usual rules, one title at a time.
+ * Adds AI Search titles to a new or existing watch list, or requests the
+ * missing ones. The user always confirms here; the AI only sets it up.
+ * Requests follow the usual rules, one title at a time.
  */
 const AiBulkSheet = ({
   mode,
@@ -115,7 +116,7 @@ const AiBulkSheet = ({
   titles: Title[];
   suggestedName?: string;
   onClose: () => void;
-  /** Titles now requested, so the cards behind can say so. */
+  /** Lets the cards behind show the new requests. */
   onRequested?: (keys: string[]) => void;
 }) => {
   const intl = useIntl();
@@ -124,11 +125,13 @@ const AiBulkSheet = ({
     [Permission.REQUEST, Permission.REQUEST_MOVIE, Permission.REQUEST_TV],
     { type: 'or' }
   );
-  const { data: lists } = useSWR<ListSummary[]>(
+  const { data: allLists } = useSWR<ListSummary[]>(
     mode === 'list' ? '/api/v1/list' : null
   );
+  // Music lists are playlists, not watch lists.
+  const lists = allLists?.filter((list) => list.kind !== 'music');
 
-  // Requesting: only what is not here or asked for yet is ticked.
+  // When requesting, preselect only missing titles.
   const [chosen, setChosen] = useState<Set<string>>(
     () =>
       new Set(
@@ -153,7 +156,7 @@ const AiBulkSheet = ({
     results?: RequestResult[];
   }>();
 
-  // A list the AI named that already exists is the one meant.
+  // Select an existing list matching the AI's suggested name.
   useEffect(() => {
     if (!lists || !suggestedName) {
       return;
@@ -172,7 +175,7 @@ const AiBulkSheet = ({
     [titles, chosen]
   );
 
-  // What may be ticked: requesting skips what is here or asked for.
+  // Requesting skips titles already available or requested.
   const choosable = titles.filter(
     (t) => mode === 'list' || statusOf(t) === 'missing'
   );
@@ -189,10 +192,8 @@ const AiBulkSheet = ({
       return next;
     });
 
-  /*
-   * Twenty at a time: each request goes to Radarr or Sonarr in turn, and a
-   * hundred in one call could outlast a reverse proxy's time limit.
-   */
+  // Batched because requests hit Radarr/Sonarr serially and one large call
+  // could exceed a reverse proxy timeout.
   const requestInBatches = async (items: Title[]) => {
     const results: RequestResult[] = [];
     try {
@@ -271,7 +272,7 @@ const AiBulkSheet = ({
       setDone(summary);
     } catch {
       setError(intl.formatMessage(messages.failed));
-      // What was done before it failed is still shown.
+      // Show what succeeded before the failure.
       if (summary.listId !== undefined || summary.results) {
         setDone(summary);
       }
@@ -342,7 +343,7 @@ const AiBulkSheet = ({
       >
         <div className="space-y-4 text-sm" data-testid="ai-bulk-sheet">
           {error && (
-            <p className="rounded bg-red-900/40 px-3 py-2 text-red-200">
+            <p className="rounded bg-red-900/40 px-3 py-2 text-red-200 light:bg-danger-soft/15 light:text-danger-text">
               {error}
             </p>
           )}
@@ -370,7 +371,7 @@ const AiBulkSheet = ({
               {done.listId !== undefined && (
                 <Link
                   href={`/lists/${done.listId}`}
-                  className="inline-block pt-1 font-semibold text-indigo-300 hover:text-indigo-200"
+                  className="inline-block pt-1 font-semibold text-indigo-300 hover:text-indigo-200 light:text-accent-text light:hover:text-accent-text"
                   onClick={onClose}
                 >
                   {intl.formatMessage(messages.openList)}
@@ -453,7 +454,7 @@ const AiBulkSheet = ({
           {!done && choosable.length > 6 && (
             <button
               type="button"
-              className="text-xs font-semibold text-indigo-300 hover:text-indigo-200"
+              className="text-xs font-semibold text-indigo-300 hover:text-indigo-200 light:text-accent-text light:hover:text-accent-text"
               onClick={() =>
                 setChosen(allChosen ? new Set() : new Set(choosable.map(keyOf)))
               }
@@ -491,11 +492,11 @@ const AiBulkSheet = ({
                       size="w92"
                     />
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate text-gray-100">
+                      <span className="block break-words text-gray-100">
                         {resultLabel(title)}
                       </span>
                       <span
-                        className={`block truncate text-xs ${
+                        className={`block break-words text-xs ${
                           failed ? 'text-red-300' : 'text-gray-400'
                         }`}
                       >

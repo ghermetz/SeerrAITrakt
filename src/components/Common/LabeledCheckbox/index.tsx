@@ -25,17 +25,17 @@ const LabeledCheckbox: React.FC<LabeledCheckboxProps> = ({
           <Field type="checkbox" id={id} name={id} onChange={onChange} />
         </div>
         <div className="ml-3 text-sm leading-6">
-          {/* Each label is for its own box; they all used to toggle Local Sign-In. */}
+          {/* Each label must target its own box via a unique id. */}
           <label htmlFor={id} className="block" aria-label={label}>
             <div className="flex flex-col">
-              <span className="font-medium text-white">{label}</span>
+              <span className="font-medium text-strong">{label}</span>
               <span className="font-normal text-gray-400">{description}</span>
             </div>
           </label>
         </div>
       </div>
       {
-        /* can hold child checkboxes */
+        /* Child checkboxes. */
         children && <div className="mt-4 pl-10">{children}</div>
       }
     </>

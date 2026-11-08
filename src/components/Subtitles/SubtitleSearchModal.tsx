@@ -27,11 +27,11 @@ const messages = defineMessages('components.Subtitles.SubtitleSearchModal', {
   asking: 'Asking Bazarr’s providers. This can take up to a minute.',
   none: 'No provider has a subtitle for this.',
   noneTranscribing:
-    'No provider had the missing subtitle, so Whisper is transcribing it from the audio. It shows on the page when it is done.',
+    'No provider had it, so Whisper is transcribing it from the audio.',
   noneQueued:
     'No provider had the missing subtitle. It is already queued to be transcribed from the audio.',
   noneNotMissing:
-    'No provider has another subtitle for this. Nothing was transcribed, since that would replace the one you have. Tap Transcribe to do it anyway.',
+    'No provider has another subtitle. Nothing was transcribed, as it would replace yours; tap Transcribe to do it anyway.',
   noneNotMissingPlain: 'No provider has another subtitle for this.',
   noneUnavailable:
     'No provider has the missing subtitle, and Bazarr has no Whisper to transcribe one.',
@@ -47,7 +47,7 @@ const messages = defineMessages('components.Subtitles.SubtitleSearchModal', {
   transcribeDetail: 'Transcribe the audio into subtitles',
   showAll: 'Show all {count}',
   downloaded:
-    'Subtitle downloaded. {mediaServerName} shows it after its next library scan.',
+    'Subtitle downloaded. It shows in {mediaServerName} after the next library scan.',
   transcribing:
     'Transcribing. It shows here when Whisper is done, which can take a while.',
   couldNot: 'Could not get that subtitle: {reason}',
@@ -83,13 +83,13 @@ export interface SubtitleSearchModalProps {
   tmdbId: number;
   seasonNumber?: number;
   episodeNumber?: number;
-  /** What is being searched for: the title, or the episode. */
+  /** The title or episode searched for. */
   subTitle: string;
   heading: string;
-  /** Show this language's results first, when there are any. */
+  /** This language's results go first. */
   language?: string;
   onClose: () => void;
-  /** After a subtitle was downloaded, or a transcription asked for. */
+  /** After a download, or a transcription request. */
   onDone: () => void;
 }
 
@@ -112,8 +112,8 @@ const SubtitleSearchModal = ({
     kind === 'movie'
       ? subtitlesKey('movie', tmdbId)
       : `${subtitlesKey('tv', tmdbId)}/season/${seasonNumber}/episode/${episodeNumber}`;
-  // Each opening is a new search: one that finds nothing may start a
-  // transcription, and its answer is about that moment.
+  // A fresh search per opening: an empty result may start a transcription,
+  // so cached answers can't be reused.
   const [opened] = useState(() => Date.now());
   const { data: answer, error } = useSWR<SubtitleSearchResponse>(
     `${base}/search?transcribeIfNone=true&at=${opened}`,
@@ -133,8 +133,8 @@ const SubtitleSearchModal = ({
   const { mutate } = useSWRConfig();
   const transcriptionKey = `${subtitlesKey(kind, tmdbId)}/transcription`;
 
-  // When Whisper took over, the page follows it; with nothing else to
-  // choose from, the dialog has done its job.
+  // Whisper took over: the page tracks it, and with no other results the
+  // dialog closes.
   const told = useRef(false);
   useEffect(() => {
     if (told.current || !noneFound) {
@@ -264,7 +264,7 @@ const SubtitleSearchModal = ({
               role="status"
               className={
                 noneFound === 'started' || noneFound === 'alreadyQueued'
-                  ? 'rounded-md border border-indigo-500 bg-indigo-500/10 px-3 py-2 text-sm text-indigo-100'
+                  ? 'rounded-md border border-indigo-500 bg-indigo-500/10 px-3 py-2 text-sm text-indigo-100 light:text-accent-text'
                   : 'rounded-md border border-gray-600 bg-gray-800 px-3 py-2 text-sm text-gray-200'
               }
             >
@@ -281,7 +281,7 @@ const SubtitleSearchModal = ({
                     setChosenLanguage(e.target.value);
                     setShowAll(false);
                   }}
-                  className="rounded-md border border-gray-500 bg-gray-700 py-1.5 text-white"
+                  className="rounded-md border border-field-border bg-field py-1.5 text-strong"
                 >
                   {languages.map((code) => (
                     <option key={code} value={code}>
@@ -324,10 +324,10 @@ const SubtitleSearchModal = ({
                   <span
                     className={
                       result.score >= 90
-                        ? 'text-lg font-extrabold text-green-300'
+                        ? 'text-lg font-extrabold text-green-300 light:text-success-text'
                         : result.score >= 70
-                          ? 'text-lg font-extrabold text-yellow-200'
-                          : 'text-lg font-extrabold text-red-300'
+                          ? 'text-lg font-extrabold text-yellow-200 light:text-warning-text'
+                          : 'text-lg font-extrabold text-red-300 light:text-danger-text'
                     }
                   >
                     {result.score}%
@@ -338,7 +338,7 @@ const SubtitleSearchModal = ({
                 </div>
                 <div className="flex min-w-0 flex-1 basis-64 flex-col gap-1">
                   <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="font-semibold text-white">
+                    <span className="font-semibold text-strong">
                       {providerName(result.provider)}
                     </span>
                     {result.ai && (
@@ -360,7 +360,7 @@ const SubtitleSearchModal = ({
                     {result.matched.map((field) => (
                       <span
                         key={`m-${field}`}
-                        className="rounded bg-green-500/10 px-1.5 text-xs text-green-200"
+                        className="rounded bg-green-500/10 px-1.5 text-xs text-green-200 light:text-success-text"
                       >
                         ✓ {fieldName(field)}
                       </span>
@@ -368,7 +368,7 @@ const SubtitleSearchModal = ({
                     {result.missed.map((field) => (
                       <span
                         key={`x-${field}`}
-                        className="rounded bg-red-500/10 px-1.5 text-xs text-red-200"
+                        className="rounded bg-red-500/10 px-1.5 text-xs text-red-200 light:text-danger-text"
                       >
                         ✗ {fieldName(field)}
                       </span>
@@ -379,7 +379,7 @@ const SubtitleSearchModal = ({
                   type="button"
                   onClick={() => choose(result)}
                   disabled={!!busy}
-                  className="min-h-[40px] flex-none rounded-md bg-indigo-600 px-4 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50"
+                  className="min-h-[40px] flex-none rounded-md bg-accent px-4 text-sm font-semibold text-on-accent transition hover:bg-accent-hover disabled:opacity-50"
                 >
                   {busy === result.subtitle
                     ? intl.formatMessage(globalMessages.loading)

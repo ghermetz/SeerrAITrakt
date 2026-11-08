@@ -1,21 +1,65 @@
+import { isMbid } from '@server/api/musicbrainz';
 import RadarrAPI from '@server/api/servarr/radarr';
 import SonarrAPI from '@server/api/servarr/sonarr';
 import TheMovieDb from '@server/api/themoviedb';
+import type { ProfileService } from '@server/constants/requestDefaults';
+import { getRepository } from '@server/datasource';
+import { User } from '@server/entity/User';
 import type {
+  LidarrServer,
+  LidarrServerWithDetails,
   ServiceCommonServer,
   ServiceCommonServerWithDetails,
 } from '@server/interfaces/api/serviceInterfaces';
+import { lidarrApi } from '@server/lib/music/access';
+import { Permission } from '@server/lib/permissions';
+import { savedProfileFor } from '@server/lib/requestDefaults';
+import type { LidarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
-import type { NextFunction } from 'express';
+import { requireMusic } from '@server/middleware/music';
+import type { NextFunction, Request } from 'express';
 import { Router } from 'express';
 
 const serviceRoutes = Router();
 
+/**
+ * The quality profiles saved by the person a request is for (`?requestUser=`,
+ * else whoever asks) for this server, while they may choose them. Someone
+ * else's only for those who request on others' behalf.
+ */
+const savedProfiles = async (
+  req: Request,
+  service: ProfileService,
+  server: { id: number; activeAnimeProfileId?: number }
+): Promise<{ savedProfileId?: number; savedAnimeProfileId?: number }> => {
+  const asked = Number(req.query.requestUser);
+  const forOther = Number.isInteger(asked) && asked !== req.user?.id;
+  if (
+    forOther &&
+    !req.user?.hasPermission(
+      [Permission.MANAGE_REQUESTS, Permission.MANAGE_USERS],
+      { type: 'or' }
+    )
+  ) {
+    return {};
+  }
+  const user = await getRepository(User).findOne({
+    where: { id: forOther ? asked : req.user?.id },
+  });
+  return {
+    savedProfileId: savedProfileFor(user, service, server),
+    savedAnimeProfileId:
+      service === 'lidarr'
+        ? undefined
+        : savedProfileFor(user, service, server, true),
+  };
+};
+
 /*
- * Anyone signed in reads these, for the request window. Why a server did
- * not answer (its address, the error) is for the log; people are told
- * only that it did not.
+ * Anyone signed in reads these for the request window. Failure details
+ * (address, error) go to the log only; clients just learn the server didn't
+ * answer.
  */
 const serverFailed = (
   next: NextFunction,
@@ -90,7 +134,9 @@ serviceRoutes.get<{ radarrId: string }>(
           activeAnimeDirectory: radarrSettings.activeAnimeDirectory,
           activeTags: radarrSettings.tags,
           activeAnimeTags: radarrSettings.animeTags,
+          profileFolders: radarrSettings.profileFolders ?? [],
         },
+        ...(await savedProfiles(req, 'radarr', radarrSettings)),
         profiles: profiles.map((profile) => ({
           id: profile.id,
           name: profile.name,
@@ -177,7 +223,9 @@ serviceRoutes.get<{ sonarrId: string }>(
             sonarrSettings.activeAnimeLanguageProfileId,
           activeTags: sonarrSettings.tags,
           activeAnimeTags: sonarrSettings.animeTags,
+          profileFolders: sonarrSettings.profileFolders ?? [],
         },
+        ...(await savedProfiles(req, 'sonarr', sonarrSettings)),
         profiles: profiles.map((profile) => ({
           id: profile.id,
           name: profile.name,
@@ -239,6 +287,102 @@ serviceRoutes.get<{ tmdbId: string }>(
         status: 500,
         message: 'Something went wrong trying to fetch series information',
       });
+    }
+  }
+);
+
+/** A Lidarr server as the request window needs it, without secrets. */
+const lidarrServer = (lidarr: LidarrSettings): LidarrServer => ({
+  id: lidarr.id,
+  name: lidarr.name,
+  is4k: false,
+  isDefault: lidarr.isDefault,
+  activeDirectory: lidarr.activeDirectory,
+  activeProfileId: lidarr.activeProfileId,
+  activeMetadataProfileId: lidarr.activeMetadataProfileId,
+  activeTags: lidarr.tags ?? [],
+});
+
+/*
+ * Lidarr for the music request window, only for people with music on. With
+ * `?artist=<MusicBrainz id>`, also says whether and where that artist already
+ * is in Lidarr: its folder and profiles are its own there, and a request
+ * doesn't change them.
+ */
+serviceRoutes.get('/lidarr', requireMusic, async (_req, res) => {
+  return res.status(200).json(getSettings().lidarr.map(lidarrServer));
+});
+
+serviceRoutes.get<{ lidarrId: string }>(
+  '/lidarr/:lidarrId',
+  requireMusic,
+  async (req, res, next) => {
+    const lidarrSettings = getSettings().lidarr.find(
+      (lidarr) => lidarr.id === Number(req.params.lidarrId)
+    );
+
+    if (!lidarrSettings) {
+      return next({
+        status: 404,
+        message: 'Lidarr server with provided ID does not exist.',
+      });
+    }
+
+    const lidarr = lidarrApi(lidarrSettings);
+    const artistMbid =
+      typeof req.query.artist === 'string' && isMbid(req.query.artist)
+        ? req.query.artist
+        : undefined;
+
+    try {
+      const [profiles, metadataProfiles, rootFolders, tags, artist] =
+        await Promise.all([
+          lidarr.getProfiles(),
+          lidarr.getMetadataProfiles(),
+          lidarr.getRootFolders(),
+          lidarr.getTags(),
+          artistMbid ? lidarr.getArtistByMbid(artistMbid) : undefined,
+        ]);
+
+      const allowed = (
+        types: { albumType: { name: string }; allowed: boolean }[] = []
+      ) => types.filter((type) => type.allowed).map((t) => t.albumType.name);
+
+      return res.status(200).json({
+        server: lidarrServer(lidarrSettings),
+        savedProfileId: (await savedProfiles(req, 'lidarr', lidarrSettings))
+          .savedProfileId,
+        profiles: profiles.map((profile) => ({
+          id: profile.id,
+          name: profile.name,
+        })),
+        metadataProfiles: metadataProfiles.map((profile) => ({
+          id: profile.id,
+          name: profile.name,
+          primaryTypes: allowed(profile.primaryAlbumTypes),
+          secondaryTypes: allowed(profile.secondaryAlbumTypes),
+        })),
+        rootFolders: rootFolders.map((folder) => ({
+          id: folder.id,
+          freeSpace: folder.freeSpace,
+          path: folder.path,
+          totalSpace: folder.totalSpace,
+        })),
+        tags,
+        artist: artist
+          ? {
+              id: artist.id,
+              path: artist.path,
+              rootFolderPath: artist.rootFolderPath,
+              qualityProfileId: artist.qualityProfileId,
+              metadataProfileId: artist.metadataProfileId,
+              tags: artist.tags ?? [],
+              monitored: artist.monitored,
+            }
+          : null,
+      } satisfies LidarrServerWithDetails);
+    } catch (e) {
+      return serverFailed(next, 'Lidarr', lidarrSettings.name, e);
     }
   }
 );

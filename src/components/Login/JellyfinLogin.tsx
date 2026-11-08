@@ -35,6 +35,8 @@ const messages = defineMessages('components.Login', {
   forgotpassword: 'Forgot Password?',
   quickconnect: 'Quick Connect',
   quickconnecterror: 'Quick Connect failed. Please try again.',
+  existingaccounterror:
+    'Another account here uses this name as its email. Sign in with it, then link {mediaServerName} in your profile.',
 });
 
 interface JellyfinLoginProps {
@@ -73,11 +75,24 @@ const JellyfinLogin = ({ revalidate, serverType }: JellyfinLoginProps) => {
     ),
     password: Yup.string(),
   });
-  const baseUrl = settings.currentSettings.jellyfinExternalHost
-    ? settings.currentSettings.jellyfinExternalHost
-    : settings.currentSettings.jellyfinHost;
-  const jellyfinForgotPasswordUrl =
-    settings.currentSettings.jellyfinForgotPasswordUrl;
+  // Password reset host. The Jellyfin settings belong to Emby when Emby is
+  // the first connected Jellyfin-family server, so they are unused then.
+  const isEmby = serverType === MediaServerType.EMBY;
+  const firstFamily = settings.currentSettings.mediaServers.find(
+    (server) => server.kind === 'jellyfin' || server.kind === 'emby'
+  )?.kind;
+  const jellyfinOwn = firstFamily !== 'emby';
+  const baseUrl = isEmby
+    ? settings.currentSettings.embyExternalHost
+    : jellyfinOwn
+      ? settings.currentSettings.jellyfinExternalHost ||
+        settings.currentSettings.jellyfinHost
+      : undefined;
+  const jellyfinForgotPasswordUrl = isEmby
+    ? settings.currentSettings.embyForgotPasswordUrl
+    : jellyfinOwn
+      ? settings.currentSettings.jellyfinForgotPasswordUrl
+      : undefined;
 
   return (
     <div>
@@ -94,6 +109,7 @@ const JellyfinLogin = ({ revalidate, serverType }: JellyfinLoginProps) => {
               username: values.username,
               password: values.password,
               email: values.username,
+              serverType,
             });
           } catch (e) {
             let errorMessage = messages.loginerror;
@@ -114,6 +130,9 @@ const JellyfinLogin = ({ revalidate, serverType }: JellyfinLoginProps) => {
               case ApiErrorCode.NoAdminUser:
                 errorMessage = messages.noadminerror;
                 break;
+              case ApiErrorCode.ExistingAccount:
+                errorMessage = messages.existingaccounterror;
+                break;
             }
             toasts.addToast(
               intl.formatMessage(errorMessage, mediaServerFormatValues),
@@ -132,7 +151,7 @@ const JellyfinLogin = ({ revalidate, serverType }: JellyfinLoginProps) => {
             <>
               <Form data-form-type="login">
                 <div>
-                  <h2 className="-mt-1 mb-6 text-center text-lg font-bold text-neutral-200">
+                  <h2 className="-mt-1 mb-6 text-center text-lg font-bold text-neutral-200 light:text-strong">
                     {intl.formatMessage(messages.loginwithapp, {
                       appName: mediaServerFormatValues.mediaServerName,
                     })}
@@ -145,7 +164,7 @@ const JellyfinLogin = ({ revalidate, serverType }: JellyfinLoginProps) => {
                         name="username"
                         type="text"
                         placeholder={intl.formatMessage(messages.username)}
-                        className="!bg-gray-700/80 placeholder:text-gray-400"
+                        className="!bg-gray-700/80 placeholder:text-gray-400 light:!bg-field"
                         data-form-type="username"
                       />
                     </div>
@@ -171,7 +190,7 @@ const JellyfinLogin = ({ revalidate, serverType }: JellyfinLoginProps) => {
                         type="password"
                         autoComplete="current-password"
                         placeholder={intl.formatMessage(messages.password)}
-                        className="!bg-gray-700/80 placeholder:text-gray-400"
+                        className="!bg-gray-700/80 placeholder:text-gray-400 light:!bg-field"
                         data-form-type="password"
                         data-1pignore="false"
                         data-lpignore="false"
@@ -188,13 +207,10 @@ const JellyfinLogin = ({ revalidate, serverType }: JellyfinLoginProps) => {
                             jellyfinForgotPasswordUrl
                               ? `${jellyfinForgotPasswordUrl}`
                               : `${baseUrl}/web/index.html#!/${
-                                  settings.currentSettings.mediaServerType ===
-                                  MediaServerType.EMBY
-                                    ? 'startup/'
-                                    : ''
+                                  isEmby ? 'startup/' : ''
                                 }forgotpassword.html`
                           }
-                          className="pt-2 text-sm text-indigo-500 hover:text-indigo-400"
+                          className="pt-2 text-sm text-accent-text hover:text-indigo-400 light:hover:text-accent-text"
                         >
                           {intl.formatMessage(messages.forgotpassword)}
                         </a>
@@ -245,6 +261,10 @@ const JellyfinLogin = ({ revalidate, serverType }: JellyfinLoginProps) => {
           }}
           onError={handleQuickConnectError}
           mediaServerName={mediaServerFormatValues.mediaServerName}
+          existingAccountMessage={intl.formatMessage(
+            messages.existingaccounterror,
+            mediaServerFormatValues
+          )}
         />
       )}
     </div>

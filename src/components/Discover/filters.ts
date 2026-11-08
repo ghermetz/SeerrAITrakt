@@ -1,10 +1,14 @@
+import {
+  MAX_STREAMING_SERVICES,
+  leftOutServices,
+  readServiceIds,
+} from '@server/constants/streamingServices';
 import type { ParsedUrlQuery } from 'querystring';
 
 /*
- * The Discover filters, read from the address. Kept apart from constants.ts,
- * which every Discover slider imports, and read without a schema library:
- * every field is an optional string, which needs no more than the check
- * below, and the filtered pages are the ones opened most.
+ * Discover filters read from the URL. Kept out of constants.ts (imported by
+ * every slider) and free of a schema library, since every field is an
+ * optional string and these pages are the most opened.
  */
 
 const TEXT_FILTERS = [
@@ -26,6 +30,7 @@ const TEXT_FILTERS = [
   'voteCountGte',
   'watchRegion',
   'watchProviders',
+  'excludeWatchProviders',
   'status',
   'certification',
   'certificationGte',
@@ -37,10 +42,7 @@ export type FilterOptions = {
   [K in (typeof TEXT_FILTERS)[number]]?: string;
 } & { certificationMode?: 'exact' | 'range' };
 
-/**
- * A filter's value from the address. A parameter given twice arrives as a
- * list; the first is used rather than the page failing.
- */
+/** A URL filter value; a repeated parameter uses its first value. */
 const textOf = (value: string | string[] | undefined): string | undefined => {
   const first = Array.isArray(value) ? value[0] : value;
   return typeof first === 'string' ? first : undefined;
@@ -132,6 +134,15 @@ export const prepareFilterValues = (
     filterValues.watchProviders = values.watchProviders;
   }
 
+  // Drop invalid or also-included IDs so a mistyped link still opens.
+  const leftOut = leftOutServices(
+    values.watchProviders,
+    values.excludeWatchProviders
+  );
+  if (leftOut.length) {
+    filterValues.excludeWatchProviders = leftOut.join('|');
+  }
+
   if (values.watchRegion) {
     filterValues.watchRegion = values.watchRegion;
   }
@@ -185,11 +196,8 @@ export const countActiveFilters = (filterValues: FilterOptions): number => {
     delete clonedFilters.withRuntimeLte;
   }
 
-  if (clonedFilters.watchProviders) {
-    totalCount += 1;
-    delete clonedFilters.watchProviders;
-    delete clonedFilters.watchRegion;
-  }
+  // The region belongs to the service filters, not a filter of its own.
+  delete clonedFilters.watchRegion;
 
   if (
     clonedFilters.certification ||
@@ -209,3 +217,79 @@ export const countActiveFilters = (filterValues: FilterOptions): number => {
 
   return totalCount;
 };
+
+/* Streaming services: each is included, excluded or neither; a click cycles. */
+
+export type ServiceChoice = 'on' | 'notOn' | undefined;
+
+export interface ChosenServices {
+  on: number[];
+  notOn: number[];
+}
+
+export const servicesOf = (filters: FilterOptions): ChosenServices => ({
+  on: readServiceIds(filters.watchProviders),
+  notOn: leftOutServices(filters.watchProviders, filters.excludeWatchProviders),
+});
+
+export const serviceChoiceOf = (
+  services: ChosenServices,
+  id: number
+): ServiceChoice =>
+  services.on.includes(id)
+    ? 'on'
+    : services.notOn.includes(id)
+      ? 'notOn'
+      : undefined;
+
+/** Cycles included → excluded → neither. */
+export const nextServiceChoice = (choice: ServiceChoice): ServiceChoice =>
+  choice === undefined ? 'on' : choice === 'on' ? 'notOn' : undefined;
+
+export const chooseService = (
+  services: ChosenServices,
+  id: number,
+  choice: ServiceChoice
+): ChosenServices => {
+  const on = services.on.filter((other) => other !== id);
+  const notOn = services.notOn.filter((other) => other !== id);
+  if (choice === 'on') on.push(id);
+  if (choice === 'notOn') notOn.push(id);
+  return { on, notOn };
+};
+
+/**
+ * Select all: every listed service is shown, up to the most a filter keeps.
+ * Services left out stay left out.
+ */
+export const chooseAllServices = (
+  services: ChosenServices,
+  listed: number[]
+): ChosenServices => ({
+  on: listed
+    .filter((id) => !services.notOn.includes(id))
+    .slice(0, MAX_STREAMING_SERVICES),
+  notOn: services.notOn,
+});
+
+/** Whether select all would change anything. */
+export const allServicesChosen = (
+  services: ChosenServices,
+  listed: number[]
+): boolean => {
+  const all = chooseAllServices(services, listed).on;
+  return all.every((id) => services.on.includes(id));
+};
+
+/** URL service filters; the region is dropped when no service is chosen. */
+export const serviceFilters = (
+  region: string,
+  { on, notOn }: ChosenServices
+): Pick<
+  FilterOptions,
+  'watchRegion' | 'watchProviders' | 'excludeWatchProviders'
+> => ({
+  watchRegion: on.length || notOn.length ? region : undefined,
+  watchProviders: on.length ? on.join('|') : undefined,
+  excludeWatchProviders: notOn.length ? notOn.join('|') : undefined,
+});

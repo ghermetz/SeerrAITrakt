@@ -1,5 +1,6 @@
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
+import SaveBar from '@app/components/Common/SaveBar';
 import NotificationTypeSelector from '@app/components/NotificationTypeSelector';
 import SettingsBadge from '@app/components/Settings/SettingsBadge';
 import useToasts from '@app/hooks/useToasts';
@@ -16,6 +17,7 @@ import {
   ArrowPathIcon,
   QuestionMarkCircleIcon,
 } from '@heroicons/react/24/solid';
+import { PROJECT_BRANCH, PROJECT_URL } from '@server/constants/project';
 import axios from 'axios';
 import { Field, Form, Formik } from 'formik';
 import dynamic from 'next/dynamic';
@@ -77,6 +79,9 @@ const defaultPayload = {
   '{{extra}}': [],
 };
 
+// Seerr AI's guide: Seerr's lacks variables added here (Emby ids, albums).
+const TEMPLATE_VARIABLES_URL = `${PROJECT_URL}/blob/${PROJECT_BRANCH}/docs/using-seerr/notifications/webhook.md#template-variables`;
+
 const messages = defineMessages(
   'components.Settings.Notifications.NotificationsWebhook',
   {
@@ -97,7 +102,7 @@ const messages = defineMessages(
     customHeadersValue: 'Header Value',
     customHeadersIncomplete: 'All headers must have both name and value',
     customHeadersAuthConflict:
-      'Cannot use both Authorization Header and custom Authorization header. Please remove one.',
+      'Use either Authorization Header or a custom Authorization header, not both.',
     validationJsonPayloadRequired: 'You must provide a valid JSON payload',
     webhooksettingssaved: 'Webhook notification settings saved successfully!',
     webhooksettingsfailed: 'Webhook notification settings failed to save.',
@@ -365,11 +370,7 @@ const NotificationsWebhook = () => {
             </div>
             {values.supportVariables && (
               <div className="mt-2">
-                <Link
-                  href="https://docs.seerr.dev/using-seerr/notifications/webhook#template-variables"
-                  passHref
-                  legacyBehavior
-                >
+                <Link href={TEMPLATE_VARIABLES_URL} passHref legacyBehavior>
                   <Button
                     as="a"
                     buttonSize="sm"
@@ -423,14 +424,19 @@ const NotificationsWebhook = () => {
               </div>
             </div>
             <div className="form-row">
-              <label htmlFor="customHeaders" className="text-label">
+              {/* Labels the header group below, which may be empty. */}
+              <label id="customHeadersLabel" className="text-label">
                 {intl.formatMessage(messages.customHeaders)}
                 <span className="label-tip">
                   {intl.formatMessage(messages.customHeadersTip)}
                 </span>
               </label>
               <div className="form-input-area">
-                <div className="space-y-2">
+                <div
+                  role="group"
+                  aria-labelledby="customHeadersLabel"
+                  className="space-y-2"
+                >
                   {values.customHeaders.map(
                     (header: { key: string; value: string }, index: number) => (
                       <div key={index} className="flex gap-2">
@@ -442,6 +448,9 @@ const NotificationsWebhook = () => {
                               placeholder={intl.formatMessage(
                                 messages.customHeadersKey
                               )}
+                              aria-label={intl.formatMessage(
+                                messages.customHeadersKey
+                              )}
                             />
                           </div>
                         </div>
@@ -451,6 +460,9 @@ const NotificationsWebhook = () => {
                               name={`customHeaders.${index}.value`}
                               type="text"
                               placeholder={intl.formatMessage(
+                                messages.customHeadersValue
+                              )}
+                              aria-label={intl.formatMessage(
                                 messages.customHeadersValue
                               )}
                             />
@@ -503,7 +515,7 @@ const NotificationsWebhook = () => {
               </div>
             </div>
             <div className="form-row">
-              <label htmlFor="webhook-json-payload" className="text-label">
+              <label htmlFor="jsonPayload" className="text-label">
                 {intl.formatMessage(messages.customJson)}
                 <span className="label-required">*</span>
               </label>
@@ -511,6 +523,8 @@ const NotificationsWebhook = () => {
                 <div className="form-input-field">
                   <JSONEditor
                     name="webhook-json-payload"
+                    inputId="jsonPayload"
+                    label={intl.formatMessage(messages.customJson)}
                     onUpdate={(value) => setFieldValue('jsonPayload', value)}
                     value={values.jsonPayload}
                     onBlur={() => setFieldTouched('jsonPayload')}
@@ -533,11 +547,7 @@ const NotificationsWebhook = () => {
                     <ArrowPathIcon />
                     <span>{intl.formatMessage(messages.resetPayload)}</span>
                   </Button>
-                  <Link
-                    href="https://docs.seerr.dev/using-seerr/notifications/webhook#template-variables"
-                    passHref
-                    legacyBehavior
-                  >
+                  <Link href={TEMPLATE_VARIABLES_URL} passHref legacyBehavior>
                     <Button
                       as="a"
                       buttonSize="sm"
@@ -569,7 +579,7 @@ const NotificationsWebhook = () => {
                   : undefined
               }
             />
-            <div className="actions">
+            <SaveBar>
               <div className="flex justify-end">
                 <span className="ml-3 inline-flex rounded-md shadow-sm">
                   <Button
@@ -608,7 +618,7 @@ const NotificationsWebhook = () => {
                   </Button>
                 </span>
               </div>
-            </div>
+            </SaveBar>
           </Form>
         );
       }}

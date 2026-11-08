@@ -3,21 +3,25 @@ import BackfillCandidate from '@server/entity/BackfillCandidate';
 import BackfillJob from '@server/entity/BackfillJob';
 import type { BackfillKind } from '@server/entity/BackfillSeries';
 import BackfillSeries from '@server/entity/BackfillSeries';
+import { agentWorkingOn, workedKey } from '@server/lib/agent/working';
 import backfill, { isMissing } from '@server/lib/backfill/engine';
 import type { PlanEntry } from '@server/lib/backfill/plan';
 import { selectEntries } from '@server/lib/backfill/plan';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
+import downloadCheckRoutes from '@server/routes/downloadCheck';
 import type { NextFunction, Request, Response } from 'express';
 import { Router } from 'express';
 import { In, MoreThanOrEqual, Not, Raw } from 'typeorm';
 import { z } from 'zod';
 
 /*
- * Backfill, for admins only (mounted with Permission.ADMIN). Reading works
+ * Backfill routes, admin only (mounted with Permission.ADMIN). Reads work
  * whether or not Backfill is set up; searching and approving need it on.
  */
 const backfillRoutes = Router();
+
+backfillRoutes.use('/download-check', downloadCheckRoutes);
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -49,7 +53,7 @@ const requireReady = (res: Response, next: NextFunction): boolean => {
   return true;
 };
 
-/** What a page needs of a plan entry; the import paths stay here. */
+/** Plan entry for the client; import paths stay server-side. */
 const entryView = (entry: PlanEntry) => ({
   index: entry.index,
   name: entry.path.split('/').pop(),
@@ -68,7 +72,7 @@ const entryView = (entry: PlanEntry) => ({
   why: entry.why,
 });
 
-/** A candidate without its Prowlarr links, which carry Prowlarr's key. */
+/** Candidate without its Prowlarr links, which carry Prowlarr's API key. */
 const candidateView = (c: BackfillCandidate, withPlan = false) => ({
   id: c.id,
   seriesId: c.seriesId,
@@ -104,7 +108,19 @@ const jobView = (job: BackfillJob, withDetail = false) => ({
   rejected: job.rejected,
   fileCount: job.files.length,
   error: job.error,
+  // When a job waiting on its indexer's download limit is retried.
+  retryAt:
+    job.status === 'queued' &&
+    job.indexerWait &&
+    Date.parse(job.indexerWait.until) > Date.now()
+      ? job.indexerWait.until
+      : null,
   approvedByName: job.approvedByName,
+  // After failure: the replacing download, or the admin agent conversation
+  // looking for one.
+  followUp: job.followUp,
+  replacedById: job.replacedById,
+  agentRunId: job.agentRunId,
   createdAt: job.createdAt,
   startedAt: job.startedAt,
   finishedAt: job.finishedAt,
@@ -125,11 +141,14 @@ const seriesView = (row: BackfillSeries) => ({
   arrId: row.arrId,
   tvdbId: row.tvdbId,
   tmdbId: row.tmdbId,
+  /** Album MusicBrainz id, for linking. */
+  foreignId: row.foreignId,
+  artistName: row.artistName,
   title: row.title,
   year: row.year,
   seriesType: row.seriesType,
   poster: row.poster,
-  status: backfill.isSearching(row.id) ? 'searching' : row.status,
+  status: backfill.statusOf(row),
   missing: row.missing,
   belowCutoff: row.belowCutoff,
   searchTerms: row.searchTerms ?? [],
@@ -147,8 +166,7 @@ const FILTERS: Record<string, BackfillSeries['status'][]> = {
 };
 
 /**
- * A title search, as typed: any part of the name, upper or lower case. The
- * LIKE wildcards in it are taken literally.
+ * Case-insensitive substring title search; LIKE wildcards are taken literally.
  */
 const titleSearch = (raw: unknown) => {
   const q = String(raw ?? '')
@@ -186,12 +204,12 @@ backfillRoutes.get('/', async (req, res, next) => {
       where: { status: 'ready' },
     });
     const bestBySeries = new Map<number, BackfillCandidate>();
+    const score = (x: BackfillCandidate) =>
+      (x.summary?.fill ?? 0) * 1e6 +
+      (x.summary?.upgrade ?? 0) * 1e3 +
+      (x.summary?.score ?? 0) / 1e3;
     for (const c of ready) {
       const held = bestBySeries.get(c.seriesId);
-      const score = (x: BackfillCandidate) =>
-        (x.summary?.fill ?? 0) * 1e6 +
-        (x.summary?.upgrade ?? 0) * 1e3 +
-        (x.summary?.score ?? 0) / 1e3;
       if (!held || score(c) > score(held)) bestBySeries.set(c.seriesId, c);
     }
     const jobsRepo = getRepository(BackfillJob);
@@ -214,8 +232,8 @@ backfillRoutes.get('/', async (req, res, next) => {
         })
       ).map((row) => [row.id, row])
     );
-    // A title already being backfilled is not waiting on anyone, whatever
-    // other packs its search found.
+    // A title already being backfilled isn't waiting, whatever other packs its
+    // search found.
     const waiting = all.filter(
       (row) =>
         row.status === 'found' &&
@@ -223,8 +241,7 @@ backfillRoutes.get('/', async (req, res, next) => {
         !backfill.isSearching(row.id)
     );
     const awaiting = waiting.length;
-    // While searching, each tab counts what matches, so the tab a title is
-    // on shows at a glance.
+    // While searching, each tab shows its match count.
     const matches = search?.matches ?? (() => true);
     const counts = {
       all: all.filter(matches).length,
@@ -257,22 +274,23 @@ backfillRoutes.get('/', async (req, res, next) => {
         ],
       },
       counts,
-      series: rows.map((row) => ({
-        ...seriesView(row),
-        best: bestBySeries.has(row.id)
-          ? candidateView(bestBySeries.get(row.id)!)
-          : undefined,
-        readyCount: ready.filter((c) => c.seriesId === row.id).length,
-        job: active.find((j) => j.seriesId === row.id)
-          ? jobView(active.find((j) => j.seriesId === row.id)!)
-          : undefined,
-      })),
-      jobs: active.map((job) => ({
-        ...jobView(job),
-        series: titles.has(job.seriesId)
-          ? seriesView(titles.get(job.seriesId)!)
-          : undefined,
-      })),
+      series: rows.map((row) => {
+        const best = bestBySeries.get(row.id);
+        const job = active.find((j) => j.seriesId === row.id);
+        return {
+          ...seriesView(row),
+          best: best ? candidateView(best) : undefined,
+          readyCount: ready.filter((c) => c.seriesId === row.id).length,
+          job: job ? jobView(job) : undefined,
+        };
+      }),
+      jobs: active.map((job) => {
+        const title = titles.get(job.seriesId);
+        return {
+          ...jobView(job),
+          series: title ? seriesView(title) : undefined,
+        };
+      }),
       awaiting: waiting.map((row) => ({
         ...candidateView(bestBySeries.get(row.id)!),
         series: seriesView(row),
@@ -284,8 +302,8 @@ backfillRoutes.get('/', async (req, res, next) => {
 });
 
 /**
- * Searches every stuck title, one at a time with a pause between; the
- * overview follows its progress. DELETE stops it after the current title.
+ * Search every stuck title sequentially with a pause between; the overview
+ * tracks progress. DELETE stops after the current title.
  */
 backfillRoutes.post('/search-all', (req, res, next) => {
   if (!requireReady(res, next)) return;
@@ -314,7 +332,31 @@ backfillRoutes.post('/scan', (_req, res, next) => {
   return res.status(202).json({ started: true });
 });
 
-/** Every series Sonarr has and movie Radarr has, for starting by hand. */
+/** An album's Lidarr state, to start a search from its page. */
+backfillRoutes.get<{ mbId: string }>('/album/:mbId', async (req, res, next) => {
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.mbId)) {
+    return next({ status: 400, message: 'Bad request.' });
+  }
+  // Nothing to start from while Backfill skips music.
+  if (!backfill.readiness().music) {
+    return next({ status: 404, message: 'Backfill does not look for music.' });
+  }
+  try {
+    const serverId = Number(req.query.serverId) || undefined;
+    const found = await backfill.findAlbum(req.params.mbId, serverId);
+    if (!found) {
+      return next({ status: 404, message: 'Lidarr does not have this album.' });
+    }
+    return res.status(200).json({ kind: 'album', ...found });
+  } catch (e) {
+    return fail(next, e, 500);
+  }
+});
+
+/**
+ * Every Sonarr series and Radarr movie, plus every monitored Lidarr album while
+ * Backfill handles music, for starting by hand.
+ */
 backfillRoutes.get('/library', async (_req, res, next) => {
   try {
     const settings = getSettings();
@@ -325,9 +367,11 @@ backfillRoutes.get('/library', async (_req, res, next) => {
       arrId: number;
       title: string;
       year: number;
+      /** Album artist. */
+      artist?: string;
     }[] = [];
     const seen = new Set<string>();
-    // A server that is down leaves its titles out rather than the list.
+    // A server that's down drops its titles, not the whole list.
     const orNothing = <T>(name: string, load: () => Promise<T[]>) =>
       load().catch((e): T[] => {
         logger.warn('Backfill could not list a server', {
@@ -371,6 +415,35 @@ backfillRoutes.get('/library', async (_req, res, next) => {
         }
       }
     }
+    if (backfill.readiness().music) {
+      for (const server of settings.lidarr) {
+        const lidarr = backfill.lidarrFor(server.id);
+        const [albums, artists] = await Promise.all([
+          orNothing(server.name, () => lidarr.getAlbums()),
+          orNothing(server.name, () => lidarr.getArtists()),
+        ]);
+        const artistOf = new Map(artists.map((a) => [a.id, a.artistName]));
+        for (const album of albums) {
+          // Lidarr only fetches monitored albums; Backfill matches.
+          if (!album.monitored || seen.has(`album:${album.foreignAlbumId}`)) {
+            continue;
+          }
+          seen.add(`album:${album.foreignAlbumId}`);
+          const year = album.releaseDate
+            ? new Date(album.releaseDate).getUTCFullYear()
+            : 0;
+          out.push({
+            kind: 'album',
+            serverId: server.id,
+            serverName: server.name,
+            arrId: album.id,
+            title: album.title,
+            year: year > 1 ? year : 0,
+            artist: artistOf.get(album.artistId),
+          });
+        }
+      }
+    }
     out.sort((a, b) => a.title.localeCompare(b.title));
     return res.status(200).json(out);
   } catch (e) {
@@ -379,12 +452,12 @@ backfillRoutes.get('/library', async (_req, res, next) => {
 });
 
 const trackBody = z.object({
-  kind: z.enum(['series', 'movie']),
+  kind: z.enum(['series', 'movie', 'album']),
   serverId: z.number().int(),
   arrId: z.number().int(),
 });
 
-/** Follows a series or a movie (from a title page, or picked by hand). */
+/** Follow a series, movie or album (from its page, or picked by hand). */
 backfillRoutes.post('/series', async (req, res, next) => {
   const parsed = trackBody.safeParse(req.body);
   if (!parsed.success) return next({ status: 400, message: 'Bad request.' });
@@ -392,7 +465,8 @@ backfillRoutes.post('/series', async (req, res, next) => {
     const row = await backfill.track(
       parsed.data.kind,
       parsed.data.serverId,
-      parsed.data.arrId
+      parsed.data.arrId,
+      true
     );
     if (row.status === 'ignored' || row.status === 'done') {
       await getRepository(BackfillSeries).update(row.id, { status: 'stuck' });
@@ -405,25 +479,35 @@ backfillRoutes.post('/series', async (req, res, next) => {
 });
 
 /**
- * Backfill's state for a title, for its page and the requests list: each
- * title Backfill follows, with every download it has running. Complete
- * titles only with `all`, for a title's page to link to.
+ * Backfill state per title for its page and the requests list: each followed
+ * title with its running downloads. Complete titles only with `all`, for
+ * title-page links.
  */
 backfillRoutes.get('/lookup', async (req, res, next) => {
   try {
-    // The validator hands the comma-separated list over as an array.
-    const raw = req.query.tmdbIds as unknown;
-    const tmdbIds = (Array.isArray(raw) ? raw : String(raw ?? '').split(','))
+    // The validator turns a comma-separated list into an array.
+    const list = (raw: unknown): string[] =>
+      (Array.isArray(raw) ? raw : String(raw ?? '').split(','))
+        .map((v) => String(v).trim())
+        .filter(Boolean)
+        .slice(0, 100);
+    const tmdbIds = list(req.query.tmdbIds)
       .map(Number)
-      .filter((n) => Number.isInteger(n) && n > 0)
-      .slice(0, 100);
-    if (!tmdbIds.length) return res.status(200).json([]);
+      .filter((n) => Number.isInteger(n) && n > 0);
+    // Albums are keyed by MusicBrainz id; they have no TMDB id.
+    const mbIds = list(req.query.mbIds).filter((id) =>
+      /^[0-9a-f-]{36}$/i.test(id)
+    );
+    if (!tmdbIds.length && !mbIds.length) return res.status(200).json([]);
     const everything = ['1', 'true'].includes(String(req.query.all ?? ''));
+    const unfinished = everything ? {} : { status: Not('done' as const) };
     const rows = await getRepository(BackfillSeries).find({
-      where: {
-        tmdbId: In(tmdbIds),
-        ...(everything ? {} : { status: Not('done') }),
-      },
+      where: [
+        ...(tmdbIds.length ? [{ tmdbId: In(tmdbIds), ...unfinished }] : []),
+        ...(mbIds.length
+          ? [{ kind: 'album' as const, foreignId: In(mbIds), ...unfinished }]
+          : []),
+      ],
     });
     const jobs = await backfill.withLiveProgress(
       await getRepository(BackfillJob).find({
@@ -437,6 +521,7 @@ backfillRoutes.get('/lookup', async (req, res, next) => {
     const ready = await getRepository(BackfillCandidate).find({
       where: { seriesId: In(rows.map((r) => r.id)), status: 'ready' },
     });
+    const agent = await agentWorkingOn(rows);
     return res.status(200).json(
       rows.map((row) => {
         const own = jobs
@@ -447,6 +532,7 @@ backfillRoutes.get('/lookup', async (req, res, next) => {
           readyCount: ready.filter((c) => c.seriesId === row.id).length,
           job: own[0],
           jobs: own,
+          workingRunId: agent.get(workedKey(row)) ?? null,
         };
       })
     );
@@ -486,7 +572,50 @@ interface MovieOnDisk {
   file?: { quality: string; score?: number; belowCutoff?: boolean };
 }
 
-/** A series' episodes as Sonarr has them, for its page. */
+interface AlbumOnDisk {
+  title: string;
+  artist: string;
+  profile: string;
+  minFormatScore: number;
+  names: string[];
+  tracks: {
+    id: number;
+    number?: number;
+    title: string;
+    state: 'missing' | 'onDisk';
+    quality?: string;
+  }[];
+}
+
+/** An album's tracks as Lidarr has them. */
+const albumOnDisk = async (row: BackfillSeries): Promise<AlbumOnDisk> => {
+  const ctx = await backfill.albumContext(row);
+  const files = new Map(ctx.files.map((f) => [f.id, f]));
+  return {
+    title: ctx.album.title,
+    artist: ctx.artist.artistName,
+    profile: ctx.profile.name,
+    minFormatScore: ctx.profile.minFormatScore,
+    names: ctx.names,
+    tracks: ctx.tracks
+      .sort(
+        (a, b) =>
+          (a.mediumNumber ?? 1) - (b.mediumNumber ?? 1) ||
+          (a.absoluteTrackNumber ?? 0) - (b.absoluteTrackNumber ?? 0)
+      )
+      .map((track) => ({
+        id: track.id,
+        number: track.absoluteTrackNumber,
+        title: track.title,
+        state: track.hasFile ? ('onDisk' as const) : ('missing' as const),
+        quality: track.trackFileId
+          ? files.get(track.trackFileId)?.quality.quality.name
+          : undefined,
+      })),
+  };
+};
+
+/** A series' episodes as Sonarr has them. */
 const seriesOnDisk = async (row: BackfillSeries): Promise<SeriesOnDisk> => {
   const ctx = await backfill.context(row);
   const files = new Map(ctx.files.map((f) => [f.id, f]));
@@ -522,15 +651,13 @@ const seriesOnDisk = async (row: BackfillSeries): Promise<SeriesOnDisk> => {
                 : 'unaired',
           quality: file?.quality.quality.name,
           score: file?.customFormatScore,
-          belowCutoff: file
-            ? (file as { qualityCutoffNotMet?: boolean }).qualityCutoffNotMet
-            : undefined,
+          belowCutoff: file?.qualityCutoffNotMet,
         };
       }),
   };
 };
 
-/** A movie and its file as Radarr has them, for its page. */
+/** A movie and its file as Radarr has them. */
 const movieOnDisk = async (row: BackfillSeries): Promise<MovieOnDisk> => {
   const ctx = await backfill.movieContext(row);
   return {
@@ -569,9 +696,12 @@ backfillRoutes.get('/series/:id', async (req, res, next) => {
     );
     let sonarr: SeriesOnDisk | undefined;
     let movie: MovieOnDisk | undefined;
+    let album: AlbumOnDisk | undefined;
     let arrError: string | undefined;
     try {
-      if (row.kind === 'movie') {
+      if (row.kind === 'album') {
+        album = await albumOnDisk(row);
+      } else if (row.kind === 'movie') {
         movie = await movieOnDisk(row);
       } else {
         sonarr = await seriesOnDisk(row);
@@ -584,6 +714,7 @@ backfillRoutes.get('/series/:id', async (req, res, next) => {
       readiness: backfill.readiness(),
       sonarr,
       movie,
+      album,
       arrError,
       candidates: candidates.map((c) => candidateView(c, true)),
       jobs: jobs.map((j) => jobView(j)),
@@ -649,6 +780,8 @@ backfillRoutes.post('/series/:id/search', async (req, res, next) => {
     if (row.status === 'ignored') {
       await repo.update(id, { status: 'stuck' });
     }
+    // Searched by hand: the album stays followed, requested or not.
+    if (!row.byHand) await repo.update(id, { byHand: true });
     backfill.startSearch(id, req.user, { ai: true });
     return res.status(202).json({ started: true });
   } catch (e) {
@@ -659,7 +792,7 @@ backfillRoutes.post('/series/:id/search', async (req, res, next) => {
 const approveBody = z.object({
   mode: z.enum(['missing', 'all']),
   confirm: z.string().optional(),
-  /** Leave out the files only the AI second opinion placed. */
+  /** Exclude files placed only by the AI second opinion. */
   includeAi: z.boolean().optional(),
 });
 
@@ -675,8 +808,8 @@ backfillRoutes.post('/candidates/:id/approve', async (req, res, next) => {
     const row = await getRepository(BackfillSeries).findOneOrFail({
       where: { id: candidate.seriesId },
     });
-    // Replacing files deletes the old ones for good: typing the title
-    // confirms it, on the server as well as in the page.
+    // Replacing permanently deletes the old files, so typing the title confirms
+    // it, checked server-side too.
     const replaces = selectEntries(
       candidate.plan,
       parsed.data.mode,
@@ -692,10 +825,18 @@ backfillRoutes.post('/candidates/:id/approve', async (req, res, next) => {
         message: `This replaces ${replaces} file${replaces === 1 ? '' : 's'} on disk. Type the title to confirm.`,
       });
     }
+    // An API key acts as an account (the owner's unless it names another) but
+    // the caller is whatever holds the key, so the job records that rather than
+    // claiming the person approved it.
+    const viaApiKey =
+      !!req.user &&
+      !!getSettings().main.apiKey &&
+      req.header('X-API-Key') === getSettings().main.apiKey;
     const job = await backfill.approve(id, {
       mode: parsed.data.mode,
       user: req.user,
       includeAi: parsed.data.includeAi,
+      by: viaApiKey ? `${req.user?.displayName} (API key)` : undefined,
     });
     return res.status(200).json(jobView(job));
   } catch (e) {

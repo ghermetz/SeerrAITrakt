@@ -1,38 +1,41 @@
-/**
- * Creating, reading, sharing and deleting lists themselves.
- */
+/** Creating, reading, sharing and deleting lists. */
 import TheMovieDb from '@server/api/themoviedb';
 import { POSTER_BACKFILL_LIMIT } from '@server/constants/lists';
 import { MediaStatus, MediaType } from '@server/constants/media';
 import dataSource, { getRepository } from '@server/datasource';
 import Episode from '@server/entity/Episode';
 import Media from '@server/entity/Media';
+import type { MediaListKind } from '@server/entity/MediaList';
 import {
   MediaList,
   MediaListItem,
   MediaListMember,
+  MediaListSong,
 } from '@server/entity/MediaList';
 import { User } from '@server/entity/User';
 import { warmTmdbImages } from '@server/lib/imageproxy';
+import { limitToLibraries } from '@server/lib/libraryVisibility';
 import { loadAccessibleList } from '@server/lib/listAccess';
 import { notifyListShared } from '@server/lib/listActivity';
+import { listTitle } from '@server/lib/listTitles';
+import { musicAllowed, playlistView } from '@server/lib/playlists/view';
 import { getSettings } from '@server/lib/settings';
 import { watchSource } from '@server/lib/watchHistory';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
 import { mapWithConcurrency } from '@server/utils/mapWithConcurrency';
 import { Router } from 'express';
-import { In, IsNull } from 'typeorm';
+import { In, IsNull, Not } from 'typeorm';
 
 const listRoutes = Router();
 
-/** Posters warmed for each list card, and for the whole page at most. */
+/** Max posters cache-warmed per list card, and per page. */
 const PREVIEWS_WARMED = 9;
 const PREVIEWS_WARMED_TOTAL = 90;
 
 /**
- * Posters sent for each list card. A card rotates through a few at a time,
- * so a list of hundreds does not need hundreds of them in the page.
+ * Posters sent per list card. A card rotates a few at a time, so a long list
+ * doesn't need all of them.
  */
 const PREVIEWS_PER_LIST = 30;
 
@@ -60,18 +63,14 @@ listRoutes.get('/', isAuthenticated(), async (req, res, next) => {
         })
       : [];
 
-    // Artwork for the overview. Poster paths are stored on the item, so this
-    // normally costs no TMDB calls at all — fetching one per title is what
-    // limited a card to rotating through a fixed handful.
+    // Overview artwork. Poster paths are stored on items, so this normally
+    // makes no TMDB calls.
     const tmdb = new TheMovieDb();
     const all = [...owned, ...shared];
 
-    // Fill in anything added before posters were stored, or that failed at
-    // the time. Bounded, and written back so it only happens once.
-    //
-    // Interleaved across lists rather than taken in order: a single large
-    // list would otherwise consume the whole budget and leave every other
-    // card with blank tiles until later loads.
+    // Backfill missing posters, bounded and written back so it happens once.
+    // Interleaved across lists so one large list can't use the whole budget
+    // and leave other cards blank.
     const queues = all.map((list) =>
       (list.items ?? []).filter((item) => !item.posterPath)
     );
@@ -97,23 +96,21 @@ listRoutes.get('/', isAuthenticated(), async (req, res, next) => {
     if (missing.length) {
       const itemRepository = getRepository(MediaListItem);
 
-      /*
-       * Fetch in parallel — TMDB is the slow part — but write in one pass
-       * afterwards. Interleaving writes with the fetches meant several
-       * database calls in flight at once, which is what pg's "client is
-       * already executing a query" warning objects to.
-       */
+      // Fetch in parallel (TMDB is slow) but write in one pass afterwards:
+      // writes interleaved with fetches would trigger pg's "client is already
+      // executing a query" warning.
       const fetched = await mapWithConcurrency(missing, 4, async (item) => {
         try {
-          const posterPath =
-            item.mediaType === 'movie'
-              ? (await tmdb.getMovie({ movieId: item.tmdbId })).poster_path
-              : (await tmdb.getTvShow({ tvId: item.tmdbId })).poster_path;
+          const { posterPath } = await listTitle(
+            tmdb,
+            item.tmdbId,
+            item.mediaType
+          );
 
           return posterPath ? { item, posterPath } : null;
         } catch (e) {
-          // Left for the next load rather than failing the page, but a poster
-          // that never resolves would otherwise retry forever in silence.
+          // Retried on the next load rather than failing the page; logged so a
+          // poster that never resolves doesn't retry silently forever.
           logger.debug('Could not backfill a list poster', {
             label: 'API',
             tmdbId: item.tmdbId,
@@ -141,8 +138,7 @@ listRoutes.get('/', isAuthenticated(), async (req, res, next) => {
     for (const list of all) {
       const items = list.items ?? [];
 
-      // Prefer titles still to watch: a card showing only finished things
-      // tells you nothing at a glance.
+      // Prefer unwatched titles: a card of finished ones says little.
       const outstanding = items.filter((item) => !item.watchedAt);
       const source = outstanding.length ? outstanding : items;
 
@@ -155,9 +151,9 @@ listRoutes.get('/', isAuthenticated(), async (req, res, next) => {
       );
     }
 
-    // The cards' posters, into the image cache as the page goes out, so
-    // they are there when it is drawn. Cards open on posters from anywhere
-    // in their lists, so a good share of each, within a cap for the page.
+    // Warm the image cache with card posters as the page goes out. Cards
+    // start on posters from anywhere in their lists, so warm a share of each,
+    // capped per page.
     if (getSettings().main.cacheImages) {
       const paths = [...previewsByList.values()]
         .flatMap((previews) =>
@@ -168,13 +164,37 @@ listRoutes.get('/', isAuthenticated(), async (req, res, next) => {
       setImmediate(() => warmTmdbImages(paths));
     }
 
+    // Playlist cards show their songs' album covers.
+    const playlistIds = all.filter((l) => l.kind === 'music').map((l) => l.id);
+    const playlistSongs = playlistIds.length
+      ? await getRepository(MediaListSong).find({
+          select: { listId: true, albumMbid: true, state: true },
+          where: { listId: In(playlistIds), state: Not('removed') },
+          order: { position: 'ASC' },
+        })
+      : [];
+
     return res.status(200).json(
       all.map((list) => ({
         id: list.id,
         name: list.name,
+        kind: list.kind ?? 'watch',
         owner: { id: list.owner.id, displayName: list.owner.displayName },
         isOwner: list.ownerId === userId,
-        itemCount: (list.items ?? []).length,
+        itemCount:
+          list.kind === 'music'
+            ? playlistSongs.filter((s) => s.listId === list.id).length
+            : (list.items ?? []).length,
+        covers:
+          list.kind === 'music'
+            ? [
+                ...new Set(
+                  playlistSongs
+                    .filter((s) => s.listId === list.id && s.albumMbid)
+                    .map((s) => s.albumMbid as string)
+                ),
+              ].slice(0, PREVIEWS_PER_LIST)
+            : undefined,
         watchedCount: (list.items ?? []).filter((item) => !!item.watchedAt)
           .length,
         memberCount: (list.members ?? []).length,
@@ -199,17 +219,27 @@ listRoutes.post('/', isAuthenticated(), async (req, res, next) => {
       return next({ status: 400, message: 'A list name is required.' });
     }
 
+    // Playlists only while music is set up and enabled for this user.
+    const kind: MediaListKind = req.body.kind === 'music' ? 'music' : 'watch';
+    if (kind === 'music' && !musicAllowed(req.user)) {
+      return next({ status: 400, message: 'Music is not set up here.' });
+    }
+
     const list = await getRepository(MediaList).save(
       new MediaList({
         name,
+        kind,
         ownerId: req.user?.id as number,
-        watchedSync: req.body.watchedSync === true,
+        watchedSync: kind === 'watch' && req.body.watchedSync === true,
       })
     );
 
-    return res
-      .status(201)
-      .json({ id: list.id, name: list.name, watchedSync: list.watchedSync });
+    return res.status(201).json({
+      id: list.id,
+      name: list.name,
+      kind: list.kind,
+      watchedSync: list.watchedSync,
+    });
   } catch (e) {
     logger.error('Failed to create list', {
       label: 'API',
@@ -218,12 +248,6 @@ listRoutes.post('/', isAuthenticated(), async (req, res, next) => {
     next({ status: 500, message: 'Failed to create list.' });
   }
 });
-
-// Which of the caller's accessible lists already contain a title. Registered
-// before "/:listId" so the literal path is matched first.
-// Everything the current user has marked, in one request. Cards need this to
-// badge posters, and a lookup per card would be dozens of requests per page —
-// SWR de-duplicates this single key across every card instead.
 
 listRoutes.get<{ listId: string }>(
   '/:listId',
@@ -248,9 +272,9 @@ listRoutes.get<{ listId: string }>(
         where: { listId: access.list.id },
       });
 
-      // Items store only a tmdb id, so hydrate them for display. Bounded
-      // concurrency keeps a large list from bursting TMDB; responses are
-      // served from Seerr's existing external-API cache on repeat views.
+      // Items store only a TMDB id, so hydrate them. Bounded concurrency keeps
+      // a large list from bursting TMDB; repeat views hit the external-API
+      // cache.
       const tmdb = new TheMovieDb();
 
       const hydrated = await mapWithConcurrency(items, 5, async (item) => {
@@ -269,36 +293,18 @@ listRoutes.get<{ listId: string }>(
         };
 
         try {
-          if (item.mediaType === 'movie') {
-            const movie = await tmdb.getMovie({ movieId: item.tmdbId });
-
-            return {
-              ...base,
-              title: movie.title,
-              posterPath: item.posterPath ?? movie.poster_path,
-              releaseDate: movie.release_date,
-            };
-          }
-
-          const tv = await tmdb.getTvShow({ tvId: item.tmdbId });
+          // A series' episode total lets a partially available one show how
+          // much is here.
+          const found = await listTitle(tmdb, item.tmdbId, item.mediaType);
 
           return {
             ...base,
-            title: tv.name,
-            posterPath: item.posterPath ?? tv.poster_path,
-            releaseDate: tv.first_air_date,
-            // Total real episodes, ignoring specials, so a partially
-            // available show can say how much of it is actually here.
-            totalEpisodes: (tv.seasons ?? [])
-              .filter((season) => season.season_number > 0)
-              .reduce(
-                (total, season) => total + (season.episode_count ?? 0),
-                0
-              ),
+            ...found,
+            posterPath: item.posterPath ?? found.posterPath,
           };
         } catch (e) {
-          // A title TMDB no longer serves still belongs on the list, and the
-          // stored poster means it still has artwork.
+          // A title TMDB no longer serves stays on the list, with its stored
+          // poster.
           logger.debug('Could not hydrate a list item', {
             label: 'API',
             tmdbId: item.tmdbId,
@@ -309,12 +315,8 @@ listRoutes.get<{ listId: string }>(
         }
       });
 
-      // How many episodes of each series are actually available, from the
-      // rows the episode sync maintains.
-      //
-      // Two queries for the whole page rather than one Media lookup per
-      // series plus one Episode count per season — a list of twenty shows
-      // with five seasons each was over a hundred round trips.
+      // Available episodes per series, from the episode sync's rows: two
+      // queries for the page, not one per series and season.
       const availableEpisodes = new Map<number, number>();
       const tvTmdbIds = items
         .filter((item) => item.mediaType === 'tv')
@@ -325,13 +327,19 @@ listRoutes.get<{ listId: string }>(
           where: { tmdbId: In(tvTmdbIds), mediaType: MediaType.TV },
           relations: { seasons: true },
         });
+        // None of a series' episodes count for a viewer whose libraries
+        // don't hold it.
+        await limitToLibraries(tvMedia, req.user);
 
-        // Season id -> the series it belongs to, so one grouped count can be
-        // attributed back without another query.
+        // Season id -> series, to attribute one grouped count without another
+        // query.
         const seasonOwner = new Map<number, number>();
 
         for (const entry of tvMedia) {
           availableEpisodes.set(entry.tmdbId, 0);
+          if (entry.outsideLibraries) {
+            continue;
+          }
 
           for (const season of entry.seasons ?? []) {
             // Specials never count towards availability.
@@ -376,9 +384,9 @@ listRoutes.get<{ listId: string }>(
         }))
       );
 
-      // Watch sync only suggests a title once everyone on the list can be
-      // checked, so the owner is told who cannot be: anyone without an
-      // account on the media server.
+      // Watch sync suggests a title only once everyone on the list can be
+      // checked, so tell the owner who can't: anyone without a media server
+      // account.
       const source = watchSource();
       const cannotCheck =
         access.isOwner && source
@@ -396,8 +404,13 @@ listRoutes.get<{ listId: string }>(
       return res.status(200).json({
         id: access.list.id,
         name: access.list.name,
+        kind: access.list.kind ?? 'watch',
+        playlist:
+          access.list.kind === 'music'
+            ? await playlistView(access.list)
+            : undefined,
         isOwner: access.isOwner,
-        // Whether the viewer has accepted the list. The owner always has.
+        // Whether the viewer accepted the list; always true for the owner.
         accepted:
           access.isOwner ||
           members.some((m) => m.userId === req.user?.id && !!m.acceptedAt),
@@ -471,14 +484,13 @@ listRoutes.put<{ listId: string }>(
       const listId = access.list.id;
       let newMembers: User[] = [];
 
-      // One change: if any part fails, none of it is kept, so a list is never
-      // left with its old members removed and the new ones missing.
+      // One transaction, so a list is never left with old members removed and
+      // new ones missing.
       const conflict = await dataSource.transaction(async (manager) => {
         if (Array.isArray(req.body.memberIds)) {
           const memberRepository = manager.getRepository(MediaListMember);
 
-          // Membership is set to the ids supplied. The owner is never a
-          // member of their own list.
+          // Membership becomes the supplied ids; the owner is never a member.
           const requested = (req.body.memberIds as unknown[])
             .map(Number)
             .filter((id) => Number.isFinite(id) && id !== access.list.ownerId);
@@ -489,8 +501,8 @@ listRoutes.put<{ listId: string }>(
                 .find({ where: { id: In(requested) } })
             : [];
 
-          // Two saves at once must not both work from the same members.
-          // SQLite runs one write at a time already.
+          // Lock so concurrent saves don't both start from the same members.
+          // SQLite already serializes writes.
           if (manager.connection.options.type === 'postgres') {
             await manager
               .getRepository(MediaList)
@@ -504,9 +516,9 @@ listRoutes.put<{ listId: string }>(
           const previous = await memberRepository.find({ where: { listId } });
           const previousIds = new Set(previous.map((member) => member.userId));
 
-          // The sharing dialog says who was on the list when it opened. If
-          // that has changed since (someone left), saving it would quietly
-          // put them back, so it is refused and the owner looks again.
+          // The sharing dialog sends who was on the list when it opened. If
+          // that changed (someone left), saving would silently re-add them, so
+          // refuse and let the owner review.
           if (Array.isArray(req.body.previousMemberIds)) {
             const startedFrom = new Set(
               (req.body.previousMemberIds as unknown[]).map(Number)
@@ -520,8 +532,8 @@ listRoutes.put<{ listId: string }>(
             }
           }
 
-          // Only the differences are written, so people who stay on the list
-          // keep their rows, and with them whether they have accepted it.
+          // Write only the differences, so remaining members keep their rows
+          // and acceptance.
           const wanted = new Set(users.map((user) => user.id));
           const removed = previous.filter(
             (member) => !wanted.has(member.userId)
@@ -533,8 +545,8 @@ listRoutes.put<{ listId: string }>(
             });
           }
 
-          // Worked out against the rows already there, so re-saving the
-          // sharing dialog does not notify people who were already on it.
+          // Compared with existing rows, so re-saving doesn't notify existing
+          // members.
           newMembers = users.filter((user) => !previousIds.has(user.id));
 
           if (newMembers.length) {
@@ -612,10 +624,9 @@ listRoutes.delete<{ listId: string }>(
 );
 
 /*
- * Someone a list was shared with accepts it. They can see a list as soon as
- * it is shared, but their watch history is only used for it (watch sync,
- * picks for a room) once they accept: anyone can add anyone to a list, and
- * that alone is not agreeing to share what they watch.
+ * A member accepts a shared list. They see it once shared, but their watch
+ * history is used for it (watch sync, room picks) only after accepting:
+ * anyone can add anyone, which isn't consent to share what they watch.
  */
 listRoutes.post<{ listId: string }>(
   '/:listId/membership',
@@ -639,7 +650,7 @@ listRoutes.post<{ listId: string }>(
         });
       }
 
-      // Accepting again keeps the first time.
+      // Accepting again keeps the first acceptance time.
       await getRepository(MediaListMember).update(
         { listId: access.list.id, userId, acceptedAt: IsNull() },
         { acceptedAt: new Date() }
@@ -657,9 +668,8 @@ listRoutes.post<{ listId: string }>(
 );
 
 /*
- * Someone a list was shared with can leave it, which is also how they turn
- * it down: anyone could otherwise put a list in someone's view for good.
- * The owner deletes their list instead.
+ * A member leaves (or declines) a shared list, so nobody can force a list
+ * into someone's view. The owner deletes their list instead.
  */
 listRoutes.delete<{ listId: string }>(
   '/:listId/membership',
@@ -698,7 +708,5 @@ listRoutes.delete<{ listId: string }>(
     }
   }
 );
-
-// Anyone who can see a list can curate it; membership is the owner's call.
 
 export default listRoutes;

@@ -4,12 +4,13 @@ import { getRepository } from '@server/datasource';
 import { User } from '@server/entity/User';
 import { getIntl } from '@server/i18n';
 import globalMessages from '@server/i18n/globalMessages';
+import { declineReasonOf } from '@server/lib/notifications/declineReason';
 import { eventText } from '@server/lib/notifications/eventTitles';
+import notificationHttp from '@server/lib/notifications/http';
 import type { NotificationAgentPushbullet } from '@server/lib/settings';
 import { NotificationAgentKey, getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import type { AvailableLocale } from '@server/types/languages';
-import axios from 'axios';
 import {
   Notification,
   hasNotificationType,
@@ -22,7 +23,7 @@ interface PushbulletPayload {
   type: string;
   title: string;
   body: string;
-  /** For a "link" push: where tapping it goes. */
+  /** Tap target for a "link" push. */
   url?: string;
   channel_tag?: string;
 }
@@ -80,12 +81,18 @@ class PushbulletAgent
           status = intl.formatMessage(globalMessages.declined);
           break;
         case Notification.MEDIA_FAILED:
+        case Notification.REQUEST_FAILED:
           status = intl.formatMessage(globalMessages.failed);
           break;
       }
 
       if (status) {
         body += `\n${intl.formatMessage(globalMessages.requestStatus)}: ${status}`;
+      }
+
+      const declineReason = declineReasonOf(type, payload);
+      if (declineReason) {
+        body += `\n${intl.formatMessage(globalMessages.declineReason)}: ${declineReason}`;
       }
     } else if (payload.comment) {
       body += `\n\n${intl.formatMessage(globalMessages.commentFrom, { userName: payload.comment.user.displayName })}:\n${payload.comment.message}`;
@@ -143,7 +150,7 @@ class PushbulletAgent
       try {
         const notificationPayload = this.getNotificationPayload(type, payload);
 
-        await axios.post(
+        await notificationHttp.post(
           endpoint,
           { ...notificationPayload, channel_tag: settings.options.channelTag },
           {
@@ -165,8 +172,7 @@ class PushbulletAgent
       }
     }
 
-    // Held while a burst to this person is gathered into one (see the
-    // notification manager): only the admin and channel copies go now.
+    // holdUser: the user's copy goes out later in a digest.
     if (payload.notifyUser && !payload.holdUser) {
       if (
         payload.notifyUser.settings?.hasNotificationType(
@@ -191,7 +197,7 @@ class PushbulletAgent
             payload.notifyUser.settings?.locale as AvailableLocale
           );
 
-          await axios.post(endpoint, notificationPayload, {
+          await notificationHttp.post(endpoint, notificationPayload, {
             headers: {
               'Access-Token': payload.notifyUser.settings.pushbulletAccessToken,
             },
@@ -245,7 +251,7 @@ class PushbulletAgent
                   user.settings?.locale as AvailableLocale
                 );
 
-                await axios.post(endpoint, notificationPayload, {
+                await notificationHttp.post(endpoint, notificationPayload, {
                   headers: {
                     'Access-Token': user.settings.pushbulletAccessToken,
                   },

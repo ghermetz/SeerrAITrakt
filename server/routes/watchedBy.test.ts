@@ -1,4 +1,5 @@
 import { MediaStatus, MediaType } from '@server/constants/media';
+import { MediaServerType } from '@server/constants/server';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { User } from '@server/entity/User';
@@ -15,15 +16,15 @@ import path from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 
 /*
- * "Watched by" on a title, from a fake Tautulli's history, behind the real
- * API validator.
+ * "Watched by" on a title from a fake Tautulli history, behind the real API
+ * validator.
  */
 
 setupTestDb();
 
 const DAY = 24 * 60 * 60;
 const now = Math.floor(Date.now() / 1000);
-// History as Tautulli's get_history gives it, keyed by what was asked for.
+// History as Tautulli's get_history returns it, keyed by query.
 let history: Record<string, unknown[]> = {};
 let asked: string[] = [];
 const fake = http.createServer((req, res) => {
@@ -74,6 +75,8 @@ after(() => {
 beforeEach(async () => {
   history = {};
   asked = [];
+  // Tautulli is Plex's watch history, read while Plex is connected.
+  getSettings().main.mediaServerType = MediaServerType.PLEX;
   getSettings().tautulli = {
     hostname: '127.0.0.1',
     port: (fake.address() as { port: number }).port,
@@ -143,7 +146,7 @@ const watchedBy = (mediaId: number) =>
             try {
               body = JSON.parse(raw);
             } catch {
-              // An error page: the status is what matters.
+              // An error page: only the status matters.
             }
             resolve({ status: res.statusCode ?? 0, body });
           });
@@ -228,7 +231,7 @@ describe('watched by', () => {
         ratingKey: '400',
       })
     );
-    // The setting merges rather than replaces, so clear the fields.
+    // The setter merges, so clear the fields.
     getSettings().tautulli = { hostname: '', port: 0, apiKey: '' };
     assert.deepEqual((await watchedBy(media.id)).body, {
       configured: false,
@@ -236,5 +239,41 @@ describe('watched by', () => {
     });
     actingAs = jordan;
     assert.equal((await watchedBy(media.id)).status, 403);
+  });
+
+  it('reads Tautulli only while Plex is connected', async () => {
+    const media = await getRepository(Media).save(
+      new Media({
+        tmdbId: 4,
+        mediaType: MediaType.MOVIE,
+        status: MediaStatus.AVAILABLE,
+        ratingKey: '500',
+      })
+    );
+    history = { 'movie:500': [play(1, 'alex', 500, 1)] };
+    getSettings().main.mediaServerType = MediaServerType.JELLYFIN;
+    getSettings().plex.connected = false;
+
+    assert.deepEqual((await watchedBy(media.id)).body, {
+      configured: false,
+      people: [],
+    });
+    const watchData = await new Promise<number>((resolve, reject) => {
+      http
+        .get(
+          {
+            host: '127.0.0.1',
+            port,
+            path: `/api/v1/media/${media.id}/watch_data`,
+          },
+          (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          }
+        )
+        .on('error', reject);
+    });
+    assert.equal(watchData, 404);
+    assert.deepEqual(asked, []);
   });
 });

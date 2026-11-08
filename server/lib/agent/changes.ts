@@ -1,6 +1,15 @@
 import type { TitleRef } from '@server/lib/agent/tools';
 import type { ArrEpisode, ArrHistoryRecord } from '@server/lib/autofix/arr';
 import { FixRadarr, FixSonarr } from '@server/lib/autofix/arr';
+import type { SeasonOutcome, SeasonPlan } from '@server/lib/autofix/season';
+import {
+  approvedFrom,
+  approvedOf,
+  carryOutSeason,
+  planDetails,
+  planHeadline,
+  planSeason,
+} from '@server/lib/autofix/season';
 import {
   GROUP_NAME,
   blockedGroups,
@@ -11,34 +20,37 @@ import { getSettings } from '@server/lib/settings';
 /*
  * Changes the admin agent can propose and only an admin can approve: block
  * or unblock a release group, mark a download failed, delete a title's
- * files, move a title to another quality profile. (Replacing files goes
- * through grab with replace: true, also approved first.)
+ * files, change its quality profile, replace a whole season. (Replacing
+ * chosen files goes through grab with replace: true, also approved first.)
  *
- * A proposal is checked and described when it is made, from what Radarr or
- * Sonarr says then, so the admin sees exactly what will happen; it is
- * checked again when approved, against what they say by then.
+ * A proposal is checked and described against Radarr or Sonarr when made,
+ * so the admin sees exactly what will happen, and checked again on
+ * approval against their state by then.
  */
 
 export type ChangeKind =
   | 'replace'
+  /** A grab outside Sonarr's or Radarr's size limits, also via grab. */
+  | 'oversizeGrab'
   | 'blockGroup'
   | 'unblockGroup'
   | 'markFailed'
   | 'deleteFiles'
-  | 'changeProfile';
+  | 'changeProfile'
+  | 'replaceSeason';
 
-/** One change, as proposed: what it does, in words, and how to do it. */
+/** One proposed change: what it does, in words, and how to do it. */
 export interface ProposedChange {
   kind: ChangeKind;
-  /** One line: "Delete the file of Resident Evil (2026)". */
+  /** One line: "Delete the file of Hollow Signal (2026)". */
   headline: string;
-  /** What exactly happens, line by line. */
+  /** Exactly what happens, line by line. */
   details: string[];
   title?: TitleRef;
   params: Record<string, unknown>;
 }
 
-/** What waits for an admin's decision on a run. */
+/** Changes on a run awaiting an admin's decision. */
 export interface Proposal {
   id: string;
   at: string;
@@ -67,7 +79,7 @@ const sonarrOf = (title: TitleRef) => {
   return FixSonarr.forServer(server);
 };
 
-/** What deleting does to a file, where Radarr or Sonarr puts deleted ones. */
+/** Where Radarr or Sonarr puts a deleted file, in words. */
 const whereDeletedGo = async (api: FixRadarr | FixSonarr, app: string) => {
   const bin = await api.extras.recycleBin().catch(() => null);
   return bin
@@ -80,7 +92,7 @@ const whereDeletedGo = async (api: FixRadarr | FixSonarr, app: string) => {
 // ---- describing ------------------------------------------------------------
 
 export interface ChangeInput {
-  kind: Exclude<ChangeKind, 'replace'>;
+  kind: Exclude<ChangeKind, 'replace' | 'oversizeGrab' | 'replaceSeason'>;
   title?: TitleRef;
   name?: string;
   group?: string;
@@ -124,18 +136,22 @@ const describeGroup = async (
   };
 };
 
-/** The newest grab of a title still waiting, or the last one made. */
+/** The title's most recent grab. */
 const lastGrab = (history: ArrHistoryRecord[]) =>
   history.find((h) => h.eventType === 'grabbed');
+
+/** Whether a Radarr or Sonarr queue item is a download of this title. */
+const queuedFor = (item: object, title: TitleRef): boolean =>
+  title.kind === 'movie'
+    ? (item as { movieId?: number }).movieId === title.arrId
+    : (item as { seriesId?: number }).seriesId === title.arrId;
 
 const describeFailed = async (input: ChangeInput): Promise<ProposedChange> => {
   const title = needTitle(input);
   const name = input.name ?? 'the title';
   if (title.kind === 'movie') {
     const api = radarrOf(title);
-    const queued = (await api.getQueue()).filter(
-      (q) => (q as { movieId?: number }).movieId === title.arrId
-    );
+    const queued = (await api.getQueue()).filter((q) => queuedFor(q, title));
     if (queued.length) {
       return {
         kind: 'markFailed',
@@ -170,9 +186,7 @@ const describeFailed = async (input: ChangeInput): Promise<ProposedChange> => {
     };
   }
   const api = sonarrOf(title);
-  const queued = (await api.getQueue()).filter(
-    (q) => (q as { seriesId?: number }).seriesId === title.arrId
-  );
+  const queued = (await api.getQueue()).filter((q) => queuedFor(q, title));
   if (!queued.length) {
     throw new ChangeError(
       `${name} has nothing downloading in Sonarr to mark failed.`
@@ -194,7 +208,7 @@ const describeFailed = async (input: ChangeInput): Promise<ProposedChange> => {
   };
 };
 
-/** The episodes a change is for: a season, some of its episodes, or all. */
+/** The episodes a change covers: a season, some of its episodes, or all. */
 const episodesFor = (all: ArrEpisode[], input: ChangeInput): ArrEpisode[] =>
   all.filter(
     (ep) =>
@@ -320,7 +334,7 @@ const needTitle = (input: ChangeInput): TitleRef => {
   return input.title;
 };
 
-/** A change described, or why it cannot be made. */
+/** Describes a change, or throws why it cannot be made. */
 export const describeChange = (input: ChangeInput): Promise<ProposedChange> => {
   switch (input.kind) {
     case 'blockGroup':
@@ -336,6 +350,69 @@ export const describeChange = (input: ChangeInput): Promise<ProposedChange> => {
   }
 };
 
+// ---- a whole season ----------------------------------------------------------
+
+/**
+ * A proposal to replace every file of a season: the release to grab, then
+ * the old downloads marked failed, then the files removed. Kept with the
+ * releases shown, which are the only ones taken on approval.
+ */
+export const seasonChange = (
+  plan: SeasonPlan,
+  title: TitleRef,
+  reason?: string
+): ProposedChange => ({
+  kind: 'replaceSeason',
+  headline: planHeadline(plan),
+  title,
+  details: [...planDetails(plan), ...(reason ? [`Why: ${reason}`] : [])],
+  params: { season: plan.seasonNumber, ...approvedOf(plan) },
+});
+
+/** A season's replacement, or why there is none. */
+export const describeSeasonReplace = async (
+  title: TitleRef,
+  season: number,
+  reason: string
+): Promise<ProposedChange> => {
+  if (title.kind !== 'series') {
+    throw new ChangeError('Only a series has seasons to replace.');
+  }
+  const plan = await planSeason(sonarrOf(title), title.arrId, season);
+  if ('nothing' in plan) throw new ChangeError(plan.nothing);
+  return seasonChange(plan, title, reason);
+};
+
+/**
+ * Replaces an approved season. Searches again (Sonarr only grabs from a
+ * recent search) and takes only the releases shown; nothing is grabbed or
+ * removed if any of them is gone.
+ */
+export const applySeasonChange = async (
+  change: ProposedChange
+): Promise<SeasonOutcome> => {
+  const title = change.title;
+  const season = Number(change.params.season);
+  if (!title || !Number.isInteger(season)) {
+    throw new ChangeError('Nothing to replace.');
+  }
+  const approved = approvedFrom(change.params);
+  if (!approved) {
+    return {
+      ok: false,
+      message:
+        'This approval does not name the releases to take, so nothing was grabbed or removed. Ask for the season to be replaced again.',
+      episodeIds: [],
+    };
+  }
+  const api = sonarrOf(title);
+  const plan = await planSeason(api, title.arrId, season, approved);
+  if ('nothing' in plan) {
+    return { ok: false, message: plan.nothing, episodeIds: [] };
+  }
+  return carryOutSeason(api, plan);
+};
+
 // ---- applying --------------------------------------------------------------
 
 const ids = (value: unknown): number[] =>
@@ -344,8 +421,8 @@ const ids = (value: unknown): number[] =>
     : [];
 
 /**
- * Makes an approved change (all but replacing, which the agent's grab
- * does), and says what came of it.
+ * Applies an approved change and says what came of it. Replacing chosen
+ * files is done by the agent's grab instead.
  */
 export const applyChange = async (change: ProposedChange): Promise<string> => {
   const params = change.params;
@@ -367,7 +444,12 @@ export const applyChange = async (change: ProposedChange): Promise<string> => {
       const api = title.kind === 'movie' ? radarrOf(title) : sonarrOf(title);
       const queueIds = ids(params.queueIds);
       if (queueIds.length) {
-        const still = new Set((await api.getQueue()).map((q) => q.id));
+        // Only the title's own downloads, as when it was proposed.
+        const still = new Set(
+          (await api.getQueue())
+            .filter((q) => queuedFor(q, title))
+            .map((q) => q.id)
+        );
         const gone = queueIds.filter((id) => !still.has(id));
         const left = queueIds.filter((id) => still.has(id));
         if (!left.length) {
@@ -390,7 +472,7 @@ export const applyChange = async (change: ProposedChange): Promise<string> => {
       if (title.kind === 'movie') {
         const api = radarrOf(title);
         const movie = await api.movieDetail(title.arrId);
-        // Only the file that was shown: a new one since is not deleted.
+        // Only the file that was shown; a newer one is never deleted.
         if (!movie.movieFile || !fileIds.includes(movie.movieFile.id)) {
           throw new ChangeError(
             'The file has changed since this was proposed; nothing was deleted.'
@@ -430,7 +512,7 @@ export const applyChange = async (change: ProposedChange): Promise<string> => {
         await api.editSeries(title.arrId, { qualityProfileId: profileId });
         if (params.search) {
           // Every monitored episode, with a file or not: the new profile may
-          // want better than what is there.
+          // want better.
           const wanted = (await api.episodes(title.arrId)).filter(
             (ep) => ep.monitored && ep.seasonNumber > 0
           );
@@ -442,6 +524,12 @@ export const applyChange = async (change: ProposedChange): Promise<string> => {
       return `Moved it to ${String(params.profileName)}${params.search ? ' and started a search' : ''}.`;
     }
     case 'replace':
-      throw new ChangeError('Replacing is done by the agent’s grab.');
+    case 'oversizeGrab':
+      throw new ChangeError('Downloading is done by the agent’s grab.');
+    case 'replaceSeason': {
+      const outcome = await applySeasonChange(change);
+      if (!outcome.ok) throw new ChangeError(outcome.message);
+      return outcome.message;
+    }
   }
 };

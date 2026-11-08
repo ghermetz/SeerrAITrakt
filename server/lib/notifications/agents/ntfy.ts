@@ -1,12 +1,17 @@
 import { IssueStatus, IssueTypeName } from '@server/constants/issue';
 import { getIntl } from '@server/i18n';
 import globalMessages from '@server/i18n/globalMessages';
+import {
+  declineReasonOf,
+  escapeMarkdown,
+} from '@server/lib/notifications/declineReason';
 import { eventText } from '@server/lib/notifications/eventTitles';
+import notificationHttp from '@server/lib/notifications/http';
+import { mediaPagePath } from '@server/lib/notifications/mediaPage';
 import type { NotificationAgentNtfy } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import type { AvailableLocale } from '@server/types/languages';
-import axios from 'axios';
 import { Notification, hasNotificationType } from '..';
 import type { NotificationAgent, NotificationPayload } from './agent';
 import { BaseAgent } from './agent';
@@ -44,7 +49,7 @@ class NtfyAgent
 
     const event = eventText(payload, intl);
     const title = event ? `${event} - ${payload.subject}` : payload.subject;
-    let message = payload.message ?? '';
+    let message = payload.message ? escapeMarkdown(payload.message) : '';
 
     if (payload.request) {
       message += `${message ? '\n\n' : ''}**${intl.formatMessage(globalMessages.requestedBy)}:** ${this.escapeMarkdown(payload.request.requestedBy.displayName)}`;
@@ -65,6 +70,7 @@ class NtfyAgent
           status = intl.formatMessage(globalMessages.declined);
           break;
         case Notification.MEDIA_FAILED:
+        case Notification.REQUEST_FAILED:
           status = intl.formatMessage(globalMessages.failed);
           break;
       }
@@ -72,12 +78,17 @@ class NtfyAgent
       if (status) {
         message += `\n**${intl.formatMessage(globalMessages.requestStatus)}:** ${status}`;
       }
+
+      const declineReason = declineReasonOf(type, payload);
+      if (declineReason) {
+        message += `\n**${intl.formatMessage(globalMessages.declineReason)}:** ${escapeMarkdown(declineReason)}`;
+      }
     } else if (payload.comment) {
       message += `\n**${this.escapeMarkdown(
         intl.formatMessage(globalMessages.commentFrom, {
           userName: payload.comment.user.displayName,
         })
-      )}:**\n${payload.comment.message}`;
+      )}:**\n${escapeMarkdown(payload.comment.message)}`;
     } else if (payload.issue) {
       message += `\n\n**${intl.formatMessage(globalMessages.reportedBy)}:** ${this.escapeMarkdown(payload.issue.createdBy.displayName)}`;
       message += `\n**${intl.formatMessage(globalMessages.issueType)}:** ${IssueTypeName[payload.issue.issueType]}`;
@@ -98,7 +109,7 @@ class NtfyAgent
     if (applicationUrl && payload.actionUrl) {
       click = `${applicationUrl}${payload.actionUrl}`;
     } else if (applicationUrl && payload.media) {
-      click = `${applicationUrl}/${payload.media.mediaType}/${payload.media.tmdbId}`;
+      click = `${applicationUrl}${mediaPagePath(payload.media, payload.request)}`;
     }
 
     const ntfyPayload: Record<string, unknown> = {
@@ -166,7 +177,7 @@ class NtfyAgent
         authHeader = `Bearer ${settings.options.token}`;
       }
 
-      await axios.post(
+      await notificationHttp.post(
         settings.options.url,
         this.buildPayload(type, payload),
         authHeader

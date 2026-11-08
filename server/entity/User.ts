@@ -1,14 +1,20 @@
 import { MediaRequestStatus, MediaType } from '@server/constants/media';
+import type { MediaServerKind } from '@server/constants/server';
+import { MEDIA_SERVER_KINDS, USER_ID } from '@server/constants/server';
 import { UserType } from '@server/constants/user';
 import { getRepository } from '@server/datasource';
 import { Watchlist } from '@server/entity/Watchlist';
 import type { QuotaResponse } from '@server/interfaces/api/userInterfaces';
-import PreparedEmail from '@server/lib/email';
+import PreparedEmail, { emailLogoUrl } from '@server/lib/email';
 import type { PermissionCheckOptions } from '@server/lib/permissions';
 import { Permission, hasPermission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
-import { DbAwareColumn, resolveDbType } from '@server/utils/DbColumnHelper';
+import {
+  DbAwareColumn,
+  bigNumber,
+  resolveDbType,
+} from '@server/utils/DbColumnHelper';
 import { AfterDate } from '@server/utils/dateHelpers';
 import bcrypt from 'bcrypt';
 import { randomUUID } from 'crypto';
@@ -29,6 +35,43 @@ import { MediaRequest } from './MediaRequest';
 import { UserPushSubscription } from './UserPushSubscription';
 import { UserSettings } from './UserSettings';
 
+let throwawayHash: Promise<string> | undefined;
+
+/**
+ * Always false, after the same bcrypt work as checking a real password, so an
+ * account without one (or no account) answers as slowly as a wrong password.
+ */
+export const noPasswordMatches = async (password: string): Promise<false> => {
+  throwawayHash ??= bcrypt.hash(randomUUID(), 12);
+  await bcrypt.compare(password, await throwawayHash);
+  return false;
+};
+
+/**
+ * Start of a quota window of `days`; requests after it count. Undefined when
+ * there's no window, so every request counts.
+ */
+export const quotaWindowStart = (days?: number | null): Date | undefined => {
+  if (!days) {
+    return undefined;
+  }
+  const start = new Date();
+  start.setDate(start.getDate() - days);
+  return start;
+};
+
+/**
+ * Whether something asked for at `createdAt` (a movie request, a season or
+ * an album) counts towards a quota of `days`.
+ */
+export const countsTowardsQuota = (
+  createdAt: Date,
+  days?: number | null
+): boolean => {
+  const start = quotaWindowStart(days);
+  return !start || createdAt > start;
+};
+
 @Entity()
 export class User {
   public static filterMany(
@@ -43,15 +86,21 @@ export class User {
     'plexId',
     'password',
     'resetPasswordGuid',
+    'emailVerified',
     'jellyfinDeviceId',
     'jellyfinAuthToken',
+    'embyDeviceId',
+    'embyAuthToken',
     'plexToken',
     'settings',
-    // Whether someone's Plex sign-in lapsed is their business (and admins').
+    // Whether someone's Plex sign-in lapsed is only for them and admins.
     'plexTokenExpiredAt',
   ];
 
   public displayName: string;
+
+  /** Media servers this user has a linked account from. */
+  public linkedServers?: MediaServerKind[];
 
   @PrimaryGeneratedColumn()
   public id: number;
@@ -65,11 +114,22 @@ export class User {
   })
   public email: string;
 
+  /**
+   * False while the email is one the user set on themselves and hasn't
+   * confirmed from it. Such an email gives way to an account a media server
+   * or sign-in provider brings with it.
+   */
+  @Column({ type: 'boolean', default: true })
+  public emailVerified: boolean;
+
   @Column({ type: 'varchar', nullable: true })
   public plexUsername?: string | null;
 
   @Column({ type: 'varchar', nullable: true })
   public jellyfinUsername?: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  public embyUsername?: string | null;
 
   @Column({ nullable: true })
   public username?: string;
@@ -98,10 +158,23 @@ export class User {
   @Column({ type: 'varchar', nullable: true, select: false })
   public jellyfinAuthToken?: string | null;
 
+  @Column({ type: 'varchar', nullable: true })
+  public embyUserId?: string | null;
+
+  @Column({ type: 'varchar', nullable: true, select: false })
+  public embyDeviceId?: string | null;
+
+  @Column({ type: 'varchar', nullable: true, select: false })
+  public embyAuthToken?: string | null;
+
   @Column({ type: 'varchar', nullable: true, select: false })
   public plexToken?: string | null;
 
-  @Column({ type: 'integer', default: 0 })
+  /**
+   * A bigint: Auto-Approve Music is 2^31, beyond an integer column. Postgres
+   * returns bigints as text, so the transformer converts them to numbers.
+   */
+  @Column({ type: 'bigint', default: 0, transformer: bigNumber })
   public permissions = 0;
 
   @Column()
@@ -116,17 +189,16 @@ export class User {
   /**
    * When Plex last rejected this user's token during watchlist sync.
    *
-   * A rejected token silently stops the user's watchlist from syncing, and
-   * nothing told them. This latches on the first rejection so they are
-   * notified once, not every sync, and clears as soon as a fresh token is
+   * A rejected token silently stops their watchlist sync. Set on the first
+   * rejection so they're notified once, and cleared once a fresh token is
    * stored or Plex accepts the old one again.
    */
   @DbAwareColumn({ type: 'datetime', nullable: true })
   public plexTokenExpiredAt?: Date | null;
 
   /**
-   * Request count, filled in by `attachRequestCounts` where it is displayed.
-   * See the note on MediaRequest.seasonCount for why not @RelationCount.
+   * Request count, filled by `attachRequestCounts` where shown. Not
+   * @RelationCount: see MediaRequest.seasonCount.
    */
   public requestCount = 0;
 
@@ -147,6 +219,13 @@ export class User {
 
   @Column({ nullable: true })
   public tvQuotaDays?: number;
+
+  /** Albums, counted like seasons for series. */
+  @Column({ type: 'int', nullable: true })
+  public musicQuotaLimit?: number | null;
+
+  @Column({ type: 'int', nullable: true })
+  public musicQuotaDays?: number | null;
 
   @OneToOne(() => UserSettings, (settings) => settings.user, {
     cascade: true,
@@ -176,19 +255,18 @@ export class User {
     Object.assign(this, init);
   }
 
-  /*
-   * Someone's own settings hold their notification credentials (Pushbullet
-   * and Pushover tokens, Telegram chat, PGP key). The relation is loaded
-   * with every user, so it rode along wherever a user is embedded: a
-   * request's requester, an issue comment's author, a watchlist's owner.
-   * Never sent as part of a user; a route that needs some of them sends
-   * those explicitly. (Upstream GHSA-8j73-j6rc-q8xh.)
-   */
   /**
-   * Left out whenever a user is sent as part of something else: the
-   * requester or approver on a request, an issue's reporter, a comment's
-   * author. Seeing someone's email, Plex id or Plex sign-in state takes
-   * Manage Users (User.filter); /auth/me adds back the signed-in user's own.
+   * Excluded whenever a user is embedded in something else (a request's
+   * requester or approver, an issue's reporter, a comment's author, a
+   * watchlist's owner).
+   *
+   * `settings` holds notification credentials (Pushbullet and Pushover tokens,
+   * Telegram chat, PGP key) and is loaded with every user, so it's never sent
+   * as part of a user; routes that need some of it send it explicitly (upstream
+   * GHSA-8j73-j6rc-q8xh).
+   *
+   * Email, Plex id and Plex sign-in state require Manage Users (User.filter);
+   * /auth/me adds back the signed-in user's own.
    */
   static readonly serializationExcludedFields: string[] = [
     'settings',
@@ -224,14 +302,11 @@ export class User {
     return !!hasPermission(permissions, this.permissions, options);
   }
 
-  public passwordMatch(password: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      if (this.password) {
-        resolve(bcrypt.compare(password, this.password));
-      } else {
-        return resolve(false);
-      }
-    });
+  public async passwordMatch(password: string): Promise<boolean> {
+    if (!this.password) {
+      return noPasswordMatches(password);
+    }
+    return bcrypt.compare(password, this.password);
   }
 
   public async setPassword(password: string): Promise<void> {
@@ -259,6 +334,7 @@ export class User {
           password: password,
           applicationUrl,
           applicationTitle,
+          logoUrl: emailLogoUrl(),
           recipientName: this.username,
         },
       });
@@ -271,19 +347,18 @@ export class User {
   }
 
   /**
-   * A new password reset link, good for a day. Stored by the caller, then
-   * sent with sendResetPasswordEmail.
+   * Creates a password reset link valid for a day. The caller stores it, then
+   * calls sendResetPasswordEmail.
    */
   public newResetPasswordLink(): void {
     this.resetPasswordGuid = randomUUID();
 
-    // 24 hours into the future
     const targetDate = new Date();
     targetDate.setDate(targetDate.getDate() + 1);
     this.recoveryLinkExpirationDate = targetDate;
   }
 
-  /** Emails the reset link; never fails, a failure is logged. */
+  /** Emails the reset link; never throws, failures are logged. */
   public async sendResetPasswordEmail(): Promise<void> {
     const { applicationTitle, applicationUrl } = getSettings().main;
     const resetPasswordLink = `${applicationUrl}/resetpassword/${this.resetPasswordGuid}`;
@@ -302,6 +377,7 @@ export class User {
           resetPasswordLink,
           applicationUrl,
           applicationTitle,
+          logoUrl: emailLogoUrl(),
           recipientName: this.displayName,
           recipientEmail: this.email,
         },
@@ -314,17 +390,23 @@ export class User {
     }
   }
 
-  /*
-   * The name shown for someone wherever they appear, to anyone. Never their
-   * email: that is only for themselves and whoever manages users.
-   */
+  // The name shown for this user everywhere, to anyone. Never their email:
+  // that's only for themselves and user managers.
   @AfterLoad()
   public setDisplayName(): void {
     this.displayName =
       this.username ||
       this.plexUsername ||
       this.jellyfinUsername ||
+      this.embyUsername ||
       `User #${this.id}`;
+  }
+
+  @AfterLoad()
+  public setLinkedServers(): void {
+    this.linkedServers = MEDIA_SERVER_KINDS.filter(
+      (kind) => !!this[USER_ID[kind]]
+    );
   }
 
   public async getQuota(): Promise<QuotaResponse> {
@@ -341,11 +423,7 @@ export class User {
       : 0;
     const movieQuotaDays = this.movieQuotaDays ?? defaultQuotas.movie.quotaDays;
 
-    // Count movie requests made during quota period
-    const movieDate = new Date();
-    if (movieQuotaDays) {
-      movieDate.setDate(movieDate.getDate() - movieQuotaDays);
-    }
+    const movieDate = quotaWindowStart(movieQuotaDays);
 
     const movieQuotaUsed = movieQuotaLimit
       ? await requestRepository.count({
@@ -353,7 +431,7 @@ export class User {
             requestedBy: {
               id: this.id,
             },
-            ...(movieQuotaDays ? { createdAt: AfterDate(movieDate) } : {}),
+            ...(movieDate ? { createdAt: AfterDate(movieDate) } : {}),
             type: MediaType.MOVIE,
             status: Not(MediaRequestStatus.DECLINED),
             ignoreQuota: false,
@@ -366,12 +444,7 @@ export class User {
       : 0;
     const tvQuotaDays = this.tvQuotaDays ?? defaultQuotas.tv.quotaDays;
 
-    // Count tv season requests made during quota period
-    const tvDate = new Date();
-    if (tvQuotaDays) {
-      tvDate.setDate(tvDate.getDate() - tvQuotaDays);
-    }
-    const tvQuotaStartDate = tvDate.toJSON();
+    const tvDate = quotaWindowStart(tvQuotaDays);
     const tvQuotaUsedQuery = requestRepository
       .createQueryBuilder('request')
       .leftJoin('request.requestedBy', 'requestedBy')
@@ -385,12 +458,10 @@ export class User {
         declinedStatus: MediaRequestStatus.DECLINED,
       });
 
-    if (tvQuotaDays) {
-      tvQuotaUsedQuery.andWhere('request.createdAt > :date', {
-        date: tvQuotaStartDate,
-      });
-    }
-
+    // Each season counts from when it was asked for, so one added to an
+    // older request by editing counts too. Pass a Date so the driver writes
+    // it in its stored date format. As ISO text, SQLite compared it as a
+    // string against 'YYYY-MM-DD HH:MM:SS' and dropped the window's first day.
     const tvQuotaUsed = tvQuotaLimit
       ? Number(
           (
@@ -398,14 +469,71 @@ export class User {
               .andWhere('request.ignoreQuota = :ignoreQuota', {
                 ignoreQuota: false,
               })
-              .leftJoin('request.seasons', 'quotaSeason')
+              .leftJoin(
+                'request.seasons',
+                'quotaSeason',
+                tvDate ? 'quotaSeason.createdAt > :date' : undefined,
+                tvDate ? { date: tvDate } : undefined
+              )
               .select('COUNT(quotaSeason.id)', 'seasonCount')
               .getRawOne<{ seasonCount: string | null }>()
           )?.seasonCount ?? 0
         )
       : 0;
 
+    const musicQuotaLimit = !canBypass
+      ? (this.musicQuotaLimit ?? defaultQuotas.music?.quotaLimit)
+      : 0;
+    const musicQuotaDays =
+      this.musicQuotaDays ?? defaultQuotas.music?.quotaDays;
+
+    // Songs count as music, one each, unless Settings → Music gives them their
+    // own limit.
+    const songQuota = getSettings().music.songQuota;
+    const songsApart = !!songQuota?.quotaLimit;
+    const songQuotaLimit = songsApart && !canBypass ? songQuota.quotaLimit : 0;
+    const songQuotaDays = songsApart ? songQuota.quotaDays : undefined;
+
+    // Albums or songs in music requests within the quota window, counted like
+    // seasons for series.
+    const countMusic = async (
+      kind: 'albums' | 'songs',
+      days: number | undefined
+    ): Promise<number> => {
+      const date = quotaWindowStart(days);
+      const query = requestRepository
+        .createQueryBuilder('request')
+        .leftJoin('request.requestedBy', 'requestedBy')
+        .where('request.type = :requestType', {
+          requestType: MediaType.MUSIC,
+        })
+        .andWhere('requestedBy.id = :userId', { userId: this.id })
+        .andWhere('request.status != :declinedStatus', {
+          declinedStatus: MediaRequestStatus.DECLINED,
+        })
+        .andWhere('request.ignoreQuota = :ignoreQuota', { ignoreQuota: false });
+      const counted = await query
+        .leftJoin(
+          `request.${kind}`,
+          'quotaItem',
+          date ? 'quotaItem.createdAt > :date' : undefined,
+          date ? { date } : undefined
+        )
+        .select('COUNT(quotaItem.id)', 'itemCount')
+        .getRawOne<{ itemCount: string | null }>();
+      return Number(counted?.itemCount ?? 0);
+    };
+
+    const musicQuotaUsed = musicQuotaLimit
+      ? (await countMusic('albums', musicQuotaDays)) +
+        (songsApart ? 0 : await countMusic('songs', musicQuotaDays))
+      : 0;
+    const songQuotaUsed = songQuotaLimit
+      ? await countMusic('songs', songQuotaDays)
+      : 0;
+
     return {
+      overQuotaWaits: !!getSettings().main.overQuotaRequests,
       movie: {
         days: movieQuotaDays,
         limit: movieQuotaLimit,
@@ -426,6 +554,32 @@ export class User {
           : undefined,
         restricted: !!(tvQuotaLimit && tvQuotaLimit - tvQuotaUsed <= 0),
       },
+      music: {
+        days: musicQuotaDays,
+        limit: musicQuotaLimit ?? undefined,
+        used: musicQuotaUsed,
+        remaining: musicQuotaLimit
+          ? Math.max(0, musicQuotaLimit - musicQuotaUsed)
+          : undefined,
+        restricted: !!(
+          musicQuotaLimit && musicQuotaLimit - musicQuotaUsed <= 0
+        ),
+      },
+      ...(songsApart
+        ? {
+            song: {
+              days: songQuotaDays,
+              limit: songQuotaLimit || undefined,
+              used: songQuotaUsed,
+              remaining: songQuotaLimit
+                ? Math.max(0, songQuotaLimit - songQuotaUsed)
+                : undefined,
+              restricted: !!(
+                songQuotaLimit && songQuotaLimit - songQuotaUsed <= 0
+              ),
+            },
+          }
+        : {}),
     };
   }
 }

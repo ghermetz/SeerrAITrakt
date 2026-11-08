@@ -1,5 +1,6 @@
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
+import SaveBar from '@app/components/Common/SaveBar';
 import SensitiveInput from '@app/components/Common/SensitiveInput';
 import NotificationTypeSelector from '@app/components/NotificationTypeSelector';
 import useToasts from '@app/hooks/useToasts';
@@ -163,7 +164,7 @@ const NotificationsPushbullet = () => {
                     PushbulletSettingsLink: (msg: React.ReactNode) => (
                       <a
                         href="https://www.pushbullet.com/#settings/account"
-                        className="text-white transition duration-300 hover:underline"
+                        className="text-strong transition duration-300 hover:underline"
                         target="_blank"
                         rel="noreferrer"
                       >
@@ -215,7 +216,7 @@ const NotificationsPushbullet = () => {
                   : undefined
               }
             />
-            <div className="actions">
+            <SaveBar>
               <div className="flex justify-end">
                 <span className="ml-3 inline-flex rounded-md shadow-sm">
                   <Button
@@ -254,7 +255,7 @@ const NotificationsPushbullet = () => {
                   </Button>
                 </span>
               </div>
-            </div>
+            </SaveBar>
           </Form>
         );
       }}

@@ -1,27 +1,31 @@
+import type { BazarrJobLive } from '@server/interfaces/api/subtitlesInterfaces';
 import type { BazarrSettings } from '@server/lib/settings';
 import type { AxiosInstance } from 'axios';
 import axios from 'axios';
 
 /*
- * The part of Bazarr's API Seerr uses. Bazarr knows a movie by its Radarr
- * id and an episode by its Sonarr ids, the same ids Seerr records for a
- * title it sent to Radarr or Sonarr.
+ * Bazarr keys a movie by its Radarr id and an episode by its Sonarr ids, the
+ * same ids Seerr records for titles it sent there.
  *
- * Bazarr answers a manual download only once the subtitle is on disk, and
- * for its Whisper provider that means once the audio is transcribed, which
- * can take many minutes; those calls get a long timeout of their own.
+ * Manual downloads and missing-subtitle searches run as queued jobs: Bazarr
+ * answers once queued, the job may wait behind others, and a Whisper
+ * transcription takes as long as the audio. So each is followed in Bazarr's
+ * job list until it ends. Older Bazarrs without a job list finish the work
+ * before answering and are waited on instead.
  */
 
-/** Long enough for a busy Bazarr, short enough never to hold up a page. */
+/** Long enough for a busy Bazarr, short enough not to hold up a page. */
 const READ_TIMEOUT_MS = 15_000;
-/** A manual search asks every provider Bazarr has. */
+/** A manual search queries every provider. */
 const SEARCH_TIMEOUT_MS = 90_000;
-/** A download, which Bazarr may also sync to the audio. */
+/** Bazarr may also sync a download to the audio. */
 const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
-/** A Whisper transcription of a whole film. */
-const TRANSCRIBE_TIMEOUT_MS = 90 * 60_000;
-/** Bazarr searching every missing subtitle of a series, start to finish. */
-const SEARCH_MISSING_TIMEOUT_MS = 60 * 60_000;
+/** A whole-film Whisper transcription, queue time included. */
+const TRANSCRIBE_TIMEOUT_MS = 24 * 60 * 60_000;
+/** A search for every missing subtitle of a series. */
+const SEARCH_MISSING_TIMEOUT_MS = 2 * 60 * 60_000;
+/** Poll interval for queued Bazarr jobs. */
+export const bazarrJobPoll = { ms: 5_000 };
 
 /** A subtitle Bazarr lists for a movie or episode. */
 export interface BazarrSubtitle {
@@ -84,9 +88,12 @@ export interface BazarrHistoryEntry {
   provider: string | null;
   subtitles_path: string | null;
   language?: { code2: string } | null;
+  /** Bazarr's format: "10/25/26 16:55:00". */
+  parsed_timestamp?: string;
+  description?: string;
 }
 
-/** A result of a manual search, as Bazarr sends it. */
+/** A manual search result as Bazarr sends it. */
 export interface BazarrSearchResult {
   provider: string;
   subtitle: string;
@@ -101,7 +108,82 @@ export interface BazarrSearchResult {
   dont_matches: string[] | null;
 }
 
-/** The provider Bazarr uses to transcribe audio with Whisper. */
+/** A job in Bazarr's queue: a download, search or sync. */
+export interface BazarrJob {
+  job_id: number;
+  /** "Manually downloading Subtitles for …" once running. */
+  job_name: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'canceled' | string;
+  /** Queue time, or start time once running. */
+  last_run_time?: string;
+  /** Whether progress_value/progress_max are kept. */
+  is_progress?: boolean;
+  progress_value?: number;
+  progress_max?: number;
+}
+
+/**
+ * How a Bazarr job ended: finished (or done before Bazarr answered), failed
+ * or canceled, gone from the list (Bazarr restarted), or timed out.
+ */
+export type BazarrJobEnd = 'finished' | 'failed' | 'gone' | 'timedOut';
+
+/** Callbacks while following a job. */
+export interface JobWatch {
+  /** Queued, not started. */
+  onWaiting?: () => void;
+  /** Started. */
+  onRunning?: () => void;
+  /** On every read of Bazarr's queue. */
+  onUpdate?: (live: BazarrJobLive) => void;
+}
+
+/** A job's place in Bazarr's queue, for the title page. */
+export const jobLive = (
+  job: BazarrJob,
+  jobs: BazarrJob[],
+  since: number
+): BazarrJobLive => {
+  const others = jobs.filter((other) => other.job_id !== job.job_id);
+  const running = others.filter((other) => other.status === 'running');
+  const at = (other: BazarrJob) => {
+    const time = Date.parse(other.last_run_time ?? '');
+    return Number.isFinite(time) ? time : undefined;
+  };
+  if (job.status === 'pending') {
+    const started = running
+      .map(at)
+      .filter((time): time is number => time !== undefined);
+    return {
+      state: 'waiting',
+      since: new Date(since).toISOString(),
+      ahead:
+        running.length +
+        others.filter(
+          (other) => other.status === 'pending' && other.job_id < job.job_id
+        ).length,
+      running: running.length,
+      ...(started.length
+        ? { busySince: new Date(Math.min(...started)).toISOString() }
+        : {}),
+    };
+  }
+  const max = Number(job.progress_max) || 0;
+  return {
+    state: 'running',
+    since: new Date(since).toISOString(),
+    ...(job.is_progress && max > 0
+      ? {
+          progress: {
+            value: Math.min(Number(job.progress_value) || 0, max),
+            max,
+          },
+        }
+      : {}),
+  };
+};
+
+/** Bazarr's Whisper transcription provider. */
 export const WHISPER_PROVIDER = 'whisperai';
 
 const bool = (value: boolean | string) =>
@@ -164,6 +246,83 @@ class BazarrAPI {
       timeout,
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     });
+  }
+
+  /** Waiting, running and recently finished jobs. */
+  public async getJobs(): Promise<BazarrJob[]> {
+    const { data } = await this.read<{ data: BazarrJob[] }>('/system/jobs');
+    if (!Array.isArray(data)) {
+      throw new Error('Bazarr: not an API answer');
+    }
+    return data;
+  }
+
+  /**
+   * Makes a request Bazarr runs as a job and follows the job to its end. The
+   * job is the new one whose name `named` accepts, or, if Bazarr already had
+   * it queued, the one waiting or running. Without a job list, the response
+   * itself is the end.
+   */
+  private async asJob(
+    ask: (timeout: number) => Promise<void>,
+    named: (name: string) => boolean,
+    timeout: number,
+    watch: JobWatch = {}
+  ): Promise<BazarrJobEnd> {
+    const before = await this.getJobs().catch(() => undefined);
+    if (!before) {
+      await ask(timeout);
+      return 'finished';
+    }
+    await ask(READ_TIMEOUT_MS * 4);
+    const known = new Set(before.map((job) => job.job_id));
+    const deadline = Date.now() + timeout;
+    let id: number | undefined;
+    let told: string | undefined;
+    let since = Date.now();
+    for (;;) {
+      const jobs = await this.getJobs().catch(() => undefined);
+      if (jobs) {
+        if (id === undefined) {
+          const mine = (list: BazarrJob[]) =>
+            list
+              .filter((job) => named(job.job_name))
+              .sort((a, b) => b.job_id - a.job_id)[0]?.job_id;
+          id =
+            mine(jobs.filter((job) => !known.has(job.job_id))) ??
+            mine(
+              jobs.filter(
+                (job) =>
+                  known.has(job.job_id) &&
+                  (job.status === 'pending' || job.status === 'running')
+              )
+            );
+          if (id === undefined) {
+            // Finished before it was seen.
+            return 'finished';
+          }
+        }
+        const job = jobs.find((j) => j.job_id === id);
+        if (!job) return 'gone';
+        if (job.status === 'completed') return 'finished';
+        if (job.status === 'failed' || job.status === 'canceled') {
+          return 'failed';
+        }
+        if (job.status !== told) {
+          // Bazarr's time when valid, else now.
+          const at = Date.parse(job.last_run_time ?? '');
+          since = Number.isFinite(at) && at <= Date.now() ? at : Date.now();
+        }
+        watch.onUpdate?.(jobLive(job, jobs, since));
+        if (job.status !== told) {
+          told = job.status;
+          if (job.status === 'pending') watch.onWaiting?.();
+          if (job.status === 'running') watch.onRunning?.();
+        }
+      }
+      if (Date.now() >= deadline) return 'timedOut';
+      await new Promise((resolve) => setTimeout(resolve, bazarrJobPoll.ms));
+    }
   }
 
   /** Bazarr's version; also proves the address and API key work. */
@@ -229,8 +388,7 @@ class BazarrAPI {
     return data ?? [];
   }
 
-  /** The providers Bazarr has turned on, by name ("whisperai"). */
-  /** What Bazarr's own System → Status page lists as wrong. */
+  /** Issues from Bazarr's System → Status page. */
   public async getHealth(): Promise<{ object?: string; issue?: string }[]> {
     const { data } = await this.read<{
       data: { object?: string; issue?: string }[];
@@ -238,14 +396,14 @@ class BazarrAPI {
     return Array.isArray(data) ? data : [];
   }
 
+  /** Enabled provider names ("whisperai"). */
   public async getProviders(): Promise<string[]> {
     return (await this.getProviderStatus()).map((provider) => provider.name);
   }
 
   /**
-   * The providers Bazarr has turned on and how each stands: "Good", or the
-   * error that made Bazarr pause it ("ReadTimeout") and when it tries again
-   * ("in 41 minutes").
+   * Enabled providers and their status: "Good", or the error that paused it
+   * ("ReadTimeout") and when Bazarr retries ("in 41 minutes").
    */
   public async getProviderStatus(): Promise<
     { name: string; status?: string; retry?: string }[]
@@ -286,36 +444,95 @@ class BazarrAPI {
     };
   }
 
+  /** Matches manual download jobs at any stage. */
+  private static manualDownload = (name: string) =>
+    name.startsWith('Manually download');
+
+  /**
+   * Matches one title's job: of the kind `kind` accepts and named for the
+   * title (and episode) as Bazarr names it ("… for Show - S01E02 - Title"),
+   * so a concurrent job for another title never matches. If the title is
+   * unknown (Bazarr not answering), matches by kind alone.
+   */
+  private static jobFor(
+    kind: (name: string) => boolean,
+    title: string | undefined,
+    episode?: { season: number; episode: number }
+  ): (name: string) => boolean {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const words = [
+      ...(title ? [title.toLowerCase()] : []),
+      ...(episode ? [`s${pad(episode.season)}e${pad(episode.episode)}`] : []),
+    ];
+    return (name) =>
+      kind(name) && words.every((w) => name.toLowerCase().includes(w));
+  }
+
+  private async movieTitle(radarrId: number): Promise<string | undefined> {
+    return (await this.getMovie(radarrId).catch(() => undefined))?.title;
+  }
+
+  private async seriesTitle(
+    sonarrSeriesId: number
+  ): Promise<string | undefined> {
+    return (await this.getSeries(sonarrSeriesId).catch(() => undefined))?.title;
+  }
+
+  /** A manual download, followed until Bazarr finishes it. */
   public async downloadMovie(
     radarrId: number,
-    choice: DownloadChoice
-  ): Promise<void> {
-    await this.form(
-      'post',
-      '/providers/movies',
-      { radarrid: radarrId, ...this.downloadFields(choice) },
+    choice: DownloadChoice,
+    watch?: JobWatch
+  ): Promise<BazarrJobEnd> {
+    return this.asJob(
+      (timeout) =>
+        this.form(
+          'post',
+          '/providers/movies',
+          { radarrid: radarrId, ...this.downloadFields(choice) },
+          timeout
+        ),
+      BazarrAPI.jobFor(
+        BazarrAPI.manualDownload,
+        await this.movieTitle(radarrId)
+      ),
       choice.provider === WHISPER_PROVIDER
         ? TRANSCRIBE_TIMEOUT_MS
-        : DOWNLOAD_TIMEOUT_MS
+        : DOWNLOAD_TIMEOUT_MS,
+      watch
     );
   }
 
+  /** A manual download, followed until Bazarr finishes it. */
   public async downloadEpisode(
     sonarrSeriesId: number,
     sonarrEpisodeId: number,
-    choice: DownloadChoice
-  ): Promise<void> {
-    await this.form(
-      'post',
-      '/providers/episodes',
-      {
-        seriesid: sonarrSeriesId,
-        episodeid: sonarrEpisodeId,
-        ...this.downloadFields(choice),
-      },
+    choice: DownloadChoice,
+    watch?: JobWatch
+  ): Promise<BazarrJobEnd> {
+    return this.asJob(
+      (timeout) =>
+        this.form(
+          'post',
+          '/providers/episodes',
+          {
+            seriesid: sonarrSeriesId,
+            episodeid: sonarrEpisodeId,
+            ...this.downloadFields(choice),
+          },
+          timeout
+        ),
+      BazarrAPI.jobFor(
+        BazarrAPI.manualDownload,
+        await this.seriesTitle(sonarrSeriesId),
+        (await this.getEpisodes(sonarrSeriesId).catch(() => [])).find(
+          (ep) => ep.sonarrEpisodeId === sonarrEpisodeId
+        )
+      ),
       choice.provider === WHISPER_PROVIDER
         ? TRANSCRIBE_TIMEOUT_MS
-        : DOWNLOAD_TIMEOUT_MS
+        : DOWNLOAD_TIMEOUT_MS,
+      watch
     );
   }
 
@@ -351,23 +568,50 @@ class BazarrAPI {
     });
   }
 
-  /** Bazarr's own search for whatever the movie is missing. */
-  public async searchMissingMovie(radarrId: number): Promise<void> {
-    await this.form(
-      'patch',
-      '/movies',
-      { radarrid: radarrId, action: 'search-missing' },
-      SEARCH_MISSING_TIMEOUT_MS
+  private static missingSearch = (name: string) =>
+    name.startsWith('Downloading missing subtitles');
+
+  /** Bazarr's search for the movie's missing subtitles, followed to its end. */
+  public async searchMissingMovie(
+    radarrId: number,
+    watch?: JobWatch
+  ): Promise<BazarrJobEnd> {
+    return this.asJob(
+      (timeout) =>
+        this.form(
+          'patch',
+          '/movies',
+          { radarrid: radarrId, action: 'search-missing' },
+          timeout
+        ),
+      BazarrAPI.jobFor(
+        BazarrAPI.missingSearch,
+        await this.movieTitle(radarrId)
+      ),
+      SEARCH_MISSING_TIMEOUT_MS,
+      watch
     );
   }
 
-  /** Bazarr's own search for whatever the series is missing. */
-  public async searchMissingSeries(sonarrSeriesId: number): Promise<void> {
-    await this.form(
-      'patch',
-      '/series',
-      { seriesid: sonarrSeriesId, action: 'search-missing' },
-      SEARCH_MISSING_TIMEOUT_MS
+  /** Bazarr's search for the series' missing subtitles, followed to its end. */
+  public async searchMissingSeries(
+    sonarrSeriesId: number,
+    watch?: JobWatch
+  ): Promise<BazarrJobEnd> {
+    return this.asJob(
+      (timeout) =>
+        this.form(
+          'patch',
+          '/series',
+          { seriesid: sonarrSeriesId, action: 'search-missing' },
+          timeout
+        ),
+      BazarrAPI.jobFor(
+        BazarrAPI.missingSearch,
+        await this.seriesTitle(sonarrSeriesId)
+      ),
+      SEARCH_MISSING_TIMEOUT_MS,
+      watch
     );
   }
 }

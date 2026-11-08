@@ -9,6 +9,7 @@ import AddToList from '@app/components/AddToList';
 import BackfillForTitle from '@app/components/Backfill/ForTitle';
 import BackfillTitleButton from '@app/components/Backfill/TitleButton';
 import BlocklistModal from '@app/components/BlocklistModal';
+import Badge from '@app/components/Common/Badge';
 import Button from '@app/components/Common/Button';
 import CachedImage from '@app/components/Common/CachedImage';
 import Flag from '@app/components/Common/Flag';
@@ -18,6 +19,7 @@ import type { PlayButtonLink } from '@app/components/Common/PlayButton';
 import PlayButton from '@app/components/Common/PlayButton';
 import Tag from '@app/components/Common/Tag';
 import Tooltip from '@app/components/Common/Tooltip';
+import TitleDeclineReason from '@app/components/DeclineReason/TitleDeclineReason';
 import { DeletingSoonBadge, KeepButton } from '@app/components/DeletingSoon';
 import ExternalLinkBlock from '@app/components/ExternalLinkBlock';
 import IssueModal from '@app/components/IssueModal';
@@ -25,22 +27,26 @@ import ManageSlideOver from '@app/components/ManageSlideOver';
 import MediaSlider from '@app/components/MediaSlider';
 import PersonCard from '@app/components/PersonCard';
 import PlexMatchWarning from '@app/components/PlexMatchWarning';
+import QualityBadges from '@app/components/QualityBadges';
 import RequestButton from '@app/components/RequestButton';
 import TitleEta from '@app/components/RequestEta/TitleEta';
+import RequestedBy from '@app/components/RequestedBy';
 import Slider from '@app/components/Slider';
 import StatusBadge from '@app/components/StatusBadge';
 import SubtitlesCard from '@app/components/Subtitles/SubtitlesCard';
 import WatchedBy from '@app/components/WatchedBy';
-import useDeepLinks from '@app/hooks/useDeepLinks';
 import useLocale from '@app/hooks/useLocale';
+import usePlayLinks from '@app/hooks/usePlayLinks';
 import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
-import { Permission, UserType, useUser } from '@app/hooks/useUser';
+import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
 import ErrorPage from '@app/pages/_error';
 import blocklistAction from '@app/utils/blocklistAction';
 import { sortCrewPriority } from '@app/utils/creditHelpers';
 import defineMessages from '@app/utils/defineMessages';
+import { titleBackdrop, titlePoster } from '@app/utils/imageSources';
+import { hasAccountOn } from '@app/utils/mediaServerAccounts';
 import {
   refreshIntervalHelper,
   watchMedia,
@@ -178,12 +184,11 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
     []
   );
 
-  const { mediaUrl: plexUrl, mediaUrl4k: plexUrl4k } = useDeepLinks({
-    mediaUrl: data?.mediaInfo?.mediaUrl,
-    mediaUrl4k: data?.mediaInfo?.mediaUrl4k,
-    iOSPlexUrl: data?.mediaInfo?.iOSPlexUrl,
-    iOSPlexUrl4k: data?.mediaInfo?.iOSPlexUrl4k,
-  });
+  const {
+    links: playLinks,
+    playLink,
+    playLink4k,
+  } = usePlayLinks(data?.mediaInfo);
 
   if (!data && !error) {
     return <MediaPageSkeleton />;
@@ -196,30 +201,41 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
   const showAllStudios = data.productionCompanies.length <= minStudios + 1;
   const mediaLinks: PlayButtonLink[] = [];
 
+  // One Play button per server with the movie, the viewer's own first.
   if (
-    plexUrl &&
     hasPermission([Permission.REQUEST, Permission.REQUEST_MOVIE], {
       type: 'or',
     })
   ) {
-    mediaLinks.push({
-      text: getAvailableMediaServerName(),
-      url: plexUrl,
-      svg: <PlayIcon />,
+    playLinks.forEach((link) => {
+      if (link.url) {
+        mediaLinks.push({
+          text: intl.formatMessage(messages.play, {
+            mediaServerName: link.name,
+          }),
+          url: link.url,
+          svg: <PlayIcon />,
+        });
+      }
     });
   }
 
   if (
     settings.currentSettings.movie4kEnabled &&
-    plexUrl4k &&
     hasPermission([Permission.REQUEST_4K, Permission.REQUEST_4K_MOVIE], {
       type: 'or',
     })
   ) {
-    mediaLinks.push({
-      text: getAvailable4kMediaServerName(),
-      url: plexUrl4k,
-      svg: <PlayIcon />,
+    playLinks.forEach((link) => {
+      if (link.url4k) {
+        mediaLinks.push({
+          text: intl.formatMessage(messages.play4k, {
+            mediaServerName: link.name,
+          }),
+          url: link.url4k,
+          svg: <PlayIcon />,
+        });
+      }
     });
   }
 
@@ -251,13 +267,8 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
     (r) => r.iso_3166_1 === discoverRegion
   )?.release_dates;
 
-  // Release date types:
-  // 1. Premiere
-  // 2. Theatrical (limited)
-  // 3. Theatrical
-  // 4. Digital
-  // 5. Physical
-  // 6. TV
+  // TMDB release types: 1 premiere, 2 limited theatrical, 3 theatrical,
+  // 4 digital, 5 physical, 6 TV.
   const filteredReleases = uniqBy(
     releases?.filter((r) => r.type > 2 && r.type < 6),
     'type'
@@ -310,30 +321,6 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
     data?.watchProviders?.find(
       (provider) => provider.iso_3166_1 === streamingRegion
     )?.flatrate ?? [];
-
-  function getAvailableMediaServerName() {
-    if (settings.currentSettings.mediaServerType === MediaServerType.EMBY) {
-      return intl.formatMessage(messages.play, { mediaServerName: 'Emby' });
-    }
-
-    if (settings.currentSettings.mediaServerType === MediaServerType.PLEX) {
-      return intl.formatMessage(messages.play, { mediaServerName: 'Plex' });
-    }
-
-    return intl.formatMessage(messages.play, { mediaServerName: 'Jellyfin' });
-  }
-
-  function getAvailable4kMediaServerName() {
-    if (settings.currentSettings.mediaServerType === MediaServerType.EMBY) {
-      return intl.formatMessage(messages.play4k, { mediaServerName: 'Emby' });
-    }
-
-    if (settings.currentSettings.mediaServerType === MediaServerType.PLEX) {
-      return intl.formatMessage(messages.play4k, { mediaServerName: 'Plex' });
-    }
-
-    return intl.formatMessage(messages.play4k, { mediaServerName: 'Jellyfin' });
-  }
 
   const onClickWatchlistBtn = async (): Promise<void> => {
     setIsUpdating(true);
@@ -419,7 +406,7 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
         { appearance: 'success', autoDismiss: true }
       );
 
-      // Blocklisted, but a Radarr/Sonarr removal did not go through.
+      // Blocklisted, but a Radarr/Sonarr removal failed.
       const failed = res.data?.failed ?? [];
       if (failed.length) {
         addToast(
@@ -475,18 +462,12 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
           <CachedImage
             type="tmdb"
             alt=""
-            src={`https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${data.backdropPath}`}
+            src={titleBackdrop(data.backdropPath)}
             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
             fill
             priority
           />
-          <div
-            className="absolute inset-0"
-            style={{
-              backgroundImage:
-                'linear-gradient(180deg, rgba(17, 24, 39, 0.47) 0%, rgba(17, 24, 39, 1) 100%)',
-            }}
-          />
+          <div className="media-page-fade" />
         </div>
       )}
       <PageTitle title={data.title} />
@@ -518,13 +499,13 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
         isUpdating={isBlocklistUpdating}
         removesFiles={blocklist.removesFiles}
       />
-      <div className="media-header">
-        <div className="media-poster">
+      <div className="media-header" data-seerr="title-header">
+        <div className="media-poster" data-seerr="poster">
           <CachedImage
             type="tmdb"
             src={
               data.posterPath
-                ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${data.posterPath}`
+                ? titlePoster(data.posterPath)
                 : '/images/seerr_poster_not_found.png'
             }
             alt=""
@@ -538,6 +519,11 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
         <div className="media-title">
           <div className="media-status">
             <DeletingSoonBadge tmdbId={data.id} mediaType="movie" />
+            {data.mediaInfo?.outsideLibraries && (
+              <Badge badgeType="dark">
+                {intl.formatMessage(globalMessages.notInYourLibraries)}
+              </Badge>
+            )}
             <StatusBadge
               status={data.mediaInfo?.status}
               downloadItem={data.mediaInfo?.downloadStatus}
@@ -545,9 +531,10 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
               inProgress={(data.mediaInfo?.downloadStatus ?? []).length > 0}
               tmdbId={data.mediaInfo?.tmdbId}
               mediaType="movie"
-              plexUrl={plexUrl}
+              playLink={playLink}
               serviceUrl={data.mediaInfo?.serviceUrl}
             />
+            <QualityBadges quality={data.mediaInfo?.availableQuality} />
             {settings.currentSettings.movie4kEnabled &&
               hasPermission(
                 [
@@ -559,19 +546,22 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
                   type: 'or',
                 }
               ) && (
-                <StatusBadge
-                  status={data.mediaInfo?.status4k}
-                  downloadItem={data.mediaInfo?.downloadStatus4k}
-                  title={data.title}
-                  is4k
-                  inProgress={
-                    (data.mediaInfo?.downloadStatus4k ?? []).length > 0
-                  }
-                  tmdbId={data.mediaInfo?.tmdbId}
-                  mediaType="movie"
-                  plexUrl={plexUrl4k}
-                  serviceUrl={data.mediaInfo?.serviceUrl4k}
-                />
+                <>
+                  <StatusBadge
+                    status={data.mediaInfo?.status4k}
+                    downloadItem={data.mediaInfo?.downloadStatus4k}
+                    title={data.title}
+                    is4k
+                    inProgress={
+                      (data.mediaInfo?.downloadStatus4k ?? []).length > 0
+                    }
+                    tmdbId={data.mediaInfo?.tmdbId}
+                    mediaType="movie"
+                    playLink={playLink4k}
+                    serviceUrl={data.mediaInfo?.serviceUrl4k}
+                  />
+                  <QualityBadges quality={data.mediaInfo?.availableQuality4k} />
+                </>
               )}
           </div>
           <h1 data-testid="media-title">
@@ -598,6 +588,7 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
             requests={data.mediaInfo?.requests}
             media={data.mediaInfo}
           />
+          <TitleDeclineReason requests={data.mediaInfo?.requests} />
         </div>
         <div className="media-actions">
           {blocklist.show && (
@@ -615,7 +606,8 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
             </Tooltip>
           )}
           {data?.mediaInfo?.status !== MediaStatus.BLOCKLISTED &&
-            user?.userType !== UserType.PLEX && (
+            // Plex users keep their watchlist on Plex.
+            !hasAccountOn(user, 'plex') && (
               <>
                 {toggleWatchlist ? (
                   <Tooltip
@@ -630,7 +622,9 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
                       {isUpdating ? (
                         <Spinner />
                       ) : (
-                        <StarIcon className={'text-amber-300'} />
+                        <StarIcon
+                          className={'text-amber-300 light:text-amber-600'}
+                        />
                       )}
                     </Button>
                   </Tooltip>
@@ -693,7 +687,7 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
             data.mediaInfo?.externalServiceId != null &&
             data.mediaInfo.serviceId != null && (
               <BackfillTitleButton
-                tmdbId={data.id}
+                id={data.id}
                 target={{
                   kind: 'movie',
                   serverId: data.mediaInfo.serviceId,
@@ -706,6 +700,8 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
             data.mediaInfo &&
             (data.mediaInfo.jellyfinMediaId ||
               data.mediaInfo.jellyfinMediaId4k ||
+              data.mediaInfo.embyMediaId ||
+              data.mediaInfo.embyMediaId4k ||
               data.mediaInfo.status !== MediaStatus.UNKNOWN ||
               data.mediaInfo.status4k !== MediaStatus.UNKNOWN) && (
               <Tooltip content={intl.formatMessage(messages.managemovie)}>
@@ -760,7 +756,7 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
               <div className="mt-4 flex justify-end">
                 <Link
                   href={`/movie/${data.id}/crew`}
-                  className="flex items-center text-gray-400 transition duration-300 hover:text-gray-100"
+                  className="flex items-center text-muted transition duration-300 hover:text-gray-100"
                 >
                   <span>{intl.formatMessage(messages.viewfullcrew)}</span>
                   <ArrowRightCircleIcon className="ml-1.5 inline-block h-5 w-5" />
@@ -791,7 +787,9 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
                 mediaType="movie"
                 tmdbId={data.id}
                 itemKey={
-                  data.mediaInfo.ratingKey ?? data.mediaInfo.jellyfinMediaId
+                  data.mediaInfo.ratingKey ??
+                  data.mediaInfo.jellyfinMediaId ??
+                  data.mediaInfo.embyMediaId
                 }
               />
             )}
@@ -799,7 +797,7 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
             data.mediaInfo?.externalServiceId != null &&
             data.mediaInfo.serviceId != null && (
               <BackfillForTitle
-                tmdbId={data.id}
+                id={data.id}
                 target={{
                   kind: 'movie',
                   serverId: data.mediaInfo.serviceId,
@@ -810,7 +808,7 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
           {data.collection && (
             <div className="mb-6">
               <Link href={`/collection/${data.collection.id}`}>
-                <div className="group relative z-0 scale-100 transform-gpu cursor-pointer overflow-hidden rounded-lg bg-gray-800 bg-cover bg-center shadow-md ring-1 ring-gray-700 transition duration-300 hover:scale-105 hover:ring-gray-500">
+                <div className="group relative z-0 scale-100 transform-gpu cursor-pointer overflow-hidden rounded-lg bg-surface bg-cover bg-center shadow-md ring-1 ring-subtle transition duration-300 hover:scale-105 hover:ring-gray-500">
                   <div className="absolute inset-0 z-0">
                     <CachedImage
                       type="tmdb"
@@ -827,11 +825,11 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
                       className="absolute inset-0"
                       style={{
                         backgroundImage:
-                          'linear-gradient(180deg, rgba(31, 41, 55, 0.47) 0%, rgba(31, 41, 55, 0.80) 100%)',
+                          'linear-gradient(180deg, rgb(var(--media-scrim-raised) / 0.47) 0%, rgb(var(--media-scrim-raised) / 0.8) 100%)',
                       }}
                     />
                   </div>
-                  <div className="relative z-10 flex h-full items-center justify-between p-4 text-gray-200 transition duration-300 group-hover:text-white">
+                  <div className="relative z-10 flex h-full items-center justify-between p-4 text-gray-200 transition duration-300 group-hover:text-on-media light:text-on-media/90">
                     <div>{data.collection.name}</div>
                     <Button buttonSize="sm">
                       {intl.formatMessage(globalMessages.view)}
@@ -944,6 +942,7 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
               <span>{intl.formatMessage(globalMessages.status)}</span>
               <span className="media-fact-value">{data.status}</span>
             </div>
+            <RequestedBy requests={data.mediaInfo?.requests} />
             <WatchedBy mediaId={data.mediaInfo?.id} isShow={false} />
             {filteredReleases && filteredReleases.length > 0 ? (
               <div className="media-fact">
@@ -1175,9 +1174,7 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
                 tvdbId={data.externalIds.tvdbId}
                 imdbId={data.externalIds.imdbId}
                 rtUrl={ratingData?.rt?.url}
-                mediaUrl={
-                  data.mediaInfo?.mediaUrl ?? data.mediaInfo?.mediaUrl4k
-                }
+                playLinks={playLinks}
               />
             </div>
           </div>

@@ -1,11 +1,32 @@
+import type { JellyfinLoginResponse } from '@server/api/jellyfin';
 import JellyfinAPI from '@server/api/jellyfin';
 import PlexTvAPI from '@server/api/plextv';
+import type {
+  ApiKeyCreatedResponse,
+  ApiKeyLifetime,
+  ApiKeyListResponse,
+  SiriKeyResponse,
+} from '@server/constants/apiKeys';
+import {
+  API_KEY_LIFETIMES,
+  DEFAULT_API_KEY_LIFETIME,
+  MAX_API_KEYS_PER_PERSON,
+  MAX_API_KEY_NAME_LENGTH,
+} from '@server/constants/apiKeys';
 import { ApiErrorCode } from '@server/constants/error';
-import { MediaServerType } from '@server/constants/server';
+import {
+  cleanNavHidden,
+  cleanNavOrder,
+  isDefaultNavOrder,
+} from '@server/constants/navigation';
+import { cleanDefaultProfiles } from '@server/constants/requestDefaults';
+import { cleanAppearance } from '@server/constants/theme';
 import { UserType } from '@server/constants/user';
 import { getRepository } from '@server/datasource';
 import DiscoverSlider from '@server/entity/DiscoverSlider';
+import OidcLink from '@server/entity/OidcLink';
 import { User } from '@server/entity/User';
+import UserApiKey from '@server/entity/UserApiKey';
 import UserPasskey from '@server/entity/UserPasskey';
 import { UserSettings } from '@server/entity/UserSettings';
 import type {
@@ -16,34 +37,64 @@ import {
   DiscoverNetworksError,
   sanitizeDiscoverNetworks,
 } from '@server/lib/discoverNetworks';
-import { cleanFeatureList } from '@server/lib/features';
+import { sendEmailConfirmation } from '@server/lib/emailConfirmation';
+import { cleanFeatureList, featureEnabled } from '@server/lib/features';
 import { mayEditUser, mayManageUser } from '@server/lib/manageUser';
+import type {
+  JellyfinFamilyKind,
+  MediaServerKind,
+} from '@server/lib/mediaServers';
+import {
+  USERNAME,
+  USER_ID,
+  USER_TYPE,
+  connectedServers,
+  hostnameFor,
+  isConnected,
+  isJellyfinFamily,
+  jellyfinAccountColumns,
+  jellyfinFamily,
+  primaryServer,
+  serverName,
+} from '@server/lib/mediaServers';
+import { Notification } from '@server/lib/notifications';
+import { linkUsable, usableProviderLinks } from '@server/lib/oidc';
 import { passkeySummary } from '@server/lib/passkeys';
 import { Permission } from '@server/lib/permissions';
+import {
+  apiKeyStatus,
+  expiresAtFor,
+  keySummary,
+  makeKey,
+} from '@server/lib/personalApiKeys';
+import { cleanSeasonNote, seasonNoteValue } from '@server/lib/seasons';
 import { getSettings } from '@server/lib/settings';
 import { endSessions } from '@server/lib/signIn';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
 import { quickConnectSecret } from '@server/routes/auth';
 import { ApiError } from '@server/types/error';
-import { getHostname } from '@server/utils/getHostname';
 import {
   isOwnProfile,
   isOwnProfileOrAdmin,
 } from '@server/utils/profileMiddleware';
-import type { Request } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import { Router } from 'express';
+import gravatarUrl from 'gravatar-url';
 import net from 'net';
-import { Not } from 'typeorm';
+import { IsNull, LessThan, MoreThan, Not } from 'typeorm';
 import { canMakePermissionsChange } from '.';
+import personalCssRoutes from './customCss';
 
 /**
- * Trakt usernames: letters, digits, dots, dashes and underscores, and not
- * only dots ("." and ".." would change which Trakt page is read).
+ * Trakt usernames: letters, digits, dots, dashes and underscores, not only
+ * dots ("." and ".." would change which Trakt page is read).
  */
 const TRAKT_USERNAME = /^(?=.*[\w-])[\w.-]{1,64}$/;
 
 const userSettingsRoutes = Router({ mergeParams: true });
+
+userSettingsRoutes.use('/css', personalCssRoutes);
 
 userSettingsRoutes.get<{ id: string }, UserSettingsGeneralResponse>(
   '/main',
@@ -74,13 +125,18 @@ userSettingsRoutes.get<{ id: string }, UserSettingsGeneralResponse>(
         movieQuotaDays: user.movieQuotaDays,
         tvQuotaLimit: user.tvQuotaLimit,
         tvQuotaDays: user.tvQuotaDays,
+        musicQuotaLimit: user.musicQuotaLimit,
+        musicQuotaDays: user.musicQuotaDays,
         globalMovieQuotaDays: defaultQuotas.movie.quotaDays,
         globalMovieQuotaLimit: defaultQuotas.movie.quotaLimit,
         globalTvQuotaDays: defaultQuotas.tv.quotaDays,
         globalTvQuotaLimit: defaultQuotas.tv.quotaLimit,
+        globalMusicQuotaDays: defaultQuotas.music?.quotaDays,
+        globalMusicQuotaLimit: defaultQuotas.music?.quotaLimit,
         watchlistSyncMovies: user.settings?.watchlistSyncMovies,
         watchlistSyncTv: user.settings?.watchlistSyncTv,
         traktUsername: user.settings?.traktUsername ?? null,
+        defaultProfiles: user.settings?.defaultProfiles ?? [],
       });
     } catch (e) {
       next({ status: 500, message: e.message });
@@ -104,8 +160,8 @@ userSettingsRoutes.post<
       return next({ status: 404, message: 'User not found.' });
     }
 
-    // Only the owner changes the owner's settings, or another admin's: an
-    // admin's email is where their password reset link goes.
+    // Only the owner changes the owner's or another admin's settings: an
+    // admin's email receives their password reset link.
     if (!mayEditUser(req.user, user)) {
       return next({
         status: 403,
@@ -114,9 +170,31 @@ userSettingsRoutes.post<
     }
 
     const oldEmail = user.email;
+    // The email receives password reset links, so as with a password, a key
+    // can't change it: never a personal key, and the server's key only for
+    // another user. Leaving it out, or the same address in other case, keeps it.
+    const byKey =
+      req.authMethod === 'personalKey' ||
+      (req.authMethod !== 'session' && req.user?.id === user.id);
+    const sameEmail = (a?: string, b?: string) =>
+      (a ?? '').toLowerCase() === (b ?? '').toLowerCase();
     user.username = req.body.username;
     if (user.userType !== UserType.PLEX) {
-      user.email = req.body.email || user.jellyfinUsername || user.email;
+      user.email =
+        byKey && (!req.body.email || sameEmail(req.body.email, oldEmail))
+          ? oldEmail
+          : req.body.email ||
+            user.jellyfinUsername ||
+            user.embyUsername ||
+            user.email;
+    }
+
+    if (byKey && !sameEmail(oldEmail, user.email)) {
+      return next({
+        status: 403,
+        message:
+          'An email address can only be changed while signed in, not with a key.',
+      });
     }
 
     const existingUser = await userRepository.findOne({
@@ -127,7 +205,20 @@ userSettingsRoutes.post<
       throw new ApiError(400, ApiErrorCode.InvalidEmail);
     }
 
-    // Update quota values only if the user has the correct permissions
+    // An email someone sets on themselves is unconfirmed until confirmed from
+    // the link sent to it. One the owner or a user manager sets, the owner's
+    // own, or their server username counts as confirmed.
+    const emailChanged = !sameEmail(oldEmail, user.email);
+    if (emailChanged) {
+      user.emailVerified =
+        user.id === 1 ||
+        req.user?.id !== user.id ||
+        [user.jellyfinUsername, user.embyUsername].some((name) =>
+          sameEmail(name ?? undefined, user.email)
+        );
+    }
+
+    // Only user managers may change quotas.
     if (
       !user.hasPermission(Permission.MANAGE_USERS) &&
       req.user?.id !== user.id
@@ -136,9 +227,11 @@ userSettingsRoutes.post<
       user.movieQuotaLimit = req.body.movieQuotaLimit;
       user.tvQuotaDays = req.body.tvQuotaDays;
       user.tvQuotaLimit = req.body.tvQuotaLimit;
+      user.musicQuotaDays = req.body.musicQuotaDays;
+      user.musicQuotaLimit = req.body.musicQuotaLimit;
     }
 
-    // A Trakt username as Trakt writes them; blank clears it.
+    // A Trakt username in Trakt's format; blank clears it.
     const traktUsername =
       typeof req.body.traktUsername === 'string'
         ? req.body.traktUsername.trim()
@@ -150,9 +243,20 @@ userSettingsRoutes.post<
       });
     }
 
+    // Saved profiles for servers that exist; left out keeps them.
+    const defaultProfiles =
+      req.body.defaultProfiles === undefined
+        ? undefined
+        : cleanDefaultProfiles(req.body.defaultProfiles).filter((entry) =>
+            (getSettings()[entry.service] ?? []).some(
+              (server) => server.id === entry.serverId
+            )
+          );
+
     if (!user.settings) {
       user.settings = new UserSettings({
-        user: req.user,
+        user,
+        defaultProfiles,
         locale: req.body.locale,
         discoverRegion: req.body.discoverRegion,
         streamingRegion: req.body.streamingRegion,
@@ -171,9 +275,15 @@ userSettingsRoutes.post<
       if (traktUsername !== undefined) {
         user.settings.traktUsername = traktUsername || null;
       }
+      if (defaultProfiles !== undefined) {
+        user.settings.defaultProfiles = defaultProfiles;
+      }
     }
 
     const savedUser = await userRepository.save(user);
+    if (emailChanged && !savedUser.emailVerified) {
+      void sendEmailConfirmation(savedUser);
+    }
 
     return res.status(200).json({
       username: savedUser.username,
@@ -184,6 +294,7 @@ userSettingsRoutes.post<
       watchlistSyncMovies: savedUser.settings?.watchlistSyncMovies,
       watchlistSyncTv: savedUser.settings?.watchlistSyncTv,
       traktUsername: savedUser.settings?.traktUsername ?? null,
+      defaultProfiles: savedUser.settings?.defaultProfiles ?? [],
       email: savedUser.email,
     });
   } catch (e) {
@@ -255,15 +366,26 @@ userSettingsRoutes.post<
       });
     }
 
-    // If the user has the permission to manage users and they are not
-    // editing themselves, we will just set the new password
+    // A key can't set a sign-in password: never a personal key, and the
+    // server's key only for another user, as an admin would.
+    if (
+      req.authMethod === 'personalKey' ||
+      (req.authMethod !== 'session' && req.user?.id === user.id)
+    ) {
+      return next({
+        status: 403,
+        message: 'A password can only be set while signed in, not with a key.',
+      });
+    }
+
+    // A user manager editing someone else sets it without the current one.
     if (
       req.user?.hasPermission(Permission.MANAGE_USERS) &&
       req.user?.id !== user.id
     ) {
       await user.setPassword(req.body.newPassword);
       await userRepository.update(user.id, { password: user.password });
-      // Signed out everywhere: the new password is the only way back in.
+      // Sign out everywhere: the new password is the only way back in.
       await endSessions(user.id);
       logger.debug('Password overriden by user.', {
         label: 'User Settings',
@@ -273,8 +395,8 @@ userSettingsRoutes.post<
       return res.status(204).send();
     }
 
-    // If the user has a password, we need to check the currentPassword is
-    // correct. Only the copy loaded with the password has it.
+    // Check currentPassword when one is set; only the copy loaded with the
+    // password has it.
     if (
       userWithPassword.password &&
       (!req.body.currentPassword ||
@@ -289,7 +411,7 @@ userSettingsRoutes.post<
 
     await user.setPassword(req.body.newPassword);
     await userRepository.update(user.id, { password: user.password });
-    // Signed out everywhere else; this session stays.
+    // Sign out everywhere else; this session stays.
     await endSessions(user.id, req.sessionID);
 
     return res.status(204).send();
@@ -298,51 +420,294 @@ userSettingsRoutes.post<
   }
 });
 
-userSettingsRoutes.post<{ authToken: string }>(
+/*
+ * Linked accounts: one per connected media server. Linking needs a sign-in
+ * there, an account no other user has, and access to that server. It changes
+ * the account type only for a password-only account.
+ */
+
+/**
+ * Session only, never a key: linking a sign-in or setting a password would
+ * let a possibly leaked key become a full sign-in.
+ */
+const signedInOnly = (req: Request, _res: Response, next: NextFunction) =>
+  req.authMethod === 'session'
+    ? next()
+    : next({
+        status: 403,
+        message: 'This can only be done while signed in, not with a key.',
+      });
+
+/** The address Jellyfin and Emby are told a sign-in comes from. */
+const clientIpOf = (req: Request): string | undefined => {
+  const ip = req.ip;
+  if (ip && net.isIPv4(ip)) {
+    return ip;
+  }
+  if (ip && net.isIPv6(ip)) {
+    return ip.startsWith('::ffff:') ? ip.substring(7) : ip;
+  }
+  return undefined;
+};
+
+/** The device id Seerr signs in to Jellyfin or Emby with for this user. */
+const deviceIdFor = (user: User): string =>
+  Buffer.from(
+    user.id === 1 ? 'BOT_seerr' : `BOT_seerr_${user.username ?? ''}`
+  ).toString('base64');
+
+/**
+ * The server POST and DELETE /linked-accounts/jellyfin act on: Jellyfin, or
+ * Emby when it is the one connected (for callers from before Emby had its
+ * own routes).
+ */
+const jellyfinRouteKind = (user?: Partial<User>): JellyfinFamilyKind =>
+  user?.jellyfinUserId || isConnected('jellyfin') || !isConnected('emby')
+    ? 'jellyfin'
+    : 'emby';
+
+/** Links a Jellyfin or Emby account the user signed in to. */
+const linkJellyfinAccount = async (
+  user: User,
+  kind: JellyfinFamilyKind,
+  account: JellyfinLoginResponse,
+  deviceId: string
+): Promise<{ status: number; body?: unknown }> => {
+  const userRepository = getRepository(User);
+
+  if (
+    await userRepository.exist({
+      where: { [USER_ID[kind]]: account.User.Id },
+    })
+  ) {
+    return {
+      status: 422,
+      body: {
+        message: 'The specified account is already linked to a Seerr user',
+      },
+    };
+  }
+
+  if (account.User.Policy?.IsDisabled) {
+    return {
+      status: 403,
+      body: {
+        code: ApiErrorCode.AccountDisabled,
+        message: `This ${serverName(kind)} account is switched off.`,
+      },
+    };
+  }
+
+  await userRepository.update(user.id, {
+    ...jellyfinAccountColumns(kind, {
+      userId: account.User.Id,
+      username: account.User.Name,
+      authToken: account.AccessToken,
+      deviceId,
+    }),
+    // Only a password account takes this server's account type.
+    ...(user.userType === UserType.LOCAL ? { userType: USER_TYPE[kind] } : {}),
+  });
+
+  return { status: 204 };
+};
+
+/**
+ * Unlinks a media server account if the user can still sign in afterwards
+ * (password, another connected server's account, or an enabled single
+ * sign-on provider). The owner keeps their primary server account, and
+ * their Plex account while Plex is connected: Seerr reaches Plex with it.
+ */
+const unlinkAccount = async (
+  req: Request,
+  userId: number,
+  kind: MediaServerKind
+): Promise<{ status: number; body?: unknown }> => {
+  const userRepository = getRepository(User);
+  const user = await userRepository
+    .createQueryBuilder('user')
+    .addSelect('user.password')
+    .where({ id: userId })
+    .getOne();
+
+  if (!user) {
+    return { status: 404, body: { message: 'User not found.' } };
+  }
+
+  // Only the owner may unlink another admin's account.
+  if (!mayEditUser(req.user, user)) {
+    return {
+      status: 403,
+      body: {
+        message: "You do not have permission to modify this user's settings.",
+      },
+    };
+  }
+
+  if (user.id === 1 && kind === primaryServer()) {
+    return {
+      status: 400,
+      body: {
+        message: `The owner's ${serverName(kind)} account cannot be unlinked while ${serverName(kind)} is the primary media server.`,
+      },
+    };
+  }
+  if (user.id === 1 && kind === 'plex' && isConnected('plex')) {
+    return {
+      status: 400,
+      body: {
+        message:
+          "The owner's Plex account cannot be unlinked while Plex is connected: Seerr reaches Plex with it.",
+      },
+    };
+  }
+  // A Jellyfin or Emby server with no account chosen for Seerr is read as
+  // the owner's (jellyfinAdmin); without it, scans fail.
+  if (
+    user.id === 1 &&
+    isJellyfinFamily(kind) &&
+    isConnected(kind) &&
+    !jellyfinFamily(kind).adminUserId
+  ) {
+    return {
+      status: 400,
+      body: {
+        message: `The owner's ${serverName(kind)} account cannot be unlinked while Seerr reads ${serverName(kind)} as it. Reconnect ${serverName(kind)} in Settings → Media Servers with another administrator first.`,
+      },
+    };
+  }
+
+  const others = connectedServers().filter(
+    (other) => other !== kind && !!user[USER_ID[other]]
+  );
+  if (
+    !user.password &&
+    others.length === 0 &&
+    (await usableProviderLinks(user.id)).length === 0
+  ) {
+    return {
+      status: 400,
+      body: {
+        message:
+          'Set a password first, or link another account: without one this person could not sign in.',
+      },
+    };
+  }
+
+  const changes: Partial<User> =
+    kind === 'plex'
+      ? {
+          plexId: null,
+          plexUsername: null,
+          plexToken: null,
+          plexTokenExpiredAt: null,
+        }
+      : jellyfinAccountColumns(kind, {
+          userId: null,
+          username: null,
+          authToken: null,
+          deviceId: null,
+        });
+
+  // The account type moves to another linked account, primary server
+  // first, else it becomes a password account.
+  if (user.userType === USER_TYPE[kind]) {
+    const next = others[0];
+    changes.userType = next ? USER_TYPE[next] : UserType.LOCAL;
+    if (next && isJellyfinFamily(next)) {
+      changes.avatar = `/avatarproxy/${user[USER_ID[next]]}`;
+    } else if (!next && user.avatar.startsWith('/avatarproxy/')) {
+      // The avatar came from the account being unlinked.
+      changes.avatar = gravatarUrl(user.email || 'none', {
+        default: 'mm',
+        size: 200,
+      });
+    }
+  }
+
+  await userRepository.update(user.id, changes);
+  // Whoever signed in through that account must not stay signed in.
+  await endSessions(
+    user.id,
+    req.user?.id === user.id ? req.sessionID : undefined
+  );
+  return { status: 204 };
+};
+
+userSettingsRoutes.post<{ id: string }>(
   '/linked-accounts/plex',
   isOwnProfile(),
+  signedInOnly,
   async (req, res) => {
-    const settings = getSettings();
     const userRepository = getRepository(User);
+    const user = req.user;
 
-    if (!req.user) {
+    if (!user) {
       return res.status(404).json({ code: ApiErrorCode.Unauthorized });
     }
-    // Make sure Plex login is enabled
-    if (settings.main.mediaServerType !== MediaServerType.PLEX) {
+    if (!isConnected('plex')) {
       return res.status(500).json({ message: 'Plex login is disabled' });
     }
 
-    // First we need to use this auth token to get the user's email from plex.tv
-    const plextv = new PlexTvAPI(req.body.authToken);
-    const account = await plextv.getUser();
+    try {
+      const account = await new PlexTvAPI(req.body.authToken).getUser();
 
-    // Do not allow linking of an already linked account
-    if (await userRepository.exist({ where: { plexId: account.id } })) {
-      return res.status(422).json({
-        message: 'This Plex account is already linked to a Seerr user',
+      // Refuse an account that is already linked.
+      if (await userRepository.exist({ where: { plexId: account.id } })) {
+        return res.status(422).json({
+          message: 'This Plex account is already linked to a Seerr user',
+        });
+      }
+
+      // A Plex or password account must link the Plex account with its own
+      // email. Jellyfin and Emby users have their username as email, so it
+      // can't be compared.
+      if (
+        (user.userType === UserType.PLEX || user.userType === UserType.LOCAL) &&
+        user.email !== account.email.toLowerCase()
+      ) {
+        return res.status(422).json({
+          message:
+            'This Plex account is registered under a different email address.',
+        });
+      }
+
+      // The owner must share the Plex server with this account.
+      const owner = await userRepository.findOneOrFail({
+        select: { id: true, plexId: true, plexToken: true },
+        where: { id: 1 },
       });
-    }
+      if (
+        account.id !== owner.plexId &&
+        !(await new PlexTvAPI(owner.plexToken ?? '').checkUserAccess(
+          account.id
+        ))
+      ) {
+        return res.status(403).json({
+          message: 'This Plex account does not have access to the Plex server.',
+        });
+      }
 
-    const user = req.user;
-
-    // Emails do not match
-    if (user.email !== account.email) {
-      return res.status(422).json({
-        message:
-          'This Plex account is registered under a different email address.',
+      await userRepository.update(user.id, {
+        plexId: account.id,
+        plexUsername: account.username,
+        plexToken: account.authToken,
+        plexTokenExpiredAt: null,
+        // Only a password account becomes a Plex account.
+        ...(user.userType === UserType.LOCAL
+          ? { userType: UserType.PLEX }
+          : {}),
       });
+
+      return res.status(204).send();
+    } catch (e) {
+      logger.error('Failed to link Plex account to user.', {
+        label: 'API',
+        ip: req.ip,
+        errorMessage: e.message,
+      });
+      return res.status(401).json({ code: ApiErrorCode.InvalidAuthToken });
     }
-
-    // valid plex user found, link to current user
-    user.userType = UserType.PLEX;
-    user.plexId = account.id;
-    user.plexUsername = account.username;
-    user.plexToken = account.authToken;
-    user.plexTokenExpiredAt = null;
-    await userRepository.save(user);
-
-    return res.status(204).send();
   }
 );
 
@@ -350,85 +715,47 @@ userSettingsRoutes.delete<{ id: string }>(
   '/linked-accounts/plex',
   isOwnProfileOrAdmin(),
   async (req, res) => {
-    const settings = getSettings();
-    const userRepository = getRepository(User);
-
-    // Make sure Plex login is enabled
-    if (settings.main.mediaServerType !== MediaServerType.PLEX) {
-      return res.status(500).json({ message: 'Plex login is disabled' });
-    }
-
     try {
-      const user = await userRepository
-        .createQueryBuilder('user')
-        .addSelect('user.password')
-        .where({
-          id: Number(req.params.id),
-        })
-        .getOne();
-
-      if (!user) {
-        return res.status(404).json({ message: 'User not found.' });
-      }
-
-      if (user.id === 1) {
-        return res.status(400).json({
-          message:
-            'Cannot unlink media server accounts for the primary administrator.',
-        });
-      }
-
-      // Unlinking an admin from someone else's settings is the owner's call.
-      if (!mayEditUser(req.user, user)) {
-        return res.status(403).json({
-          message: "You do not have permission to modify this user's settings.",
-        });
-      }
-
-      if (!user.email || !user.password) {
-        return res.status(400).json({
-          message: 'User does not have a local email or password set.',
-        });
-      }
-
-      user.userType = UserType.LOCAL;
-      user.plexId = null;
-      user.plexUsername = null;
-      user.plexToken = null;
-      user.plexTokenExpiredAt = null;
-      await userRepository.save(user);
-
-      return res.status(204).send();
+      const { status, body } = await unlinkAccount(
+        req,
+        Number(req.params.id),
+        'plex'
+      );
+      return body ? res.status(status).json(body) : res.status(status).send();
     } catch (e) {
       return res.status(500).json({ message: e.message });
     }
   }
 );
 
-userSettingsRoutes.post<{ username: string; password: string }>(
-  '/linked-accounts/jellyfin',
-  isOwnProfile(),
-  async (req, res) => {
-    const settings = getSettings();
+/** Links a Jellyfin or Emby account by username and password. */
+const linkWithPassword =
+  (kindOf: () => JellyfinFamilyKind) =>
+  async (
+    req: Request<
+      { id: string },
+      unknown,
+      { username: string; password: string }
+    >,
+    res: Response
+  ) => {
     const userRepository = getRepository(User);
+    const user = req.user;
 
-    if (!req.user) {
+    if (!user) {
       return res.status(401).json({ code: ApiErrorCode.Unauthorized });
     }
-    // Make sure jellyfin login is enabled
-    if (
-      settings.main.mediaServerType !== MediaServerType.JELLYFIN &&
-      settings.main.mediaServerType !== MediaServerType.EMBY
-    ) {
+    const kind = kindOf();
+    if (!isConnected(kind)) {
       return res
         .status(500)
-        .json({ message: 'Jellyfin/Emby login is disabled' });
+        .json({ message: `${serverName(kind)} login is disabled` });
     }
 
-    // Do not allow linking of an already linked account
+    // Refuse an account that is already linked.
     if (
       await userRepository.exist({
-        where: { jellyfinUsername: req.body.username },
+        where: { [USERNAME[kind]]: req.body.username },
       })
     ) {
       return res.status(422).json({
@@ -436,55 +763,27 @@ userSettingsRoutes.post<{ username: string; password: string }>(
       });
     }
 
-    const hostname = getHostname();
-    const deviceId = Buffer.from(
-      req.user?.id === 1 ? 'BOT_seerr' : `BOT_seerr_${req.user.username ?? ''}`
-    ).toString('base64');
-
-    const jellyfinserver = new JellyfinAPI(hostname, undefined, deviceId);
-
-    const ip = req.ip;
-    let clientIp: string | undefined;
-    if (ip) {
-      if (net.isIPv4(ip)) {
-        clientIp = ip;
-      } else if (net.isIPv6(ip)) {
-        clientIp = ip.startsWith('::ffff:') ? ip.substring(7) : ip;
-      }
-    }
+    const deviceId = deviceIdFor(user);
+    const jellyfinserver = new JellyfinAPI(
+      hostnameFor(kind),
+      undefined,
+      deviceId,
+      kind
+    );
 
     try {
       const account = await jellyfinserver.login(
         req.body.username,
         req.body.password,
-        clientIp
+        clientIpOf(req)
       );
-
-      // Do not allow linking of an already linked account
-      if (
-        await userRepository.exist({
-          where: { jellyfinUserId: account.User.Id },
-        })
-      ) {
-        return res.status(422).json({
-          message: 'The specified account is already linked to a Seerr user',
-        });
-      }
-
-      const user = req.user;
-
-      // valid jellyfin user found, link to current user
-      user.userType =
-        settings.main.mediaServerType === MediaServerType.EMBY
-          ? UserType.EMBY
-          : UserType.JELLYFIN;
-      user.jellyfinUserId = account.User.Id;
-      user.jellyfinUsername = account.User.Name;
-      user.jellyfinAuthToken = account.AccessToken;
-      user.jellyfinDeviceId = deviceId;
-      await userRepository.save(user);
-
-      return res.status(204).send();
+      const { status, body } = await linkJellyfinAccount(
+        user,
+        kind,
+        account,
+        deviceId
+      );
+      return body ? res.status(status).json(body) : res.status(status).send();
     } catch (e) {
       logger.error('Failed to link account to user.', {
         label: 'API',
@@ -500,81 +799,151 @@ userSettingsRoutes.post<{ username: string; password: string }>(
 
       return res.status(500).send();
     }
-  }
+  };
+
+userSettingsRoutes.post<{ id: string }>(
+  '/linked-accounts/jellyfin',
+  isOwnProfile(),
+  signedInOnly,
+  linkWithPassword(() => jellyfinRouteKind())
+);
+
+userSettingsRoutes.post<{ id: string }>(
+  '/linked-accounts/emby',
+  isOwnProfile(),
+  signedInOnly,
+  linkWithPassword(() => 'emby')
 );
 
 userSettingsRoutes.delete<{ id: string }>(
   '/linked-accounts/jellyfin',
   isOwnProfileOrAdmin(),
   async (req, res) => {
-    const settings = getSettings();
-    const userRepository = getRepository(User);
-
-    // Make sure jellyfin login is enabled
-    if (
-      settings.main.mediaServerType !== MediaServerType.JELLYFIN &&
-      settings.main.mediaServerType !== MediaServerType.EMBY
-    ) {
-      return res
-        .status(500)
-        .json({ message: 'Jellyfin/Emby login is disabled' });
-    }
-
     try {
-      const user = await userRepository
-        .createQueryBuilder('user')
-        .addSelect('user.password')
-        .where({
-          id: Number(req.params.id),
-        })
-        .getOne();
-
-      if (!user) {
-        return res.status(404).json({ message: 'User not found.' });
-      }
-
-      if (user.id === 1) {
-        return res.status(400).json({
-          message:
-            'Cannot unlink media server accounts for the primary administrator.',
-        });
-      }
-
-      // Unlinking an admin from someone else's settings is the owner's call.
-      if (!mayEditUser(req.user, user)) {
-        return res.status(403).json({
-          message: "You do not have permission to modify this user's settings.",
-        });
-      }
-
-      if (!user.email || !user.password) {
-        return res.status(400).json({
-          message: 'User does not have a local email or password set.',
-        });
-      }
-
-      user.userType = UserType.LOCAL;
-      user.jellyfinUserId = null;
-      user.jellyfinUsername = null;
-      user.jellyfinAuthToken = null;
-      user.jellyfinDeviceId = null;
-      await userRepository.save(user);
-
-      return res.status(204).send();
+      const target = await getRepository(User).findOne({
+        select: { id: true, jellyfinUserId: true },
+        where: { id: Number(req.params.id) },
+      });
+      const { status, body } = await unlinkAccount(
+        req,
+        Number(req.params.id),
+        jellyfinRouteKind(target ?? undefined)
+      );
+      return body ? res.status(status).json(body) : res.status(status).send();
     } catch (e) {
       return res.status(500).json({ message: e.message });
     }
   }
 );
 
+userSettingsRoutes.delete<{ id: string }>(
+  '/linked-accounts/emby',
+  isOwnProfileOrAdmin(),
+  async (req, res) => {
+    try {
+      const { status, body } = await unlinkAccount(
+        req,
+        Number(req.params.id),
+        'emby'
+      );
+      return body ? res.status(status).json(body) : res.status(status).send();
+    } catch (e) {
+      return res.status(500).json({ message: e.message });
+    }
+  }
+);
+
+/*
+ * Single sign-on links, made by signing in at the provider (routes/oidc.ts),
+ * listed and removed here. Links to a disabled or removed provider, or from
+ * before its issuer URL changed, are kept and shown as unavailable.
+ */
+userSettingsRoutes.get<{ id: string }>(
+  '/linked-accounts/oidc',
+  isOwnProfileOrAdmin(),
+  async (req, res) => {
+    const links = await getRepository(OidcLink).find({
+      where: { user: { id: Number(req.params.id) } },
+      order: { id: 'ASC' },
+    });
+    const providers = getSettings().oidc.providers;
+    return res.status(200).json(
+      links.map((link) => {
+        const provider = providers.find((p) => p.id === link.provider);
+        return {
+          provider: link.provider,
+          // A removed provider's name is gone; its id derives from it.
+          name: provider?.name ?? link.provider,
+          logoUrl: provider?.logoUrl ?? '',
+          username: link.username ?? null,
+          available: linkUsable(link),
+        };
+      })
+    );
+  }
+);
+
+/**
+ * Removes a single sign-on link if the user can still sign in afterwards
+ * (password, a connected media server account, or another enabled
+ * provider). A link unusable for sign-in can always be removed.
+ */
+userSettingsRoutes.delete<{ id: string; providerId: string }>(
+  '/linked-accounts/oidc/:providerId',
+  isOwnProfileOrAdmin(),
+  async (req, res) => {
+    const user = await getRepository(User)
+      .createQueryBuilder('user')
+      .addSelect('user.password')
+      .where({ id: Number(req.params.id) })
+      .getOne();
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+    if (!mayEditUser(req.user, user)) {
+      return res.status(403).json({
+        message: "You do not have permission to modify this user's settings.",
+      });
+    }
+
+    const links = getRepository(OidcLink);
+    const link = await links.findOne({
+      where: { user: { id: user.id }, provider: req.params.providerId },
+    });
+    if (!link) {
+      return res.status(404).json({ message: 'That account is not linked.' });
+    }
+
+    const otherWayIn =
+      !!user.password ||
+      connectedServers().some((kind) => !!user[USER_ID[kind]]) ||
+      (await usableProviderLinks(user.id)).some(
+        (other) => other.id !== link.id
+      );
+    if (linkUsable(link) && !otherWayIn) {
+      return res.status(400).json({
+        message:
+          'Set a password first, or link another account: without one this person could not sign in.',
+      });
+    }
+
+    await links.delete(link.id);
+    // Whoever signed in through that account must not stay signed in.
+    await endSessions(
+      user.id,
+      req.user?.id === user.id ? req.sessionID : undefined
+    );
+    return res.status(204).send();
+  }
+);
+
 userSettingsRoutes.post<{ secret: string }>(
   '/linked-accounts/jellyfin/quickconnect',
   isOwnProfile(),
+  signedInOnly,
   async (req, res) => {
-    const settings = getSettings();
-    const userRepository = getRepository(User);
-
-    if (!req.user) {
+    const user = req.user;
+    if (!user) {
       return res.status(401).json({ code: ApiErrorCode.Unauthorized });
     }
 
@@ -585,50 +954,28 @@ userSettingsRoutes.post<{ secret: string }>(
 
     const { secret } = result.data;
 
-    if (
-      settings.main.mediaServerType !== MediaServerType.JELLYFIN &&
-      settings.main.mediaServerType !== MediaServerType.EMBY
-    ) {
-      return res
-        .status(500)
-        .json({ message: 'Jellyfin/Emby login is disabled' });
-    }
-
-    if (settings.main.mediaServerType !== MediaServerType.JELLYFIN) {
+    if (!isConnected('jellyfin')) {
       return res
         .status(403)
         .json({ message: 'Quick Connect is only supported by Jellyfin.' });
     }
 
-    const hostname = getHostname();
-    const jellyfinServer = new JellyfinAPI(hostname);
+    const jellyfinServer = new JellyfinAPI(
+      hostnameFor('jellyfin'),
+      undefined,
+      undefined,
+      'jellyfin'
+    );
 
     try {
       const account = await jellyfinServer.authenticateQuickConnect(secret);
-
-      if (
-        await userRepository.exist({
-          where: { jellyfinUserId: account.User.Id },
-        })
-      ) {
-        return res.status(422).json({
-          message: 'The specified account is already linked to a Seerr user',
-        });
-      }
-
-      const user = req.user;
-      const deviceId = Buffer.from(
-        user.id === 1 ? 'BOT_seerr' : `BOT_seerr_${user.username ?? ''}`
-      ).toString('base64');
-
-      user.userType = UserType.JELLYFIN;
-      user.jellyfinUserId = account.User.Id;
-      user.jellyfinUsername = account.User.Name;
-      user.jellyfinAuthToken = account.AccessToken;
-      user.jellyfinDeviceId = deviceId;
-      await userRepository.save(user);
-
-      return res.status(204).send();
+      const { status, body } = await linkJellyfinAccount(
+        user,
+        'jellyfin',
+        account,
+        deviceIdFor(user)
+      );
+      return body ? res.status(status).json(body) : res.status(status).send();
     } catch (e) {
       logger.error('Failed to link account with Quick Connect.', {
         label: 'API',
@@ -658,14 +1005,25 @@ userSettingsRoutes.get<{ id: string }, UserSettingsNotificationsResponse>(
         return next({ status: 404, message: 'User not found.' });
       }
 
+      // As for changing them: only the owner sees the owner's or another
+      // admin's, which hold their notification service tokens.
+      if (!mayEditUser(req.user, user)) {
+        return next({
+          status: 403,
+          message: "You do not have permission to view this user's settings.",
+        });
+      }
+
       return res.status(200).json({
         emailEnabled: settings.email.enabled,
         pgpKey: user.settings?.pgpKey,
         discordEnabled:
           settings?.discord.enabled && settings.discord.options.enableMentions,
+        // Discord only posts to the channel, and list activity never goes to
+        // one, so it can't reach anyone here.
         discordEnabledTypes:
           settings?.discord.enabled && settings.discord.options.enableMentions
-            ? settings.discord.types
+            ? (settings.discord.types ?? 0) & ~Notification.LIST_ACTIVITY
             : 0,
         discordIds: user.settings?.discordIds ?? [],
         pushbulletAccessToken: user.settings?.pushbulletAccessToken,
@@ -701,7 +1059,7 @@ userSettingsRoutes.post<{ id: string }, UserSettingsNotificationsResponse>(
         return next({ status: 404, message: 'User not found.' });
       }
 
-      // Only the owner changes the owner's settings, or another admin's.
+      // Only the owner changes the owner's or another admin's settings.
       if (!mayEditUser(req.user, user)) {
         return next({
           status: 403,
@@ -714,7 +1072,7 @@ userSettingsRoutes.post<{ id: string }, UserSettingsNotificationsResponse>(
 
       if (!user.settings) {
         user.settings = new UserSettings({
-          user: req.user,
+          user,
           pgpKey: req.body.pgpKey,
           discordIds,
           pushbulletAccessToken: req.body.pushbulletAccessToken,
@@ -805,7 +1163,7 @@ userSettingsRoutes.post<
         return next({ status: 404, message: 'User not found.' });
       }
 
-      // Nobody sets their own permissions or the owner's, and only the owner
+      // Nobody sets their own or the owner's permissions; only the owner
       // changes another admin's.
       if (!mayManageUser(req.user, user)) {
         return next({
@@ -832,8 +1190,8 @@ userSettingsRoutes.post<
 );
 
 /*
- * The fork's optional features this person has turned off for themselves.
- * Features an admin turned off for everyone stay off whatever this says.
+ * The fork's optional features this user turned off. Features an admin
+ * turned off for everyone stay off regardless.
  */
 userSettingsRoutes.get<{ id: string }>(
   '/features',
@@ -872,8 +1230,8 @@ userSettingsRoutes.post<{ id: string }>(
       if (!user) {
         return next({ status: 404, message: 'User not found.' });
       }
-      // As with every other setting: only the owner changes the owner's.
-      if (user.id === 1 && req.user?.id !== 1) {
+      // As everywhere: only the owner changes the owner's or another admin's.
+      if (!mayEditUser(req.user, user)) {
         return next({
           status: 403,
           message: "You do not have permission to modify this user's settings.",
@@ -897,8 +1255,8 @@ userSettingsRoutes.post<{ id: string }>(
 );
 
 /**
- * The home page rows a person hid for themselves, by slider id. Rows an
- * admin turned off are off for everyone whatever this says.
+ * Home page rows this user hid, by slider id. Rows an admin turned off stay
+ * off regardless.
  */
 userSettingsRoutes.get<{ id: string }>(
   '/discover',
@@ -938,8 +1296,8 @@ userSettingsRoutes.post<{ id: string }>(
         message: 'A list of slider ids, or of networks, is required.',
       });
     }
-    // Their own list for the Networks row, checked and re-written; null (or
-    // empty) for the usual list.
+    // Their own Networks row list, validated and rewritten; null or empty
+    // for the default list.
     let networks: string | null | undefined;
     if (sentNetworks) {
       try {
@@ -953,7 +1311,7 @@ userSettingsRoutes.post<{ id: string }>(
         throw e;
       }
     }
-    // Only rows that exist, once each.
+    // Only existing rows, deduplicated.
     let hidden: number[] | undefined;
     if (raw !== undefined) {
       const existing = new Set(
@@ -974,7 +1332,7 @@ userSettingsRoutes.post<{ id: string }>(
       if (!user) {
         return next({ status: 404, message: 'User not found.' });
       }
-      if (user.id === 1 && req.user?.id !== 1) {
+      if (!mayEditUser(req.user, user)) {
         return next({
           status: 403,
           message: "You do not have permission to modify this user's settings.",
@@ -1000,10 +1358,205 @@ userSettingsRoutes.post<{ id: string }>(
 );
 
 /*
- * Someone else's passkeys, for whoever manages users: to see which devices
- * can sign in as them and remove one that is lost or no longer theirs.
- * Adding or renaming stays with the person themselves. As with passwords,
- * only the owner can touch the owner's, or another admin's.
+ * A user's own look (Profile → Settings → Appearance): mode, accent, dark
+ * background and extras, or null for the server default. Affects only their
+ * screens.
+ */
+userSettingsRoutes.get<{ id: string }>(
+  '/appearance',
+  isOwnProfileOrAdmin(),
+  async (req, res, next) => {
+    try {
+      const user = await getRepository(User).findOne({
+        where: { id: Number(req.params.id) },
+      });
+      if (!user) {
+        return next({ status: 404, message: 'User not found.' });
+      }
+      return res.status(200).json({
+        appearance: user.settings?.appearance ?? null,
+        serverDefault: getSettings().fullPublicSettings.themeDefault,
+      });
+    } catch (e) {
+      return next({ status: 500, message: e.message });
+    }
+  }
+);
+
+userSettingsRoutes.post<{ id: string }>(
+  '/appearance',
+  isOwnProfileOrAdmin(),
+  async (req, res, next) => {
+    const asked = (req.body as { appearance?: unknown }).appearance;
+    const appearance = asked === null ? null : cleanAppearance(asked);
+    if (appearance === undefined) {
+      return next({
+        status: 400,
+        message: 'A look, or null for the server’s default, is required.',
+      });
+    }
+    try {
+      const user = await getRepository(User).findOne({
+        where: { id: Number(req.params.id) },
+      });
+      if (!user) {
+        return next({ status: 404, message: 'User not found.' });
+      }
+      if (!mayEditUser(req.user, user)) {
+        return next({
+          status: 403,
+          message: "You do not have permission to modify this user's settings.",
+        });
+      }
+      const repository = getRepository(UserSettings);
+      if (user.settings) {
+        await repository.update(user.settings.id, { appearance });
+      } else {
+        await repository.save(new UserSettings({ user, appearance }));
+      }
+      return res.status(200).json({
+        appearance,
+        serverDefault: getSettings().fullPublicSettings.themeDefault,
+      });
+    } catch (e) {
+      return next({ status: 500, message: e.message });
+    }
+  }
+);
+
+/*
+ * The answer to a seasonal theme's first-time note: keep it, or turn it off
+ * until it ends. Stored on the account so other devices don't ask again.
+ */
+userSettingsRoutes.post<{ id: string }>(
+  '/appearance/season',
+  isOwnProfile(),
+  async (req, res, next) => {
+    const body = req.body as Record<string, unknown>;
+    const seasonNote =
+      typeof body.season === 'string' &&
+      (body.choice === 'keep' || body.choice === 'off') &&
+      Object.keys(body).length === 2
+        ? cleanSeasonNote(seasonNoteValue(body.season, body.choice))
+        : undefined;
+    if (!seasonNote) {
+      return next({
+        status: 400,
+        message:
+          'A season, such as halloween-2026, and keep or off are required.',
+      });
+    }
+    try {
+      const user = await getRepository(User).findOne({
+        where: { id: Number(req.params.id) },
+      });
+      if (!user) {
+        return next({ status: 404, message: 'User not found.' });
+      }
+      const repository = getRepository(UserSettings);
+      if (user.settings) {
+        await repository.update(user.settings.id, { seasonNote });
+      } else {
+        await repository.save(new UserSettings({ user, seasonNote }));
+      }
+      return res.status(200).json({ seasonNote });
+    } catch (e) {
+      return next({ status: 500, message: e.message });
+    }
+  }
+);
+
+/*
+ * This user's sidebar and phone menu order and hidden items, by item name
+ * (server/constants/navigation.ts). Set from their home page; affects only
+ * their sidebar.
+ */
+userSettingsRoutes.get<{ id: string }>(
+  '/sidebar',
+  isOwnProfileOrAdmin(),
+  async (req, res, next) => {
+    try {
+      const user = await getRepository(User).findOne({
+        where: { id: Number(req.params.id) },
+      });
+      if (!user) {
+        return next({ status: 404, message: 'User not found.' });
+      }
+      return res.status(200).json({
+        order: user.settings?.sidebarOrder ?? [],
+        hidden: user.settings?.sidebarHidden ?? [],
+      });
+    } catch (e) {
+      return next({ status: 500, message: e.message });
+    }
+  }
+);
+
+userSettingsRoutes.post<{ id: string }>(
+  '/sidebar',
+  isOwnProfileOrAdmin(),
+  async (req, res, next) => {
+    const body = req.body as { order?: unknown; hidden?: unknown };
+    const isNames = (value: unknown) =>
+      Array.isArray(value) && value.every((name) => typeof name === 'string');
+    if (
+      (body.order === undefined && body.hidden === undefined) ||
+      (body.order !== undefined && !isNames(body.order)) ||
+      (body.hidden !== undefined && !isNames(body.hidden))
+    ) {
+      return next({
+        status: 400,
+        message: 'A list of sidebar items to order, or to hide, is required.',
+      });
+    }
+    // Unknown names are dropped. The default order is stored as no order, so
+    // items added later take their default place and the phone menu keeps
+    // its own order.
+    const order =
+      body.order === undefined
+        ? undefined
+        : isDefaultNavOrder(cleanNavOrder(body.order) ?? [])
+          ? []
+          : (cleanNavOrder(body.order) ?? []);
+    const hidden =
+      body.hidden === undefined ? undefined : cleanNavHidden(body.hidden);
+    const changes: Partial<UserSettings> = {
+      ...(order !== undefined && { sidebarOrder: order }),
+      ...(hidden !== undefined && { sidebarHidden: hidden }),
+    };
+    try {
+      const user = await getRepository(User).findOne({
+        where: { id: Number(req.params.id) },
+      });
+      if (!user) {
+        return next({ status: 404, message: 'User not found.' });
+      }
+      if (!mayEditUser(req.user, user)) {
+        return next({
+          status: 403,
+          message: "You do not have permission to modify this user's settings.",
+        });
+      }
+      const repository = getRepository(UserSettings);
+      if (user.settings) {
+        await repository.update(user.settings.id, changes);
+      } else {
+        await repository.save(new UserSettings({ user, ...changes }));
+      }
+      return res.status(200).json({
+        order: order ?? user.settings?.sidebarOrder ?? [],
+        hidden: hidden ?? user.settings?.sidebarHidden ?? [],
+      });
+    } catch (e) {
+      return next({ status: 500, message: e.message });
+    }
+  }
+);
+
+/*
+ * Another user's passkeys, for user managers: see which devices can sign in
+ * as them and remove a lost one. Only the user adds or renames. As with
+ * passwords, only the owner touches the owner's or another admin's.
  */
 const passkeyManager = async (
   req: Request<{ id: string }>
@@ -1059,7 +1612,7 @@ userSettingsRoutes.delete<{ id: string; passkeyId: string }>(
       if (!result.affected) {
         return next({ status: 404, message: 'Passkey not found.' });
       }
-      // Whoever has the device it was on is signed out with it.
+      // End the user's other sessions, so the device it was on is signed out.
       await endSessions(
         user.id,
         req.user?.id === user.id ? req.sessionID : undefined
@@ -1076,5 +1629,308 @@ userSettingsRoutes.delete<{ id: string; passkeyId: string }>(
     }
   }
 );
+
+/*
+ * Personal API keys (lib/personalApiKeys). Users create and revoke their own
+ * once an admin allows it (Settings → Users). User managers can list and
+ * revoke another user's keys but never see a secret, which nobody can after
+ * creation; as with passkeys, only the owner touches the owner's or another
+ * admin's.
+ */
+const apiKeyOwner = async (
+  req: Request<{ id: string }>
+): Promise<User | { status: number; message: string }> => {
+  const user = await getRepository(User).findOne({
+    where: { id: Number(req.params.id) },
+  });
+  if (!user) {
+    return { status: 404, message: 'User not found.' };
+  }
+  if (
+    req.user?.id !== user.id &&
+    !(
+      req.user?.hasPermission(Permission.MANAGE_USERS) &&
+      mayManageUser(req.user, user)
+    )
+  ) {
+    return {
+      status: 403,
+      message: "You do not have permission to manage this user's API keys.",
+    };
+  }
+  return user;
+};
+
+userSettingsRoutes.get<{ id: string }, ApiKeyListResponse>(
+  '/api-keys',
+  async (req, res, next) => {
+    try {
+      const user = await apiKeyOwner(req);
+      if (!(user instanceof User)) {
+        return next(user);
+      }
+      // Siri keys are listed on the Siri page.
+      const keys = await getRepository(UserApiKey).find({
+        where: { userId: user.id, scope: IsNull() },
+        order: { createdAt: 'ASC', id: 'ASC' },
+      });
+      return res.status(200).json({
+        keys: keys.map(keySummary),
+        status: apiKeyStatus(user),
+        limit: MAX_API_KEYS_PER_PERSON,
+      });
+    } catch (e) {
+      return next({ status: 500, message: e.message });
+    }
+  }
+);
+
+userSettingsRoutes.post<
+  { id: string },
+  ApiKeyCreatedResponse,
+  { name?: unknown; expiresInDays?: unknown }
+>('/api-keys', isOwnProfile(), async (req, res, next) => {
+  const user = req.user as User;
+  // Session only: a possibly leaked key can't create its successor, nor can
+  // the server's key acting for the user.
+  if (req.authMethod !== 'session') {
+    return next({
+      status: 403,
+      message: 'API keys can only be made while signed in, not with a key.',
+    });
+  }
+  const status = apiKeyStatus(user);
+  if (status !== 'on') {
+    return next({
+      status: 403,
+      message:
+        status === 'off'
+          ? 'Personal API keys are turned off on this server.'
+          : 'Only admins and people who manage users may make API keys.',
+    });
+  }
+
+  const name =
+    typeof req.body.name === 'string' ? req.body.name.trim() : undefined;
+  if (!name || name.length > MAX_API_KEY_NAME_LENGTH) {
+    return next({
+      status: 400,
+      message: `Give the key a name of up to ${MAX_API_KEY_NAME_LENGTH} characters.`,
+    });
+  }
+  const lifetime =
+    req.body.expiresInDays === undefined
+      ? DEFAULT_API_KEY_LIFETIME
+      : req.body.expiresInDays;
+  if (!API_KEY_LIFETIMES.includes(lifetime as ApiKeyLifetime)) {
+    return next({
+      status: 400,
+      message: 'A key lasts 30 days, 90 days, a year, or never expires.',
+    });
+  }
+
+  try {
+    const repository = getRepository(UserApiKey);
+    const now = new Date();
+    // Delete keys expired a month or more, so they don't pile up.
+    await repository.delete({
+      userId: user.id,
+      expiresAt: LessThan(new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)),
+    });
+    const live = await repository.count({
+      where: [
+        { userId: user.id, scope: IsNull(), expiresAt: IsNull() },
+        { userId: user.id, scope: IsNull(), expiresAt: MoreThan(now) },
+      ],
+    });
+    if (live >= MAX_API_KEYS_PER_PERSON) {
+      return next({
+        status: 400,
+        message: `You can have up to ${MAX_API_KEYS_PER_PERSON} API keys. Revoke one you no longer use first.`,
+      });
+    }
+
+    let made = makeKey();
+    // The public id is random; retry on a clash.
+    while (await repository.exists({ where: { publicId: made.publicId } })) {
+      made = makeKey();
+    }
+    const saved = await repository.save(
+      new UserApiKey({
+        userId: user.id,
+        publicId: made.publicId,
+        secretHash: made.secretHash,
+        name,
+        createdAt: now,
+        expiresAt: expiresAtFor(lifetime as ApiKeyLifetime, now),
+      })
+    );
+    logger.info('Personal API key created', {
+      label: 'API Key',
+      userId: user.id,
+      keyId: saved.id,
+      publicId: saved.publicId,
+      name,
+      expiresAt: saved.expiresAt?.toISOString() ?? 'never',
+    });
+    return res.status(201).json({ key: keySummary(saved), secret: made.key });
+  } catch (e) {
+    return next({ status: 500, message: e.message });
+  }
+});
+
+userSettingsRoutes.delete<{ id: string; keyId: string }>(
+  '/api-keys/:keyId',
+  async (req, res, next) => {
+    try {
+      const user = await apiKeyOwner(req);
+      if (!(user instanceof User)) {
+        return next(user);
+      }
+      const repository = getRepository(UserApiKey);
+      const key = await repository.findOne({
+        where: {
+          id: Number(req.params.keyId),
+          userId: user.id,
+          scope: IsNull(),
+        },
+      });
+      if (!key) {
+        return next({ status: 404, message: 'API key not found.' });
+      }
+      await repository.delete(key.id);
+      logger.info('Personal API key revoked', {
+        label: 'API Key',
+        userId: user.id,
+        keyId: key.id,
+        publicId: key.publicId,
+        name: key.name,
+        revokedBy: req.user?.id,
+      });
+      return res.status(204).send();
+    } catch (e) {
+      return next({ status: 500, message: e.message });
+    }
+  }
+);
+
+/*
+ * A user's Siri key: one key that only reports what is playing (lib/siri),
+ * for the "Fix this show" shortcut. Created on their Siri page while signed
+ * in, even when personal API keys are off; a new one replaces the old. User
+ * managers can see and revoke it, like other keys.
+ */
+const mayUseSiri = (user: User) =>
+  featureEnabled('siri', user) &&
+  user.hasPermission([Permission.CREATE_ISSUES, Permission.MANAGE_ISSUES], {
+    type: 'or',
+  });
+
+userSettingsRoutes.get<{ id: string }, SiriKeyResponse>(
+  '/siri',
+  async (req, res, next) => {
+    try {
+      const user = await apiKeyOwner(req);
+      if (!(user instanceof User)) {
+        return next(user);
+      }
+      const key = await getRepository(UserApiKey).findOne({
+        where: { userId: user.id, scope: 'siri' },
+        order: { createdAt: 'DESC', id: 'DESC' },
+      });
+      const { main } = getSettings();
+      return res.status(200).json({
+        key: key ? keySummary(key) : null,
+        shortcutUrl: main.siriShortcutUrl ?? '',
+        applicationUrl: main.applicationUrl ?? '',
+      });
+    } catch (e) {
+      return next({ status: 500, message: e.message });
+    }
+  }
+);
+
+userSettingsRoutes.post<{ id: string }, ApiKeyCreatedResponse>(
+  '/siri',
+  isOwnProfile(),
+  async (req, res, next) => {
+    const user = req.user as User;
+    if (req.authMethod !== 'session') {
+      return next({
+        status: 403,
+        message: 'A Siri key can only be made while signed in, not with a key.',
+      });
+    }
+    if (!mayUseSiri(user)) {
+      return next({
+        status: 403,
+        message: featureEnabled('siri', user)
+          ? 'Reporting with Siri needs permission to report problems.'
+          : 'Reporting with Siri is turned off.',
+      });
+    }
+    try {
+      const repository = getRepository(UserApiKey);
+      const before = await repository.find({
+        where: { userId: user.id, scope: 'siri' },
+      });
+      let made = makeKey();
+      while (await repository.exists({ where: { publicId: made.publicId } })) {
+        made = makeKey();
+      }
+      const saved = await repository.save(
+        new UserApiKey({
+          userId: user.id,
+          publicId: made.publicId,
+          secretHash: made.secretHash,
+          name: 'Siri',
+          scope: 'siri',
+          createdAt: new Date(),
+          expiresAt: null,
+        })
+      );
+      // Revoke the old key once the new one exists.
+      if (before.length) {
+        await repository.delete(before.map((k) => k.id));
+      }
+      logger.info('Siri key created', {
+        label: 'API Key',
+        userId: user.id,
+        keyId: saved.id,
+        publicId: saved.publicId,
+        replaced: before.map((k) => k.publicId),
+      });
+      return res.status(201).json({ key: keySummary(saved), secret: made.key });
+    } catch (e) {
+      return next({ status: 500, message: e.message });
+    }
+  }
+);
+
+userSettingsRoutes.delete<{ id: string }>('/siri', async (req, res, next) => {
+  try {
+    const user = await apiKeyOwner(req);
+    if (!(user instanceof User)) {
+      return next(user);
+    }
+    const repository = getRepository(UserApiKey);
+    const keys = await repository.find({
+      where: { userId: user.id, scope: 'siri' },
+    });
+    if (!keys.length) {
+      return next({ status: 404, message: 'There is no Siri key.' });
+    }
+    await repository.delete(keys.map((k) => k.id));
+    logger.info('Siri key revoked', {
+      label: 'API Key',
+      userId: user.id,
+      keyIds: keys.map((k) => k.id),
+      revokedBy: req.user?.id,
+    });
+    return res.status(204).send();
+  } catch (e) {
+    return next({ status: 500, message: e.message });
+  }
+});
 
 export default userSettingsRoutes;

@@ -5,13 +5,16 @@ import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
-import { MediaServerType } from '@server/constants/server';
+import { SERVER_NAMES } from '@app/utils/mediaServerAccounts';
+import type { JellyfinFamilyKind } from '@server/constants/server';
 import axios from 'axios';
 import { useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR from 'swr';
 
 interface JellyfinImportProps {
+  /** Server to import users from. */
+  kind: JellyfinFamilyKind;
   onCancel?: () => void;
   onComplete?: () => void;
 }
@@ -19,6 +22,8 @@ interface JellyfinImportProps {
 interface JellyfinImportResponse {
   createdUsers: unknown[];
   refreshedUsers: number;
+  /** Users skipped because another account has their username as its email. */
+  skippedUsers?: { id: string; name: string; reason: string }[];
 }
 
 const messages = defineMessages('components.UserList', {
@@ -31,18 +36,21 @@ const messages = defineMessages('components.UserList', {
   importfromJellyfinsynced:
     '{mediaServerName} users synced successfully. Existing users were refreshed.',
   jellyfinsyncnotice:
-    'Everyone on {mediaServerName} has been imported. You can still click Sync to refresh them, such as a changed name or picture.',
+    'Everyone on {mediaServerName} is imported. Sync refreshes names and pictures.',
   importedfromJellyfin:
-    '<strong>{userCount}</strong> {mediaServerName} {userCount, plural, one {user} other {users}} imported successfully!',
+    '<strong>{userCount}</strong> {mediaServerName} {userCount, plural, one {user} other {users}} imported.',
   importedUsersNoPassword:
-    'Imported users do not have a {applicationTitle} password set. If you disable {mediaServerName} sign-in, they will need to set a password from their profile or via a password reset link.',
+    'Imported users have no {applicationTitle} password. Without {mediaServerName} sign-in, they’ll need to set one.',
   user: 'User',
   noJellyfinuserstoimport: 'There are no {mediaServerName} users to import.',
+  jellyfinImportSkipped:
+    'Not imported, as another account already uses their name as its email: {names}. They can sign in with it and link {mediaServerName}.',
   newJellyfinsigninenabled:
-    'The <strong>Enable New {mediaServerName} Sign-In</strong> setting is currently enabled. {mediaServerName} users with library access do not need to be imported in order to sign in.',
+    '<strong>Enable New {mediaServerName} Sign-In</strong> is on, so {mediaServerName} users with library access can sign in without being imported.',
 });
 
 const JellyfinImportModal: React.FC<JellyfinImportProps> = ({
+  kind,
   onCancel,
   onComplete,
 }) => {
@@ -51,10 +59,7 @@ const JellyfinImportModal: React.FC<JellyfinImportProps> = ({
   const { addToast } = useToasts();
   const [isImporting, setImporting] = useState(false);
   const [selectedUsers, setSelectedUsers] = useState<string[]>([]);
-  const mediaServerName =
-    settings.currentSettings.mediaServerType === MediaServerType.EMBY
-      ? 'Emby'
-      : 'Jellyfin';
+  const mediaServerName = SERVER_NAMES[kind];
   const { data, error } = useSWR<
     {
       id: string;
@@ -63,7 +68,7 @@ const JellyfinImportModal: React.FC<JellyfinImportProps> = ({
       email: string;
       thumb: string;
     }[]
-  >(`/api/v1/settings/jellyfin/users`, {
+  >(`/api/v1/settings/${kind}/users`, {
     revalidateOnMount: true,
   });
 
@@ -71,14 +76,26 @@ const JellyfinImportModal: React.FC<JellyfinImportProps> = ({
     setImporting(true);
 
     try {
-      // People already imported are refreshed on every import, so with
-      // nobody left to import this is still worth doing, as a sync.
+      // Import also refreshes already imported users, so it works as a sync
+      // with none selected.
       const { data: importResponse } = await axios.post<JellyfinImportResponse>(
-        '/api/v1/user/import-from-jellyfin',
-        { jellyfinUserIds: selectedUsers }
+        `/api/v1/user/import-from-${kind}`,
+        kind === 'emby'
+          ? { embyUserIds: selectedUsers }
+          : { jellyfinUserIds: selectedUsers }
       );
 
-      const { createdUsers, refreshedUsers } = importResponse;
+      const { createdUsers, refreshedUsers, skippedUsers } = importResponse;
+
+      if (skippedUsers?.length) {
+        addToast(
+          intl.formatMessage(messages.jellyfinImportSkipped, {
+            names: intl.formatList(skippedUsers.map((user) => user.name)),
+            mediaServerName,
+          }),
+          { autoDismiss: false, appearance: 'warning' }
+        );
+      }
 
       if (createdUsers.length > 0) {
         addToast(
@@ -196,7 +213,7 @@ const JellyfinImportModal: React.FC<JellyfinImportProps> = ({
               title={intl.formatMessage(messages.newJellyfinsigninenabled, {
                 mediaServerName,
                 strong: (msg: React.ReactNode) => (
-                  <strong className="font-semibold text-white">{msg}</strong>
+                  <strong className="font-semibold text-strong">{msg}</strong>
                 ),
               })}
               type="info"
@@ -279,7 +296,7 @@ const JellyfinImportModal: React.FC<JellyfinImportProps> = ({
                               />
                             </span>
                           </td>
-                          <td className="whitespace-nowrap px-1 py-4 text-sm font-medium leading-5 text-gray-100 md:px-6">
+                          <td className="px-1 py-4 text-sm font-medium leading-5 text-gray-100 [overflow-wrap:anywhere] md:px-6">
                             <div className="flex items-center">
                               <CachedImage
                                 type="avatar"
@@ -289,17 +306,10 @@ const JellyfinImportModal: React.FC<JellyfinImportProps> = ({
                                 width={40}
                                 height={40}
                               />
-                              <div className="ml-4">
+                              <div className="ml-4 min-w-0">
                                 <div className="text-base font-bold leading-5">
                                   {user.username}
                                 </div>
-                                {/* {user.username &&
-                                  user.username.toLowerCase() !==
-                                  user.email && (
-                                    <div className="text-sm leading-5 text-gray-300">
-                                      {user.email}
-                                    </div>
-                                  )} */}
                               </div>
                             </div>
                           </td>

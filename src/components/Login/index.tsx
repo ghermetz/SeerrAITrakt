@@ -5,21 +5,38 @@ import Button from '@app/components/Common/Button';
 import ImageFader from '@app/components/Common/ImageFader';
 import PageTitle from '@app/components/Common/PageTitle';
 import LanguagePicker from '@app/components/Layout/LanguagePicker';
+import { StackedLogo } from '@app/components/Layout/Sidebar/BrandLogo';
 import JellyfinLogin from '@app/components/Login/JellyfinLogin';
 import LocalLogin from '@app/components/Login/LocalLogin';
-import PasskeyLoginButton from '@app/components/Login/PasskeyLoginButton';
+import OidcLoginButton from '@app/components/Login/OidcLoginButton';
+import PasskeyLoginButton, {
+  passkeyMessages,
+} from '@app/components/Login/PasskeyLoginButton';
 import PlexLoginButton from '@app/components/Login/PlexLoginButton';
+import { plexLoginFailure } from '@app/components/Login/plexLoginFailure';
+import {
+  OPTION_BUTTON,
+  optionColumns,
+  spansRow,
+} from '@app/components/Login/signInOptions';
+import { singleSignOnOutcome } from '@app/components/Login/singleSignOnMessages';
+import SafeModeSignInLink from '@app/components/Themes/SafeModeSignInLink';
+import { usePasskeySupport } from '@app/hooks/usePasskeys';
 import useSettings from '@app/hooks/useSettings';
 import { useUser } from '@app/hooks/useUser';
 import defineMessages from '@app/utils/defineMessages';
 import { safeRedirect } from '@app/utils/loginRedirect';
+import { SERVER_NAMES, signInServers } from '@app/utils/mediaServerAccounts';
 import { Transition } from '@headlessui/react';
 import { XCircleIcon } from '@heroicons/react/24/solid';
-import { MediaServerType } from '@server/constants/server';
+import type {
+  JellyfinFamilyKind,
+  MediaServerKind,
+} from '@server/constants/server';
+import { isJellyfinFamily, typeOfKind } from '@server/constants/server';
 import axios from 'axios';
 import { useRouter } from 'next/dist/client/router';
-import Image from 'next/image';
-import { useEffect, useRef, useState, type JSX } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { CSSTransition, SwitchTransition } from 'react-transition-group';
 import useSWR from 'swr';
@@ -27,11 +44,16 @@ import useSWR from 'swr';
 const messages = defineMessages('components.Login', {
   signin: 'Sign In',
   signinheader: 'Sign in to continue',
-  signinwithplex: 'Use your Plex account',
   signinwithjellyfin: 'Use your {mediaServerName} account',
   signinwithoverseerr: 'Use your {applicationTitle} account',
   orsigninwith: 'Or sign in with',
 });
+
+const SERVER_LOGOS: Record<MediaServerKind, typeof PlexLogo> = {
+  plex: PlexLogo,
+  jellyfin: JellyfinLogo,
+  emby: EmbyLogo,
+};
 
 const Login = () => {
   const intl = useIntl();
@@ -46,9 +68,7 @@ const Login = () => {
     settings.currentSettings.mediaServerLogin
   );
 
-  // Effect that is triggered when the `authToken` comes back from the Plex OAuth
-  // We take the token and attempt to sign in. If we get a success message, we will
-  // ask swr to revalidate the user which _should_ come back with a valid user.
+  // Exchange the Plex OAuth token for a session, then revalidate the user.
   useEffect(() => {
     const login = async () => {
       setProcessing(true);
@@ -59,7 +79,7 @@ const Login = () => {
           revalidate();
         }
       } catch (e) {
-        setError(e.response?.data?.message);
+        setError(plexLoginFailure(intl, e));
         setAuthToken(undefined);
         setProcessing(false);
       }
@@ -67,12 +87,18 @@ const Login = () => {
     if (authToken) {
       login();
     }
-  }, [authToken, revalidate]);
+  }, [authToken, revalidate, intl]);
 
-  // Effect that is triggered whenever `useUser`'s user changes. Every way of
-  // signing in (Plex, Jellyfin or Emby, Quick Connect, a password, a passkey)
-  // ends by revalidating the user, so this is where all of them go on: to
-  // the page the person was sent here from, or home.
+  // Show why a single sign-on provider did not sign them in.
+  const oidcProviders = settings.currentSettings.oidcProviders;
+  useEffect(() => {
+    const outcome = singleSignOnOutcome(intl, router.query, oidcProviders);
+    if (outcome) {
+      setError(outcome.message);
+    }
+  }, [intl, router.query, oidcProviders]);
+
+  // Every sign-in method ends by revalidating the user, so all redirect here.
   useEffect(() => {
     if (user) {
       router.push(safeRedirect(router.query.redirect));
@@ -85,82 +111,139 @@ const Login = () => {
     revalidateOnFocus: false,
   });
 
-  const mediaServerName =
-    settings.currentSettings.mediaServerType === MediaServerType.PLEX
-      ? 'Plex'
-      : settings.currentSettings.mediaServerType === MediaServerType.JELLYFIN
-        ? 'Jellyfin'
-        : settings.currentSettings.mediaServerType === MediaServerType.EMBY
-          ? 'Emby'
-          : undefined;
+  // Primary server first. Plex uses its button; Jellyfin/Emby share one form.
+  const servers = signInServers(settings.currentSettings);
+  const plexSignIn = servers.includes('plex');
+  const formServers = servers.filter(isJellyfinFamily);
+  const [formServer, setFormServer] = useState<JellyfinFamilyKind | undefined>(
+    formServers[0]
+  );
+  const shownServer =
+    formServer && formServers.includes(formServer)
+      ? formServer
+      : formServers[0];
 
-  const MediaServerLogo =
-    settings.currentSettings.mediaServerType === MediaServerType.PLEX
-      ? PlexLogo
-      : settings.currentSettings.mediaServerType === MediaServerType.JELLYFIN
-        ? JellyfinLogo
-        : settings.currentSettings.mediaServerType === MediaServerType.EMBY
-          ? EmbyLogo
-          : undefined;
-
-  const isJellyfin =
-    settings.currentSettings.mediaServerType === MediaServerType.JELLYFIN ||
-    settings.currentSettings.mediaServerType === MediaServerType.EMBY;
+  const isJellyfin = !!shownServer;
   const mediaServerLoginRef = useRef<HTMLDivElement>(null);
   const localLoginRef = useRef<HTMLDivElement>(null);
-  const loginRef = mediaServerLogin ? mediaServerLoginRef : localLoginRef;
+  const showingServerForm =
+    isJellyfin && (mediaServerLogin || !settings.currentSettings.localLogin);
+  const loginRef = showingServerForm ? mediaServerLoginRef : localLoginRef;
 
-  const loginFormVisible =
-    (isJellyfin && settings.currentSettings.mediaServerLogin) ||
-    settings.currentSettings.localLogin;
-  const additionalLoginOptions = [
-    settings.currentSettings.mediaServerLogin &&
-      (settings.currentSettings.mediaServerType === MediaServerType.PLEX ? (
+  const loginFormVisible = isJellyfin || settings.currentSettings.localLogin;
+
+  // Under a form, option buttons show short labels (full text in aria-label).
+  const compact = loginFormVisible;
+  const { supported: passkeysSupported } = usePasskeySupport();
+
+  const serverFormButton = (kind: JellyfinFamilyKind) => {
+    const Logo = SERVER_LOGOS[kind];
+    return (
+      <Button
+        data-testid="mediaserver-login-button"
+        className={`${OPTION_BUTTON} bg-transparent`}
+        aria-label={intl.formatMessage(messages.signinwithjellyfin, {
+          mediaServerName: SERVER_NAMES[kind],
+        })}
+        onClick={() => {
+          setFormServer(kind);
+          setMediaServerLogin(true);
+        }}
+      >
+        <Logo className="shrink-0" />
+        <span className="truncate">{SERVER_NAMES[kind]}</span>
+      </Button>
+    );
+  };
+
+  // Labels drive the column layout.
+  const additionalLoginOptions: {
+    key: string;
+    label: string;
+    button: React.ReactNode;
+  }[] = [];
+  if (plexSignIn) {
+    additionalLoginOptions.push({
+      key: 'plex',
+      label: 'Plex',
+      button: (
         <PlexLoginButton
-          key="plex"
           isProcessing={isProcessing}
-          onAuthToken={(authToken) => setAuthToken(authToken)}
-          large={!isJellyfin && !settings.currentSettings.localLogin}
+          onAuthToken={(authToken) => {
+            setError('');
+            setAuthToken(authToken);
+          }}
+          onError={setError}
+          large={!compact}
         />
-      ) : (
-        settings.currentSettings.localLogin &&
-        (mediaServerLogin ? (
-          <Button
-            key="seerr"
-            data-testid="seerr-login-button"
-            className="flex-1 bg-transparent"
-            onClick={() => setMediaServerLogin(false)}
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src="/os_icon.svg"
-              alt={settings.currentSettings.applicationTitle}
-              className="mr-2 h-5"
-            />
-            <span>{settings.currentSettings.applicationTitle}</span>
-          </Button>
-        ) : (
-          <Button
-            key="mediaserver"
-            data-testid="mediaserver-login-button"
-            className="flex-1 bg-transparent"
-            onClick={() => setMediaServerLogin(true)}
-          >
-            <MediaServerLogo />
-            <span>{mediaServerName}</span>
-          </Button>
-        ))
-      )),
-    // Anyone who has added a passkey, whatever account it belongs to.
-    <PasskeyLoginButton
-      key="passkey"
-      onSignedIn={() => revalidate()}
-      onError={setError}
-    />,
-  ].filter((o): o is JSX.Element => !!o);
+      ),
+    });
+  }
+  formServers
+    .filter((kind) => !showingServerForm || kind !== shownServer)
+    .forEach((kind) =>
+      additionalLoginOptions.push({
+        key: kind,
+        label: SERVER_NAMES[kind],
+        button: serverFormButton(kind),
+      })
+    );
+  oidcProviders.forEach((provider) =>
+    additionalLoginOptions.push({
+      key: `oidc-${provider.id}`,
+      label: provider.name,
+      button: (
+        <OidcLoginButton
+          provider={provider}
+          applicationUrl={settings.currentSettings.applicationUrl}
+          redirect={safeRedirect(router.query.redirect)}
+          compact={compact}
+        />
+      ),
+    })
+  );
+  if (showingServerForm && settings.currentSettings.localLogin) {
+    additionalLoginOptions.push({
+      key: 'seerr',
+      label: settings.currentSettings.applicationTitle,
+      button: (
+        <Button
+          data-testid="seerr-login-button"
+          className={`${OPTION_BUTTON} bg-transparent`}
+          aria-label={intl.formatMessage(messages.signinwithoverseerr, {
+            applicationTitle: settings.currentSettings.applicationTitle,
+          })}
+          onClick={() => setMediaServerLogin(false)}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/os_icon.svg" alt="" className="mr-2 h-5 w-5 shrink-0" />
+          <span className="truncate">
+            {settings.currentSettings.applicationTitle}
+          </span>
+        </Button>
+      ),
+    });
+  }
+  // Any account type can have a passkey.
+  if (passkeysSupported) {
+    additionalLoginOptions.push({
+      key: 'passkey',
+      label: intl.formatMessage(passkeyMessages.passkey),
+      button: (
+        <PasskeyLoginButton
+          onSignedIn={() => revalidate()}
+          onError={setError}
+          compact={compact}
+        />
+      ),
+    });
+  }
 
   return (
-    <div className="relative flex min-h-screen flex-col bg-gray-900 py-14">
+    <div
+      className="relative flex min-h-screen flex-col bg-gray-900 py-14"
+      data-seerr="login"
+    >
       <PageTitle title={intl.formatMessage(messages.signin)} />
       <ImageFader
         backgroundImages={
@@ -174,12 +257,12 @@ const Login = () => {
       </div>
       <div className="relative z-40 mt-10 flex flex-col items-center px-4 sm:mx-auto sm:w-full sm:max-w-md">
         <div className="relative h-48 w-full max-w-full">
-          <Image src="/logo_stacked.svg" alt="Logo" fill />
+          <StackedLogo />
         </div>
       </div>
       <div className="relative z-50 mt-8 sm:mx-auto sm:w-full sm:max-w-md">
         <div
-          className="bg-gray-800/50 shadow sm:rounded-lg"
+          className="bg-gray-800/50 shadow light:bg-surface/90 sm:rounded-lg"
           style={{ backdropFilter: 'blur(5px)' }}
         >
           <>
@@ -209,7 +292,7 @@ const Login = () => {
             <div className="px-10 py-8">
               <SwitchTransition mode="out-in">
                 <CSSTransition
-                  key={mediaServerLogin ? 'ms' : 'local'}
+                  key={showingServerForm ? `ms-${shownServer}` : 'local'}
                   nodeRef={loginRef}
                   timeout={{ enter: 300, exit: 150 }}
                   onEntered={() => {
@@ -225,11 +308,9 @@ const Login = () => {
                   }}
                 >
                   <div ref={loginRef} className="button-container">
-                    {isJellyfin &&
-                    (mediaServerLogin ||
-                      !settings.currentSettings.localLogin) ? (
+                    {showingServerForm && shownServer ? (
                       <JellyfinLogin
-                        serverType={settings.currentSettings.mediaServerType}
+                        serverType={typeOfKind(shownServer)}
                         revalidate={revalidate}
                       />
                     ) : (
@@ -251,18 +332,36 @@ const Login = () => {
                     <div className="flex-grow border-t border-gray-600" />
                   </div>
                 ) : (
-                  <h2 className="mb-6 text-center text-lg font-bold text-neutral-200">
+                  <h2 className="mb-6 text-center text-lg font-bold text-neutral-200 light:text-strong">
                     {intl.formatMessage(messages.signinheader)}
                   </h2>
                 ))}
 
               <div
-                className={`flex w-full flex-wrap gap-2 ${
-                  !loginFormVisible ? 'flex-col' : ''
-                }`}
+                className="grid w-full gap-2 text-sm"
+                style={{
+                  gridTemplateColumns: compact
+                    ? optionColumns(
+                        additionalLoginOptions.map((option) => option.label)
+                      )
+                    : '1fr',
+                }}
+                data-testid="sign-in-options"
               >
-                {additionalLoginOptions}
+                {additionalLoginOptions.map((option, index) => (
+                  <div
+                    key={option.key}
+                    className={`flex min-w-0 ${
+                      spansRow(index, additionalLoginOptions.length)
+                        ? 'col-span-full'
+                        : ''
+                    }`}
+                  >
+                    {option.button}
+                  </div>
+                ))}
               </div>
+              <SafeModeSignInLink />
             </div>
           </>
         </div>

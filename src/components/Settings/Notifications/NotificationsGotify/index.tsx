@@ -1,5 +1,6 @@
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
+import SaveBar from '@app/components/Common/SaveBar';
 import NotificationTypeSelector from '@app/components/NotificationTypeSelector';
 import { availableLanguages } from '@app/context/LanguageContext';
 import useToasts from '@app/hooks/useToasts';
@@ -26,6 +27,7 @@ const messages = defineMessages(
     validationUrlTrailingSlash: 'URL must not end in a trailing slash',
     validationTokenRequired: 'You must provide an application token',
     validationPriorityRequired: 'You must set a priority number',
+    validationPriority: 'The priority must be a whole number from 0 to 10',
     gotifysettingssaved: 'Gotify notification settings saved successfully!',
     gotifysettingsfailed: 'Gotify notification settings failed to save.',
     toastGotifyTestSending: 'Sending Gotify test notification…',
@@ -73,16 +75,20 @@ const NotificationsGotify = () => {
           .required(intl.formatMessage(messages.validationTokenRequired)),
       otherwise: (schema) => schema.nullable(),
     }),
-    priority: Yup.string().when('enabled', {
-      is: true,
-      then: (schema) =>
-        schema
-          .nullable()
-          .min(0)
-          .max(9)
-          .required(intl.formatMessage(messages.validationPriorityRequired)),
-      otherwise: (schema) => schema.nullable(),
-    }),
+    // Gotify apps read 0 to 10 (see the guide); other values save as nothing.
+    priority: Yup.string()
+      .when('enabled', {
+        is: true,
+        then: (schema) =>
+          schema
+            .nullable()
+            .required(intl.formatMessage(messages.validationPriorityRequired)),
+        otherwise: (schema) => schema.nullable(),
+      })
+      .matches(/^(?:\d|10)$/, {
+        message: intl.formatMessage(messages.validationPriority),
+        excludeEmptyString: true,
+      }),
   });
 
   if (!data && !error) {
@@ -297,7 +303,7 @@ const NotificationsGotify = () => {
                   : undefined
               }
             />
-            <div className="actions">
+            <SaveBar>
               <div className="flex justify-end">
                 <span className="ml-3 inline-flex rounded-md shadow-sm">
                   <Button
@@ -336,7 +342,7 @@ const NotificationsGotify = () => {
                   </Button>
                 </span>
               </div>
-            </div>
+            </SaveBar>
           </Form>
         );
       }}

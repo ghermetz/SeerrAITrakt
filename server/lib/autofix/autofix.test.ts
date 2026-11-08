@@ -1,12 +1,17 @@
 import BazarrAPI from '@server/api/bazarr';
+import { MusicBrainz } from '@server/api/musicbrainz';
+import LidarrAPI from '@server/api/servarr/lidarr';
 import TheMovieDb from '@server/api/themoviedb';
 import { IssueType } from '@server/constants/issue';
 import { MediaStatus, MediaType } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
+import AgentRun from '@server/entity/AgentRun';
+import AutoFixMark from '@server/entity/AutoFixMark';
 import type BackfillSeries from '@server/entity/BackfillSeries';
 import Issue from '@server/entity/Issue';
 import IssueComment from '@server/entity/IssueComment';
 import Media from '@server/entity/Media';
+import MusicAlbum from '@server/entity/MusicAlbum';
 import { User } from '@server/entity/User';
 import agent from '@server/lib/agent';
 import { clearAiCache } from '@server/lib/ai';
@@ -14,11 +19,21 @@ import autofix, {
   classify,
   minutesOf,
   pickReplacement,
+  seasonEpisodeIn,
   wrongLength,
 } from '@server/lib/autofix';
-import type { ArrEpisode, ArrRelease } from '@server/lib/autofix/arr';
+import type {
+  ArrEpisode,
+  ArrExtras,
+  ArrHistoryRecord,
+  ArrRelease,
+} from '@server/lib/autofix/arr';
 import { FixRadarr, FixSonarr } from '@server/lib/autofix/arr';
+import { titleInTheirWords } from '@server/lib/autofix/chat';
+import { askAboutReport } from '@server/lib/autofix/understand';
 import backfill from '@server/lib/backfill/engine';
+import BackfillSonarr from '@server/lib/backfill/sonarr';
+import notificationManager from '@server/lib/notifications';
 import { Permission } from '@server/lib/permissions';
 import type { RadarrSettings, SonarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
@@ -39,9 +54,8 @@ import { after, afterEach, beforeEach, describe, it, mock } from 'node:test';
 setupTestDb();
 
 /*
- * Fixing what people report, with Sonarr, Radarr, Bazarr and the model
- * stubbed at their API clients. The rejection texts are ones Sonarr gave on
- * the live server.
+ * Auto-fix with Sonarr, Radarr, Bazarr and the model stubbed at their API
+ * clients. Rejection texts are real Sonarr output.
  */
 
 const EXISTING =
@@ -136,8 +150,8 @@ describe('Auto-fix: reading a report', () => {
 
 describe('Auto-fix: choosing another release', () => {
   const current = {
-    title: '[Erai-raws] Naruto - 002 [480p]',
-    group: 'Erai-raws',
+    title: '[Kaze-raws] Kitsuraga - 002 [480p]',
+    group: 'Kaze-raws',
   };
 
   it('takes one Sonarr only turns down for the file already there, from another group', () => {
@@ -145,22 +159,22 @@ describe('Auto-fix: choosing another release', () => {
       [
         release({
           guid: 'same',
-          title: '[Erai-raws] Naruto - 002 [480p]',
-          releaseGroup: 'Erai-raws',
+          title: '[Kaze-raws] Kitsuraga - 002 [480p]',
+          releaseGroup: 'Kaze-raws',
           rejected: true,
           rejections: [EXISTING],
           qualityWeight: 900,
         }),
         release({
           guid: 'pack',
-          title: '[Judas] Naruto S01',
+          title: '[Tengu] Kitsuraga S01',
           fullSeason: true,
           rejected: true,
           rejections: ['Full season pack'],
         }),
         release({
           guid: 'low-score',
-          title: '[X] Naruto 002',
+          title: '[X] Kitsuraga 002',
           rejected: true,
           rejections: [
             'Custom Formats Original Language , Required Size have score 0 below Series profile minimum 100',
@@ -168,13 +182,13 @@ describe('Auto-fix: choosing another release', () => {
         }),
         release({
           guid: 'other-episode',
-          title: '[Judas] Naruto - 003',
+          title: '[Tengu] Kitsuraga - 003',
           mappedEpisodeInfo: [{ id: 3 }],
         }),
         release({
           guid: 'good',
-          title: '[Judas] Naruto - 002 [BD 1080p]',
-          releaseGroup: 'Judas',
+          title: '[Tengu] Kitsuraga - 002 [BD 1080p]',
+          releaseGroup: 'Tengu',
           rejected: true,
           rejections: [EXISTING],
           mappedEpisodeInfo: [{ id: 2 }],
@@ -192,7 +206,7 @@ describe('Auto-fix: choosing another release', () => {
       pickReplacement(
         [
           release({
-            title: '[Erai-raws] Naruto - 002 [480p].mkv',
+            title: '[Kaze-raws] Kitsuraga - 002 [480p].mkv',
             episodeRequested: true,
           }),
         ],
@@ -251,10 +265,20 @@ let grabbed: string[] = [];
 let searched: number[][] = [];
 let downloads: string[] = [];
 let episodes: ArrEpisode[] = [];
-/** Where each file came from, by episode id. */
+/** Source release per episode id. */
 let origins: Record<number, string> = {};
 let releases: ArrRelease[] = [];
 let modelAnswer = '{}';
+/** Sonarr's season search results. */
+let seasonReleases: ArrRelease[] = [];
+/** Season history: grabs and the files they became. */
+let seasonHistory: ArrHistoryRecord[] = [];
+/** History ids of grabs marked failed (blocklisted). */
+let markedFailed: number[] = [];
+let monitored: number[][] = [];
+/** Sonarr actions, in order. */
+let done: string[] = [];
+let quietRavens: Media;
 
 const call = async (method: string, url: string, body?: unknown) => {
   const res = await fetch(`http://127.0.0.1:${port}${url}`, {
@@ -265,7 +289,7 @@ const call = async (method: string, url: string, body?: unknown) => {
   return { status: res.status, body: await res.json() };
 };
 
-/** The automatic comment on an issue, once the background fix is done. */
+/** The auto-fix comment, once the background fix finishes. */
 const commentOn = async (issueId: number): Promise<string> => {
   for (let i = 0; i < 100; i++) {
     const comments = await getRepository(IssueComment).find({
@@ -289,6 +313,11 @@ beforeEach(async () => {
   origins = {};
   releases = [];
   modelAnswer = '{}';
+  seasonReleases = [];
+  seasonHistory = [];
+  markedFailed = [];
+  monitored = [];
+  done = [];
   episodes = [1, 2, 3, 4].map((n) => episode(n));
 
   const settings = getSettings();
@@ -313,7 +342,7 @@ beforeEach(async () => {
     dailyLimit: 0,
   };
 
-  // Issues and comments tell people; not in these tests.
+  // Silence issue notifications.
   mock.method(
     IssueSubscriber.prototype as unknown as {
       sendIssueNotification: () => Promise<void>;
@@ -335,7 +364,7 @@ beforeEach(async () => {
   }));
   mock.method(FixSonarr.prototype, 'episodeFile', async (id: number) => ({
     id,
-    releaseGroup: 'Erai-raws',
+    releaseGroup: 'Kaze-raws',
     mediaInfo: {
       runTime:
         episodes.find((e) => e.episodeFileId === id)?.runtime === 45
@@ -363,20 +392,46 @@ beforeEach(async () => {
   mock.method(FixSonarr.prototype, 'releases', async () => releases);
   mock.method(FixSonarr.prototype, 'deleteEpisodeFile', async (id: number) => {
     deleted.push(id);
+    done.push(`delete:${id}`);
   });
   mock.method(FixSonarr.prototype, 'grab', async (r: { guid: string }) => {
     grabbed.push(r.guid);
+    done.push(`grab:${r.guid}`);
   });
+  mock.method(
+    FixSonarr.prototype,
+    'seasonReleases',
+    async () => seasonReleases
+  );
+  mock.method(FixSonarr.prototype, 'seasonHistory', async () => seasonHistory);
+  mock.method(FixSonarr.prototype, 'seriesFacts', async () => ({
+    title: 'Quiet Ravens',
+    originalLanguage: 'English',
+  }));
+  mock.method(FixSonarr.prototype, 'monitorEpisodes', async (ids: number[]) => {
+    monitored.push(ids);
+  });
+  mock.getter(
+    FixSonarr.prototype,
+    'extras',
+    () =>
+      ({
+        markFailed: async (id: number) => {
+          markedFailed.push(id);
+          done.push(`failed:${id}`);
+        },
+      }) as unknown as ArrExtras
+  );
   mock.method(FixSonarr.prototype, 'searchEpisodes', async (ids: number[]) => {
     searched.push(ids);
   });
   mock.method(FixRadarr.prototype, 'movieDetail', async () => ({
     id: 9,
-    title: 'Groundhog Day',
+    title: 'Hedgehog Morning',
     hasFile: true,
     movieFile: {
       id: 900,
-      sceneName: 'Groundhog.Day.1993.1080p.BluRay.x264-OLD',
+      sceneName: 'Hedgehog.Morning.1993.1080p.BluRay.x264-OLD',
       releaseGroup: 'OLD',
     },
   }));
@@ -391,7 +446,7 @@ beforeEach(async () => {
 
   mock.method(BazarrAPI.prototype, 'getMovie', async () => ({
     radarrId: 9,
-    title: 'Groundhog Day',
+    title: 'Hedgehog Morning',
     profileId: 1,
     subtitles: [
       {
@@ -465,14 +520,14 @@ beforeEach(async () => {
     }
   );
 
-  // The model, at its HTTP call; TMDB, for the title it names.
+  // Stub the model's HTTP call, and TMDB for the title it names.
   mock.method(axios, 'post', async () => ({
     data: {
       content: [{ type: 'text', text: modelAnswer }],
       usage: { input_tokens: 1, output_tokens: 1 },
     },
   }));
-  // TMDB sets its methods on each instance: answered from the prototype.
+  // TMDB assigns methods per instance; pin them to the prototype.
   Object.defineProperty(TheMovieDb.prototype, 'searchMovies', {
     configurable: true,
     set() {},
@@ -483,7 +538,7 @@ beforeEach(async () => {
       results: [
         {
           id: 137,
-          title: 'Groundhog Day',
+          title: 'Hedgehog Morning',
           release_date: '1993-02-11',
           media_type: 'movie',
           genre_ids: [],
@@ -493,7 +548,7 @@ beforeEach(async () => {
           vote_count: 1,
           adult: false,
           original_language: 'en',
-          original_title: 'Groundhog Day',
+          original_title: 'Hedgehog Morning',
           video: false,
         },
       ],
@@ -522,14 +577,49 @@ beforeEach(async () => {
   actingAs = member;
   series = await getRepository(Media).save(
     new Media({
-      tmdbId: 46260,
-      tvdbId: 78857,
+      tmdbId: 58371,
+      tvdbId: 63914,
       mediaType: MediaType.TV,
       status: MediaStatus.AVAILABLE,
       serviceId: 0,
       externalServiceId: 77,
     })
   );
+  quietRavens = await getRepository(Media).save(
+    new Media({
+      tmdbId: 87316,
+      tvdbId: 521387,
+      mediaType: MediaType.TV,
+      status: MediaStatus.AVAILABLE,
+      serviceId: 0,
+      externalServiceId: 77,
+    })
+  );
+  Object.defineProperty(TheMovieDb.prototype, 'searchTvShows', {
+    configurable: true,
+    set() {},
+    get: () => async () => ({
+      page: 1,
+      total_pages: 1,
+      total_results: 1,
+      results: [
+        {
+          id: 87316,
+          name: 'Quiet Ravens',
+          first_air_date: '2022-04-01',
+          media_type: 'tv',
+          genre_ids: [],
+          overview: '',
+          popularity: 1,
+          vote_average: 8,
+          vote_count: 1,
+          origin_country: ['GB'],
+          original_language: 'en',
+          original_name: 'Quiet Ravens',
+        },
+      ],
+    }),
+  });
   movie = await getRepository(Media).save(
     new Media({
       tmdbId: 137,
@@ -573,7 +663,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  // A fix from an issue runs on after the route answers.
+  // Issue fixes outlive the route response.
   await autofix.idle();
   mock.restoreAll();
 });
@@ -586,9 +676,9 @@ describe('Auto-fix: reported issues', () => {
   it('replaces a broken episode only once another release is found, and says so on the issue', async () => {
     releases = [
       release({
-        guid: 'judas-2',
-        title: '[Judas] Show - S01E02 [BD 1080p]',
-        releaseGroup: 'Judas',
+        guid: 'tengu-2',
+        title: '[Tengu] Show - S01E02 [BD 1080p]',
+        releaseGroup: 'Tengu',
         rejected: true,
         rejections: [EXISTING],
         mappedEpisodeInfo: [{ id: 102 }],
@@ -607,10 +697,10 @@ describe('Auto-fix: reported issues', () => {
     assert.match(comment, /^Automatic fix: Replacing S01E02/);
     assert.match(
       comment,
-      /grabbed \[Judas\] Show - S01E02 \[BD 1080p\] from Nyaa/
+      /grabbed \[Tengu\] Show - S01E02 \[BD 1080p\] from Nyaa/
     );
     assert.deepEqual(deleted, [502]);
-    assert.deepEqual(grabbed, ['judas-2']);
+    assert.deepEqual(grabbed, ['tengu-2']);
   });
 
   it('leaves the file alone when there is nothing else to get', async () => {
@@ -630,8 +720,7 @@ describe('Auto-fix: reported issues', () => {
   });
 
   it('checks the whole season for a wrong episode, and replaces the ones that are off', async () => {
-    // Episode 3's file came from episode 4's release; episode 1 runs twice
-    // as long as it should.
+    // Episode 3's file is episode 4's release; episode 1 runs double length.
     origins = { 103: 'Show S01E04 1080p WEB-DL' };
     episodes[0] = { ...episodes[0], runtime: 45 };
     releases = [
@@ -699,7 +788,7 @@ describe('Auto-fix: reported issues', () => {
   });
 
   it('leaves the subtitles of a title on a Radarr Bazarr does not follow', async () => {
-    // A second Radarr numbers its films on its own: its 9 is not Bazarr's 9.
+    // A second Radarr has its own ids: its 9 is not Bazarr's 9.
     getSettings().radarr = [
       { ...RADARR, isDefault: true },
       { ...RADARR, id: 1, name: 'Radarr Anime', isDefault: false },
@@ -785,6 +874,95 @@ describe('Auto-fix: reported issues', () => {
     assert.match(result.message, /Backfill is checking indexers/);
   });
 
+  it('keeps its daily allowances and recent fixes across a restart', async () => {
+    const fix = () =>
+      autofix.run({
+        kind: 'subtitles',
+        media: movie,
+        language: 'es',
+        user: member,
+      });
+    assert.equal((await fix()).ok, true);
+    assert.deepEqual(downloads, ['subdl-es']);
+    // A restart forgets what was held in memory.
+    autofix.reset();
+    const again = await fix();
+    assert.equal(again.ok, false);
+    assert.match(again.message, /looked for in the last hour/);
+    assert.deepEqual(downloads, ['subdl-es']);
+
+    // A day's allowance used up before the restart stays used up.
+    await autofix.idle();
+    const day = new Date().toISOString().slice(0, 10);
+    await getRepository(AutoFixMark).upsert(
+      { key: `use:fix:${member.id}:${day}`, count: 30, at: new Date() },
+      ['key']
+    );
+    autofix.reset();
+    const refused = await autofix.run({
+      kind: 'missing',
+      media: movie,
+      user: member,
+    });
+    assert.equal(refused.ok, false);
+    assert.match(refused.message, /as many fixes today as allowed/);
+  });
+
+  it('says who approves what a missing-title search finds', async () => {
+    mock.method(FixRadarr.prototype, 'searchMovie', async () => undefined);
+    mock.method(backfill, 'readiness', () => ({ ready: true }));
+    mock.method(
+      backfill,
+      'track',
+      async (kind: string, serverId: number, arrId: number) =>
+        ({
+          id: 12,
+          kind,
+          serverId,
+          arrId,
+          status: 'stuck',
+        }) as unknown as BackfillSeries
+    );
+    mock.method(backfill, 'startSearch', () => undefined);
+    const settings = getSettings();
+    const before = settings.backfill;
+    settings.backfill = {
+      ...before,
+      autoApprove: { ...before.autoApprove, enabled: true },
+    };
+    try {
+      const forAdmin = await autofix.run({
+        kind: 'missing',
+        media: movie,
+        user: admin,
+      });
+      assert.match(forAdmin.message, /auto-approve rules allow at once/);
+      assert.doesNotMatch(forAdmin.message, /An admin approves/);
+      autofix.reset();
+      await getRepository(AutoFixMark).clear();
+      const forMember = await autofix.run({
+        kind: 'missing',
+        media: movie,
+        user: member,
+      });
+      assert.match(forMember.message, /An admin approves anything it finds/);
+    } finally {
+      settings.backfill = before;
+    }
+  });
+
+  it('asks the model again about the same words from someone else', async () => {
+    modelAnswer = JSON.stringify({ kind: 'subtitles', language: 'en' });
+    const post = axios.post as unknown as { mock: { callCount(): number } };
+    const before = post.mock.callCount();
+    const words = 'the words at the bottom say something else';
+    await askAboutReport(words, { user: member, episode: false });
+    await askAboutReport(words, { user: member, episode: false });
+    assert.equal(post.mock.callCount() - before, 1, 'the same person, once');
+    await askAboutReport(words, { user: admin, episode: false });
+    assert.equal(post.mock.callCount() - before, 2);
+  });
+
   it('hands a missing report on to the admin agent, should the searches find nothing', async () => {
     mock.method(FixRadarr.prototype, 'searchMovie', async () => undefined);
     mock.method(backfill, 'readiness', () => ({ ready: true }));
@@ -828,6 +1006,57 @@ describe('Auto-fix: reported issues', () => {
     );
   });
 
+  it('asks the model about a report the rules can’t read, and fixes its subtitles', async () => {
+    modelAnswer = JSON.stringify({
+      kind: 'subtitles',
+      language: 'en',
+      wrongSubtitles: true,
+    });
+    const res = await call('POST', '/api/v1/issue', {
+      issueType: IssueType.OTHER,
+      message: 'people talk but the words at the bottom say something else',
+      mediaId: movie.id,
+    });
+    const comment = await commentOn(res.body.id);
+    assert.match(comment, /Downloaded en subtitles from subdl/);
+    assert.deepEqual(downloads, ['subdl-1']);
+  });
+
+  it('leaves a file the model reads as bad for an admin', async () => {
+    modelAnswer = JSON.stringify({ kind: 'broken' });
+    const res = await call('POST', '/api/v1/issue', {
+      issueType: IssueType.OTHER,
+      message: 'something about this one is not right',
+      mediaId: series.id,
+      problemSeason: 1,
+      problemEpisode: 2,
+    });
+    const comment = await commentOn(res.body.id);
+    assert.equal(
+      comment,
+      'Automatic fix: this reads as a bad or broken file. That replaces files, so it is left for an admin.'
+    );
+    assert.deepEqual(deleted, []);
+    assert.deepEqual(grabbed, []);
+  });
+
+  it('reads nothing into a report when Understand Reports is off', async () => {
+    getSettings().main.disabledFeatures = ['aiReports'];
+    modelAnswer = JSON.stringify({ kind: 'broken' });
+    const res = await call('POST', '/api/v1/issue', {
+      issueType: IssueType.OTHER,
+      message: 'something about this one is not right',
+      mediaId: series.id,
+      problemSeason: 1,
+      problemEpisode: 2,
+    });
+    await autofix.idle();
+    const comments = await getRepository(IssueComment).find({
+      where: { issue: { id: res.body.id } },
+    });
+    assert.equal(comments.length, 1, 'only the report itself');
+  });
+
   it('does nothing when an admin turned it off', async () => {
     getSettings().main.disabledFeatures = ['autoFix'];
     const res = await call('POST', '/api/v1/issue', {
@@ -849,14 +1078,14 @@ describe('Auto-fix: reported issues', () => {
 describe('Auto-fix: from AI Search', () => {
   it('fetches subtitles at once when asked in plain words', async () => {
     modelAnswer = JSON.stringify({
-      r: 'Getting Spanish subtitles for Groundhog Day.',
-      titles: [{ t: 'Groundhog Day', y: 1993, k: 'movie' }],
+      r: 'Getting Spanish subtitles for Hedgehog Morning.',
+      titles: [{ t: 'Hedgehog Morning', y: 1993, k: 'movie' }],
       do: 'fix',
       fx: 'subtitles',
       lang: 'es',
     });
     const res = await call('POST', '/api/v1/ai/chat', {
-      message: 'get spanish subtitles for groundhog day',
+      message: 'get spanish subtitles for hedgehog morning',
     });
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.match(res.body.reply, /Downloaded es subtitles from subdl/);
@@ -864,26 +1093,79 @@ describe('Auto-fix: from AI Search', () => {
     assert.deepEqual(downloads, ['subdl-es']);
   });
 
+  it('only offers a fix the message itself did not ask for, and runs it once confirmed', async () => {
+    modelAnswer = JSON.stringify({
+      r: 'Getting Spanish subtitles for Hedgehog Morning.',
+      titles: [{ t: 'Hedgehog Morning', y: 1993, k: 'movie' }],
+      do: 'fix',
+      fx: 'subtitles',
+      lang: 'es',
+    });
+    const asked = await call('POST', '/api/v1/ai/chat', {
+      message: 'what did I watch last?',
+    });
+    assert.equal(asked.status, 200, JSON.stringify(asked.body));
+    assert.match(asked.body.reply, /Confirm to go ahead/);
+    assert.equal(asked.body.fix, undefined);
+    assert.deepEqual(downloads, []);
+    assert.deepEqual(asked.body.confirm, {
+      kind: 'subtitles',
+      mediaId: movie.id,
+      language: 'es',
+      message: 'what did I watch last?',
+    });
+
+    const res = await call('POST', '/api/v1/ai/fix', asked.body.confirm);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.match(res.body.reply, /Downloaded es subtitles from subdl/);
+    assert.deepEqual(downloads, ['subdl-es']);
+    assert.equal(await getRepository(Issue).count(), 0);
+  });
+
+  it('needs permission to report problems for any fix from AI Search', async () => {
+    actingAs = await getRepository(User).save(
+      Object.assign(member, { permissions: Permission.REQUEST })
+    );
+    modelAnswer = JSON.stringify({
+      r: 'Getting Spanish subtitles for Hedgehog Morning.',
+      titles: [{ t: 'Hedgehog Morning', y: 1993, k: 'movie' }],
+      do: 'fix',
+      fx: 'subtitles',
+      lang: 'es',
+    });
+    const res = await call('POST', '/api/v1/ai/chat', {
+      message: 'get spanish subtitles for hedgehog morning',
+    });
+    assert.match(res.body.reply, /needs permission to report problems/);
+    const direct = await call('POST', '/api/v1/ai/fix', {
+      kind: 'subtitles',
+      mediaId: movie.id,
+      language: 'es',
+      message: 'get spanish subtitles for hedgehog morning',
+    });
+    assert.match(direct.body.reply, /needs permission to report problems/);
+    assert.deepEqual(downloads, []);
+  });
+
   it('asks before replacing a file, then files it as an issue and fixes it in the background', async () => {
     releases = [
       release({
         guid: 'new',
-        title: 'Groundhog.Day.1993.1080p.BluRay.x264-NEW',
+        title: 'Hedgehog.Morning.1993.1080p.BluRay.x264-NEW',
         releaseGroup: 'NEW',
       }),
     ];
     modelAnswer = JSON.stringify({
       r: 'Replacing it.',
-      titles: [{ t: 'Groundhog Day', y: 1993, k: 'movie' }],
+      titles: [{ t: 'Hedgehog Morning', y: 1993, k: 'movie' }],
       do: 'fix',
       fx: 'broken',
     });
     const asked = await call('POST', '/api/v1/ai/chat', {
-      message: 'groundhog day has no sound',
+      message: 'hedgehog morning has no sound',
     });
     assert.equal(asked.status, 200, JSON.stringify(asked.body));
-    // Nothing is touched until they confirm, with the title it would act
-    // on shown to them.
+    // Nothing happens until confirmed, with the title shown.
     assert.equal(await getRepository(Issue).count(), 0);
     assert.equal(asked.body.fix, undefined);
     assert.deepEqual(
@@ -893,7 +1175,7 @@ describe('Auto-fix: from AI Search', () => {
     assert.deepEqual(asked.body.confirm, {
       kind: 'broken',
       mediaId: movie.id,
-      message: 'groundhog day has no sound',
+      message: 'hedgehog morning has no sound',
     });
 
     const res = await call('POST', '/api/v1/ai/fix', asked.body.confirm);
@@ -908,7 +1190,7 @@ describe('Auto-fix: from AI Search', () => {
     const comment = await commentOn(issueId);
     assert.match(
       comment,
-      /Replacing it: removed Groundhog\.Day\.1993\.1080p\.BluRay\.x264-OLD/
+      /Replacing it: removed Hedgehog\.Morning\.1993\.1080p\.BluRay\.x264-OLD/
     );
     assert.deepEqual(deleted, [900]);
     assert.deepEqual(grabbed, ['new']);
@@ -920,20 +1202,20 @@ describe('Auto-fix: from AI Search', () => {
     );
     modelAnswer = JSON.stringify({
       r: '',
-      titles: [{ t: 'Groundhog Day', y: 1993, k: 'movie' }],
+      titles: [{ t: 'Hedgehog Morning', y: 1993, k: 'movie' }],
       do: 'fix',
       fx: 'broken',
     });
     const res = await call('POST', '/api/v1/ai/chat', {
-      message: 'groundhog day is broken',
+      message: 'hedgehog morning is broken',
     });
     assert.match(res.body.reply, /needs permission to report problems/);
     assert.equal(res.body.confirm, undefined);
-    // Nor can it be confirmed by asking the server directly.
+    // Nor via a direct API call.
     const direct = await call('POST', '/api/v1/ai/fix', {
       kind: 'broken',
       mediaId: movie.id,
-      message: 'groundhog day is broken',
+      message: 'hedgehog morning is broken',
     });
     assert.match(direct.body.reply, /needs permission to report problems/);
     assert.equal(await getRepository(Issue).count(), 0);
@@ -943,7 +1225,7 @@ describe('Auto-fix: from AI Search', () => {
   it('acts on the title in the library, not the first TMDB has by that name', async () => {
     const found = (id: number, date: string) => ({
       id,
-      title: 'Groundhog Day',
+      title: 'Hedgehog Morning',
       release_date: date,
       media_type: 'movie',
       genre_ids: [],
@@ -953,10 +1235,10 @@ describe('Auto-fix: from AI Search', () => {
       vote_count: 1,
       adult: false,
       original_language: 'en',
-      original_title: 'Groundhog Day',
+      original_title: 'Hedgehog Morning',
       video: false,
     });
-    // A newer film by the same name comes first, and is not on the server.
+    // A newer same-named film ranks first but isn't on the server.
     Object.defineProperty(TheMovieDb.prototype, 'searchMovies', {
       configurable: true,
       set() {},
@@ -969,13 +1251,13 @@ describe('Auto-fix: from AI Search', () => {
     });
     modelAnswer = JSON.stringify({
       r: '',
-      titles: [{ t: 'Groundhog Day', k: 'movie' }],
+      titles: [{ t: 'Hedgehog Morning', k: 'movie' }],
       do: 'fix',
       fx: 'subtitles',
       lang: 'es',
     });
     const res = await call('POST', '/api/v1/ai/chat', {
-      message: 'spanish subtitles for groundhog day',
+      message: 'spanish subtitles for hedgehog morning',
     });
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.match(res.body.reply, /Downloaded es subtitles/);
@@ -988,34 +1270,1061 @@ describe('Auto-fix: from AI Search', () => {
   it('points at the open report when the same problem is asked about again', async () => {
     modelAnswer = JSON.stringify({
       r: '',
-      titles: [{ t: 'Groundhog Day', y: 1993, k: 'movie' }],
+      titles: [{ t: 'Hedgehog Morning', y: 1993, k: 'movie' }],
       do: 'fix',
       fx: 'broken',
     });
     const asked = await call('POST', '/api/v1/ai/chat', {
-      message: 'groundhog day has no sound',
+      message: 'hedgehog morning has no sound',
     });
     const first = await call('POST', '/api/v1/ai/fix', asked.body.confirm);
     await commentOn(Number(first.body.fix.link.split('/').pop()));
     const again = await call('POST', '/api/v1/ai/chat', {
-      message: 'groundhog day still has no sound',
+      message: 'hedgehog morning still has no sound',
     });
     assert.match(again.body.reply, /reported this already today/);
     assert.equal(again.body.fix.link, first.body.fix.link);
     assert.equal(await getRepository(Issue).count(), 1);
   });
 
+  describe('a title newer than the model', () => {
+    // An on-server sequel TMDB finds only by its own name.
+    const film = (id: number, title: string, date: string) => ({
+      id,
+      title,
+      release_date: date,
+      media_type: 'movie',
+      genre_ids: [],
+      overview: '',
+      popularity: 1,
+      vote_average: 8,
+      vote_count: 1,
+      adult: false,
+      original_language: 'en',
+      original_title: title,
+      video: false,
+    });
+    beforeEach(async () => {
+      await getRepository(Media).save(
+        new Media({
+          tmdbId: 4242,
+          mediaType: MediaType.MOVIE,
+          status: MediaStatus.AVAILABLE,
+          serviceId: 0,
+          externalServiceId: 10,
+        })
+      );
+      Object.defineProperty(TheMovieDb.prototype, 'searchMovies', {
+        configurable: true,
+        set() {},
+        get:
+          () =>
+          async ({ query }: { query: string }) => {
+            const results =
+              /hedgehog/i.test(query) && !/:/.test(query)
+                ? [
+                    film(137, 'Hedgehog Morning', '1993-02-11'),
+                    film(
+                      4242,
+                      'Hedgehog Morning: Beyond the Hedge',
+                      '2031-05-02'
+                    ),
+                  ]
+                : [];
+            return {
+              page: 1,
+              total_pages: 1,
+              total_results: results.length,
+              results,
+            };
+          },
+      });
+    });
+
+    it('finds it by their words when the model renames it', async () => {
+      modelAnswer = JSON.stringify({
+        r: '',
+        titles: [{ t: 'Hedgehog Morning: The Hedge', k: 'movie' }],
+        do: 'fix',
+        fx: 'subtitles',
+        lang: 'es',
+      });
+      const res = await call('POST', '/api/v1/ai/chat', {
+        message: 'Fix spanish subtitles for hedgehog morning beyond the hedge',
+      });
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.match(res.body.reply, /Downloaded es subtitles/);
+      assert.deepEqual(
+        res.body.results.map((r: { id: number }) => r.id),
+        [4242]
+      );
+    });
+
+    it('finds it by their words when the model names no title', async () => {
+      modelAnswer = JSON.stringify({
+        r: '',
+        titles: [],
+        do: 'fix',
+        fx: 'subtitles',
+        lang: 'es',
+      });
+      const res = await call('POST', '/api/v1/ai/chat', {
+        message: 'get spanish subtitles for Hedgehog Morning Beyond the Hedge',
+      });
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.deepEqual(
+        res.body.results.map((r: { id: number }) => r.id),
+        [4242]
+      );
+    });
+
+    it('asks which one when their words could mean either', async () => {
+      modelAnswer = JSON.stringify({
+        r: '',
+        titles: [],
+        do: 'fix',
+        fx: 'subtitles',
+        lang: 'es',
+      });
+      const res = await call('POST', '/api/v1/ai/chat', {
+        message: 'fix the subtitles on hedgehog',
+      });
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.match(res.body.reply, /^Which title is it/);
+      assert.deepEqual(downloads, []);
+    });
+  });
+
   it('says so when the title is not on the server', async () => {
     await getRepository(Media).delete({ id: movie.id });
     modelAnswer = JSON.stringify({
       r: '',
-      titles: [{ t: 'Groundhog Day', y: 1993, k: 'movie' }],
+      titles: [{ t: 'Hedgehog Morning', y: 1993, k: 'movie' }],
       do: 'fix',
       fx: 'subtitles',
     });
     const res = await call('POST', '/api/v1/ai/chat', {
-      message: 'subtitles for groundhog day',
+      message: 'subtitles for hedgehog morning',
     });
     assert.match(res.body.reply, /not on the server yet/);
+  });
+});
+
+// ---- a whole season --------------------------------------------------------------
+
+/** Source release of Quiet Ravens season 6 on the fake Sonarr. */
+const OLD_PACK = 'Quiet.Ravens.S06.1080p.ATVP.WEB-DL.DDP5.1.H.264-OLDGRP';
+
+/**
+ * Quiet Ravens season 6: five episodes, all from one pack per Sonarr history.
+ */
+const season6 = () => {
+  episodes = [1, 2, 3, 4, 5].map((n) =>
+    episode(n, {
+      id: 600 + n,
+      seasonNumber: 6,
+      absoluteEpisodeNumber: 30 + n,
+      episodeFileId: 1600 + n,
+    })
+  );
+  seasonHistory = [
+    ...episodes.map((ep) => ({
+      id: 9100 + ep.episodeNumber,
+      eventType: 'downloadFolderImported',
+      sourceTitle: OLD_PACK,
+      date: '2026-10-01T01:00:00Z',
+      downloadId: 'old',
+      episodeId: ep.id,
+      data: {
+        fileId: String(ep.episodeFileId),
+        droppedPath: `/downloads/${OLD_PACK}/Quiet.Ravens.S06E0${ep.episodeNumber}.mkv`,
+      },
+    })),
+    {
+      id: 9001,
+      eventType: 'grabbed',
+      sourceTitle: OLD_PACK,
+      date: '2026-10-01T00:00:00Z',
+      downloadId: 'old',
+      episodeId: 601,
+      data: { guid: 'old-guid' },
+    },
+  ];
+};
+
+/** A season pack Sonarr only turns down for the files already there. */
+const pack = (guid: string, title: string, over: Partial<ArrRelease> = {}) =>
+  release({
+    guid,
+    title,
+    fullSeason: true,
+    rejected: true,
+    rejections: [EXISTING],
+    mappedEpisodeInfo: [601, 602, 603, 604, 605].map((id) => ({ id })),
+    indexer: 'Torznab',
+    ...over,
+  });
+
+/** One episode's release. */
+const single = (n: number, over: Partial<ArrRelease> = {}) =>
+  release({
+    guid: `single-${n}`,
+    title: `Quiet.Ravens.S06E0${n}.1080p.WEB.H.264-EPGRP`,
+    rejected: true,
+    rejections: [EXISTING],
+    mappedEpisodeInfo: [{ id: 600 + n }],
+    indexer: 'Torznab',
+    ...over,
+  });
+
+const NEW_PACK = 'Quiet.Ravens.S06.1080p.WEB-DL-NEWGRP';
+
+/** Messages the admin agent sends admins. */
+const agentReady = () => {
+  const sent: { subject?: string; message?: string }[] = [];
+  mock.method(agent, 'problem', () => null);
+  mock.method(
+    notificationManager,
+    'sendNotification',
+    (_type: unknown, payload: { subject?: string; message?: string }) => {
+      sent.push(payload);
+    }
+  );
+  return sent;
+};
+
+/** A run, once the agent finishes it. */
+const settled = async (id: number) => {
+  for (let i = 0; i < 200; i++) {
+    const run = await getRepository(AgentRun).findOneOrFail({ where: { id } });
+    if (['done', 'failed'].includes(run.status) && !agent.isBusy()) return run;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error('The run did not finish');
+};
+
+/** An issue's comments, oldest first, once there are `count`. */
+const commentsOn = async (issueId: number, count: number) => {
+  for (let i = 0; i < 100; i++) {
+    const comments = await getRepository(IssueComment).find({
+      where: { issue: { id: issueId } },
+      order: { id: 'ASC' },
+    });
+    if (comments.length >= count) return comments.map((c) => c.message);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error(`Fewer than ${count} comments were written`);
+};
+
+/** Sonarr state after the new files import. */
+const filesBack = () =>
+  mock.method(BackfillSonarr.prototype, 'getSeriesEpisodes', async () =>
+    episodes.map((ep) => ({ ...ep, hasFile: true }))
+  );
+
+describe('Auto-fix: the title in their words', () => {
+  it('takes the words of the report out', () => {
+    for (const [said, title] of [
+      [
+        'Fix hedgehog morning beyond the hedge',
+        'hedgehog morning beyond the hedge',
+      ],
+      ['Quiet Ravens S02E04 has no sound', 'Quiet Ravens'],
+      [
+        'the subtitles on Quiet Ravens season 2 are out of sync',
+        'Quiet Ravens',
+      ],
+      [
+        'can you replace episode 3 of Quiet Ravens, it is broken',
+        'Quiet Ravens',
+      ],
+      [
+        "Once Upon a Morning in the Hedge won't play",
+        'Once Upon a Morning in the Hedge',
+      ],
+    ]) {
+      assert.equal(titleInTheirWords(said), title, said);
+    }
+    assert.equal(titleInTheirWords('fix it'), undefined);
+  });
+});
+
+describe('Auto-fix: reading which season and episode', () => {
+  it('reads the season and episode however they are said', () => {
+    assert.deepEqual(seasonEpisodeIn('Fix season 6 of quiet ravens'), {
+      season: 6,
+    });
+    assert.deepEqual(
+      seasonEpisodeIn('Whole season 6 is messed up of quiet ravens'),
+      { season: 6 }
+    );
+    assert.deepEqual(seasonEpisodeIn('s6 of quiet ravens is broken'), {
+      season: 6,
+    });
+    assert.deepEqual(seasonEpisodeIn('S06E03 has no sound'), {
+      season: 6,
+      episode: 3,
+    });
+    assert.deepEqual(
+      seasonEpisodeIn('episode 3 of season 6 is the wrong one'),
+      { season: 6, episode: 3 }
+    );
+    assert.deepEqual(seasonEpisodeIn('season six episode two'), {
+      season: 6,
+      episode: 2,
+    });
+    assert.deepEqual(seasonEpisodeIn('6x03 skips'), { season: 6, episode: 3 });
+    assert.deepEqual(seasonEpisodeIn('episode 4 is wrong'), { episode: 4 });
+    assert.deepEqual(seasonEpisodeIn('Starwake has no sound'), {});
+    assert.deepEqual(seasonEpisodeIn('Chrome Courier 2049 is broken'), {});
+  });
+
+  it('tells a whole season to replace from mixed-up episodes', () => {
+    assert.equal(
+      classify('Whole season 6 is messed up of quiet ravens')?.kind,
+      'replaceSeason'
+    );
+    assert.equal(classify('replace all of season 2')?.kind, 'replaceSeason');
+    assert.equal(
+      classify('season 3 needs redownloading')?.kind,
+      'replaceSeason'
+    );
+    assert.equal(
+      classify('the entire season is broken', IssueType.VIDEO)?.kind,
+      'replaceSeason'
+    );
+    assert.equal(
+      classify('episodes are mixed up in season 2')?.kind,
+      'wrongEpisode'
+    );
+    assert.equal(classify('season 2 episode 5 is broken')?.kind, 'broken');
+    assert.equal(
+      classify('replace the subtitles for season 2')?.kind,
+      'subtitles'
+    );
+    assert.equal(classify('Fix season 6 of quiet ravens'), undefined);
+    assert.equal(classify('season 6 all bad')?.kind, 'replaceSeason');
+    assert.equal(classify('season all wrong')?.kind, 'replaceSeason');
+  });
+
+  it('reads a long report in good time, whatever is in it', () => {
+    // Reports can be request-body sized; long space runs after "season"
+    // must not cause quadratic regex time.
+    const started = Date.now();
+    for (const text of [
+      `season${' '.repeat(90_000)}x`,
+      `season 2${' '.repeat(90_000)}x`,
+      `${'season '.repeat(12_000)}x`,
+    ]) {
+      classify(text, IssueType.VIDEO);
+      seasonEpisodeIn(text);
+    }
+    assert.ok(Date.now() - started < 500, `${Date.now() - started} ms`);
+  });
+});
+
+describe('Auto-fix: replacing a whole season', () => {
+  it('takes a season pack that is not the old release, and removes the old files only once it is grabbed', async () => {
+    season6();
+    // Episode 2 is unmonitored and must be re-monitored.
+    episodes[1] = { ...episodes[1], monitored: false };
+    seasonReleases = [
+      // The files' source, best quality: never retaken.
+      pack('old-again', OLD_PACK, { qualityWeight: 900 }),
+      // Dubbed into a language the series isn't in.
+      pack('german', 'Quiet.Ravens.S06.GERMAN.1080p.WEB.x264-GERGRP', {
+        qualityWeight: 800,
+        languages: [{ id: 4, name: 'German' }],
+      }),
+      // A quality the profile rejects.
+      pack('unwanted', 'Quiet.Ravens.S06.480p.WEB.x264-LOW', {
+        rejections: ['WEBDL-480p is not wanted in profile'],
+      }),
+      // A single episode better than any pack; the pack still wins.
+      single(1, { qualityWeight: 950 }),
+      pack('good', 'Quiet.Ravens.S06.1080p.ATVP.WEB-DL.DDP5.1.H.264-NEWGRP', {
+        qualityWeight: 700,
+      }),
+    ];
+    const result = await autofix.run({
+      kind: 'replaceSeason',
+      media: quietRavens,
+      seasonNumber: 6,
+      user: admin,
+    });
+    assert.equal(result.ok, true, result.message);
+    assert.deepEqual(grabbed, ['good']);
+    // Order: grab, blocklist old release, delete files.
+    assert.deepEqual(done, [
+      'grab:good',
+      'failed:9001',
+      'delete:1601',
+      'delete:1602',
+      'delete:1603',
+      'delete:1604',
+      'delete:1605',
+    ]);
+    assert.deepEqual(markedFailed, [9001]);
+    assert.deepEqual(monitored, [[602]]);
+    assert.match(
+      result.message,
+      /grabbed the season pack Quiet\.Ravens\.S06\.1080p\.ATVP\.WEB-DL\.DDP5\.1\.H\.264-NEWGRP from Torznab/
+    );
+    assert.match(result.message, /the 5 old files were removed/);
+    assert.match(result.message, /marked failed in Sonarr/);
+  });
+
+  it('takes a release per episode when there is no season pack, and keeps the files of episodes it found nothing for', async () => {
+    season6();
+    seasonReleases = [single(1), single(2), single(3)];
+    // Episode 4 found by its own search; episode 5 not at all.
+    mock.method(FixSonarr.prototype, 'releases', async (episodeId: number) =>
+      episodeId === 604 ? [single(4)] : []
+    );
+    const result = await autofix.run({
+      kind: 'replaceSeason',
+      media: quietRavens,
+      seasonNumber: 6,
+      user: admin,
+    });
+    assert.equal(result.ok, true, result.message);
+    assert.deepEqual(grabbed, ['single-1', 'single-2', 'single-3', 'single-4']);
+    assert.deepEqual(deleted, [1601, 1602, 1603, 1604]);
+    const firstDelete = done.findIndex((d) => d.startsWith('delete'));
+    assert.equal(
+      done.slice(0, firstDelete).filter((d) => d.startsWith('grab')).length,
+      4,
+      done.join(', ')
+    );
+    assert.match(
+      result.message,
+      /one per episode \(no season pack was found\)/
+    );
+    assert.match(
+      result.message,
+      /No other release was found for S06E05, so its file stays\./
+    );
+  });
+
+  it('removes nothing when no other release is found, and hands it to the admin agent', async () => {
+    season6();
+    seasonReleases = [
+      pack('old-again', OLD_PACK),
+      pack('unwanted', 'Quiet.Ravens.S06.480p.WEB.x264-LOW', {
+        rejections: ['WEBDL-480p is not wanted in profile'],
+      }),
+    ];
+    mock.method(backfill, 'readiness', () => ({ ready: true }));
+    mock.method(
+      backfill,
+      'track',
+      async (kind: string, serverId: number, arrId: number) =>
+        ({
+          id: 12,
+          kind,
+          serverId,
+          arrId,
+          title: 'Quiet Ravens',
+          status: 'stuck',
+        }) as unknown as BackfillSeries
+    );
+    const handed: Record<string, unknown>[] = [];
+    mock.method(
+      agent,
+      'afterReport',
+      async (report: Record<string, unknown>) => {
+        handed.push(report);
+        return { id: 1 };
+      }
+    );
+    const result = await autofix.run({
+      kind: 'replaceSeason',
+      media: quietRavens,
+      seasonNumber: 6,
+      user: admin,
+      issueId: 7,
+    });
+    assert.equal(result.ok, false);
+    assert.match(
+      result.message,
+      /^No other release of season 6 was found, so nothing was removed\./
+    );
+    assert.match(result.message, /The admin agent looks further/);
+    assert.deepEqual(grabbed, []);
+    assert.deepEqual(deleted, []);
+    assert.deepEqual(markedFailed, []);
+    assert.deepEqual(
+      handed.map((h) => [h.seasonNumber, h.replace, h.issueId]),
+      [[6, true, 7]]
+    );
+  });
+
+  it('removes nothing when the replacement cannot be grabbed', async () => {
+    season6();
+    seasonReleases = [pack('good', NEW_PACK)];
+    mock.method(FixSonarr.prototype, 'grab', async () => {
+      throw new Error('Sonarr said no');
+    });
+    const result = await autofix.run({
+      kind: 'replaceSeason',
+      media: quietRavens,
+      seasonNumber: 6,
+      user: admin,
+    });
+    assert.equal(result.ok, false);
+    assert.match(
+      result.message,
+      /could not be grabbed, so nothing was removed/
+    );
+    assert.deepEqual(deleted, []);
+    assert.deepEqual(markedFailed, []);
+  });
+
+  it('lets an admin replace a season again the same day, and anyone else ask once a day', async () => {
+    season6();
+    seasonReleases = [pack('good', NEW_PACK)];
+    agentReady();
+    const replace = (user: User) =>
+      autofix.run({
+        kind: 'replaceSeason',
+        media: quietRavens,
+        seasonNumber: 6,
+        user,
+      });
+    assert.equal((await replace(admin)).ok, true);
+    assert.equal((await replace(admin)).ok, true);
+    assert.deepEqual(grabbed, ['good', 'good']);
+
+    const first = await replace(member);
+    assert.equal(first.ok, true, first.message);
+    const again = await replace(member);
+    assert.equal(again.ok, false);
+    assert.match(again.message, /already asked to be replaced today/);
+    assert.equal(
+      await getRepository(AgentRun).count({ where: { status: 'waiting' } }),
+      1
+    );
+  });
+
+  it("puts anyone else's request to an admin; approved, it is replaced and followed until it is back", async () => {
+    season6();
+    seasonReleases = [pack('good', NEW_PACK)];
+    const sent = agentReady();
+    actingAs = member;
+    const res = await call('POST', '/api/v1/issue', {
+      issueType: IssueType.OTHER,
+      message: 'The whole season is messed up, please replace it',
+      mediaId: quietRavens.id,
+      problemSeason: 6,
+    });
+    assert.equal(res.status, 201, JSON.stringify(res.body));
+    const issueId = res.body.id;
+    const waitingNote = await commentOn(issueId);
+    assert.match(waitingNote, /waiting for an admin/);
+    assert.match(waitingNote, /Nothing changes until then/);
+    // Nothing has changed yet.
+    assert.deepEqual(grabbed, []);
+    assert.deepEqual(deleted, []);
+    const run = await getRepository(AgentRun).findOneOrFail({
+      where: { status: 'waiting' },
+    });
+    assert.equal(
+      run.question,
+      `Waiting for approval: Replace season 6 of Quiet Ravens: download ${NEW_PACK} and then remove the 5 current files.`
+    );
+    assert.equal(run.trigger, 'report');
+    assert.equal(run.requestedByName, member.displayName);
+    assert.match(sent[0]?.subject ?? '', /needs your approval/);
+
+    const proposal = (run.memory as { proposal: { id: string } }).proposal;
+    await agent.approve(run.id, proposal.id, admin);
+    const finished = await settled(run.id);
+    assert.equal(finished.status, 'done', finished.error ?? '');
+    assert.deepEqual(done, [
+      'grab:good',
+      'failed:9001',
+      'delete:1601',
+      'delete:1602',
+      'delete:1603',
+      'delete:1604',
+      'delete:1605',
+    ]);
+    const said = await commentsOn(issueId, 3);
+    assert.match(said[2], /^Admin agent: Approved by fix-admin\./);
+    assert.match(said[2], /grabbed the season pack/);
+
+    // Followed until files import, then the reporter is told.
+    const follow = await getRepository(AgentRun).findOneOrFail({
+      where: { status: 'held' },
+    });
+    filesBack();
+    await agent.checkHeld();
+    const back = await commentsOn(issueId, 4);
+    assert.equal(
+      back[3],
+      'Automatic fix: Season 6 of Quiet Ravens is back: all 5 new files have been imported.'
+    );
+    assert.equal(
+      (
+        await getRepository(AgentRun).findOneOrFail({
+          where: { id: follow.id },
+        })
+      ).status,
+      'done'
+    );
+  });
+
+  it('changes nothing when an admin declines, and tells the reporter', async () => {
+    season6();
+    seasonReleases = [pack('good', NEW_PACK)];
+    agentReady();
+    actingAs = member;
+    const res = await call('POST', '/api/v1/issue', {
+      issueType: IssueType.OTHER,
+      message: 'Whole season 6 needs redownloading',
+      mediaId: quietRavens.id,
+      problemSeason: 6,
+    });
+    await commentOn(res.body.id);
+    const run = await getRepository(AgentRun).findOneOrFail({
+      where: { status: 'waiting' },
+    });
+    const proposal = (run.memory as { proposal: { id: string } }).proposal;
+    await agent.decline(run.id, proposal.id, admin);
+    const said = await commentsOn(res.body.id, 3);
+    assert.match(
+      said[2],
+      /^Admin agent: An admin declined this: Replace season 6/
+    );
+    assert.match(said[2], /Nothing was changed\./);
+    assert.deepEqual(grabbed, []);
+    assert.deepEqual(deleted, []);
+    assert.deepEqual(markedFailed, []);
+  });
+
+  it('says an admin is needed when no admin agent can ask for approval', async () => {
+    season6();
+    seasonReleases = [pack('good', NEW_PACK)];
+    const result = await autofix.run({
+      kind: 'replaceSeason',
+      media: quietRavens,
+      seasonNumber: 6,
+      user: member,
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.message, /needs an admin’s approval/);
+    assert.deepEqual(grabbed, []);
+    assert.equal(await getRepository(AgentRun).count(), 0);
+  });
+
+  it('follows an admin’s replacement on its issue until it is back', async () => {
+    season6();
+    seasonReleases = [pack('good', NEW_PACK)];
+    actingAs = admin;
+    const res = await call('POST', '/api/v1/issue', {
+      issueType: IssueType.OTHER,
+      message: 'Replace all of season 6',
+      mediaId: quietRavens.id,
+      problemSeason: 6,
+    });
+    assert.match(await commentOn(res.body.id), /grabbed the season pack/);
+    const follow = await getRepository(AgentRun).findOneOrFail({
+      where: { status: 'held' },
+    });
+    assert.deepEqual(
+      (follow.memory as { report: { follow: { episodeIds: number[] } } }).report
+        .follow.episodeIds,
+      [601, 602, 603, 604, 605]
+    );
+    // Not yet: still downloading.
+    mock.method(BackfillSonarr.prototype, 'getSeriesEpisodes', async () =>
+      episodes.map((ep) => ({ ...ep, hasFile: false }))
+    );
+    await agent.checkHeld();
+    assert.equal((await commentsOn(res.body.id, 2)).length, 2);
+    filesBack();
+    await agent.checkHeld();
+    assert.match(
+      (await commentsOn(res.body.id, 3))[2],
+      /^Automatic fix: Season 6 of Quiet Ravens is back/
+    );
+  });
+});
+
+describe('Auto-fix: a season from AI Search and issues', () => {
+  it('“Fix season 6 of quiet ravens” with nothing missing asks what is wrong, and replacing it then works', async () => {
+    season6();
+    actingAs = admin;
+    // A real model answer: missing episodes.
+    modelAnswer = JSON.stringify({
+      r: 'Looking for what is missing in season 6.',
+      titles: [{ t: 'Quiet Ravens', y: 2022, k: 'tv' }],
+      do: 'fix',
+      fx: 'missing',
+      se: 6,
+    });
+    const ask = 'Fix season 6 of quiet ravens';
+    const res = await call('POST', '/api/v1/ai/chat', { message: ask });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.match(
+      res.body.reply,
+      /^Sonarr has every aired episode of season 6, so nothing is missing\./
+    );
+    assert.match(
+      res.body.reply,
+      /replace the whole season, check it for mixed-up episodes, or fix its subtitles\?$/
+    );
+    assert.doesNotMatch(res.body.reply, /report it as/);
+    assert.equal(res.body.confirm, undefined);
+
+    // The model names the earlier title but no season; it comes from the
+    // conversation.
+    modelAnswer = JSON.stringify({
+      r: 'Replacing season 6.',
+      titles: [{ t: 'Quiet Ravens', y: 2022, k: 'tv' }],
+      do: 'fix',
+      fx: 'replaceSeason',
+    });
+    const chosen = await call('POST', '/api/v1/ai/chat', {
+      message: 'Replace the whole season',
+      turns: [{ ask, reply: res.body.reply, offered: [] }],
+    });
+    assert.equal(chosen.status, 200, JSON.stringify(chosen.body));
+    assert.deepEqual(chosen.body.confirm, {
+      kind: 'replaceSeason',
+      mediaId: quietRavens.id,
+      seasonNumber: 6,
+      message: 'Replace the whole season',
+    });
+    assert.match(chosen.body.reply, /all of season 6 of Quiet Ravens/);
+
+    seasonReleases = [pack('good', NEW_PACK)];
+    const fixed = await call('POST', '/api/v1/ai/fix', chosen.body.confirm);
+    assert.equal(fixed.status, 200, JSON.stringify(fixed.body));
+    assert.match(
+      fixed.body.reply,
+      /^Reported it, and started replacing season 6/
+    );
+    const issueId = Number(fixed.body.fix.link.split('/').pop());
+    const issue = await getRepository(Issue).findOneOrFail({
+      where: { id: issueId },
+    });
+    assert.equal(issue.problemSeason, 6);
+    assert.match(await commentOn(issueId), /grabbed the season pack/);
+    assert.deepEqual(grabbed, ['good']);
+  });
+
+  it('“Whole season 6 is messed up of quiet ravens” is filed on season 6, not All Seasons, and replaced for an admin', async () => {
+    season6();
+    seasonReleases = [pack('good', NEW_PACK)];
+    actingAs = admin;
+    // A real model answer: wrong episode, no season.
+    modelAnswer = JSON.stringify({
+      r: 'Checking season 6.',
+      titles: [{ t: 'Quiet Ravens', y: 2022, k: 'tv' }],
+      do: 'fix',
+      fx: 'wrongEpisode',
+    });
+    const message = 'Whole season 6 is messed up of quiet ravens';
+    const asked = await call('POST', '/api/v1/ai/chat', { message });
+    assert.equal(asked.status, 200, JSON.stringify(asked.body));
+    assert.deepEqual(asked.body.confirm, {
+      kind: 'replaceSeason',
+      mediaId: quietRavens.id,
+      seasonNumber: 6,
+      message,
+    });
+    assert.match(asked.body.reply, /This replaces all of season 6/);
+    assert.match(asked.body.reply, /removed only once it is grabbed/);
+
+    const res = await call('POST', '/api/v1/ai/fix', asked.body.confirm);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    const issueId = Number(res.body.fix.link.split('/').pop());
+    const issue = await getRepository(Issue).findOneOrFail({
+      where: { id: issueId },
+    });
+    assert.equal(issue.problemSeason, 6, 'not All Seasons');
+    assert.equal(issue.problemEpisode, 0);
+    const comment = await commentOn(issueId);
+    assert.doesNotMatch(comment, /Say which season/);
+    assert.match(comment, /grabbed the season pack/);
+    assert.deepEqual(grabbed, ['good']);
+    assert.equal(deleted.length, 5);
+  });
+
+  it('“Whole season 6 is messed up of quiet ravens” from anyone else waits for an admin', async () => {
+    season6();
+    seasonReleases = [pack('good', NEW_PACK)];
+    agentReady();
+    modelAnswer = JSON.stringify({
+      r: 'Checking season 6.',
+      titles: [{ t: 'Quiet Ravens', y: 2022, k: 'tv' }],
+      do: 'fix',
+      fx: 'wrongEpisode',
+    });
+    const message = 'Whole season 6 is messed up of quiet ravens';
+    const asked = await call('POST', '/api/v1/ai/chat', { message });
+    assert.equal(asked.body.confirm.seasonNumber, 6);
+    assert.match(asked.body.reply, /An admin approves it first/);
+    const res = await call('POST', '/api/v1/ai/fix', asked.body.confirm);
+    assert.match(res.body.reply, /needs an admin’s approval/);
+    const issueId = Number(res.body.fix.link.split('/').pop());
+    const issue = await getRepository(Issue).findOneOrFail({
+      where: { id: issueId },
+    });
+    assert.equal(issue.problemSeason, 6);
+    assert.match(await commentOn(issueId), /waiting for an admin/);
+    assert.deepEqual(grabbed, []);
+    assert.deepEqual(deleted, []);
+  });
+
+  it('carries the season and episode said into the issue, whatever the model gave', async () => {
+    season6();
+    modelAnswer = JSON.stringify({
+      r: '',
+      titles: [{ t: 'Quiet Ravens', y: 2022, k: 'tv' }],
+      do: 'fix',
+      fx: 'wrongEpisode',
+      se: 1,
+    });
+    const asked = await call('POST', '/api/v1/ai/chat', {
+      message: 'S06E03 of quiet ravens is the wrong episode',
+    });
+    assert.equal(asked.body.confirm.seasonNumber, 6);
+    assert.equal(asked.body.confirm.episodeNumber, 3);
+    const res = await call('POST', '/api/v1/ai/fix', asked.body.confirm);
+    const issue = await getRepository(Issue).findOneOrFail({
+      where: { id: Number(res.body.fix.link.split('/').pop()) },
+    });
+    assert.equal(issue.problemSeason, 6);
+    assert.equal(issue.problemEpisode, 3);
+  });
+
+  it('reads the season from a report filed on All Seasons', async () => {
+    season6();
+    actingAs = admin;
+    seasonReleases = [pack('good', NEW_PACK)];
+    const res = await call('POST', '/api/v1/issue', {
+      issueType: IssueType.OTHER,
+      message: 'The whole season 6 is messed up',
+      mediaId: quietRavens.id,
+      problemSeason: 0,
+    });
+    assert.equal(res.status, 201, JSON.stringify(res.body));
+    assert.match(await commentOn(res.body.id), /grabbed the season pack/);
+    const issue = await getRepository(Issue).findOneOrFail({
+      where: { id: res.body.id },
+    });
+    assert.equal(issue.problemSeason, 6);
+    assert.deepEqual(grabbed, ['good']);
+  });
+});
+
+// ---- music --------------------------------------------------------------------
+
+describe('Auto-fix: music from AI Search', () => {
+  const ARTIST = '3c9e5f21-8d47-4b6a-a1e3-5f7d2c90b844';
+  const GROUP = '7e41c0d8-5b29-3f6c-b8a4-91d6e2f07a35';
+  let commands: { name: string; options: Record<string, unknown> }[];
+  /** On Lidarr 0 as artist 31; Sonarr 0 has a series 31 too. */
+  let artist: Media;
+
+  beforeEach(async () => {
+    commands = [];
+    getSettings().lidarr = [
+      {
+        id: 0,
+        name: 'Lidarr',
+        hostname: '127.0.0.1',
+        port: 1,
+        apiKey: 'k',
+        useSsl: false,
+        baseUrl: '',
+        isDefault: true,
+      } as never,
+    ];
+    mock.method(
+      LidarrAPI.prototype as unknown as {
+        runCommand: (name: string, options: object) => Promise<void>;
+      },
+      'runCommand',
+      async (name: string, options: Record<string, unknown>) => {
+        commands.push({ name, options });
+      }
+    );
+    const credit = [
+      { name: 'Glasswing', artist: { id: ARTIST, name: 'Glasswing' } },
+    ];
+    mock.method(MusicBrainz.prototype, 'searchReleaseGroups', async () => ({
+      count: 1,
+      offset: 0,
+      'release-groups': [
+        {
+          id: GROUP,
+          title: 'Static Garden',
+          'primary-type': 'Album',
+          score: 100,
+          'artist-credit': credit,
+        },
+      ],
+    }));
+    mock.method(MusicBrainz.prototype, 'searchArtists', async () => ({
+      count: 1,
+      offset: 0,
+      artists: [{ id: ARTIST, name: 'Glasswing', score: 100 }],
+    }));
+    artist = await getRepository(Media).save(
+      new Media({
+        mediaType: MediaType.MUSIC,
+        tmdbId: 0,
+        foreignId: ARTIST,
+        foreignTitle: 'Glasswing',
+        status: MediaStatus.PARTIALLY_AVAILABLE,
+        serviceId: 0,
+        externalServiceId: 31,
+      })
+    );
+    await getRepository(MusicAlbum).save(
+      Object.assign(new MusicAlbum(), {
+        media: artist,
+        mbId: GROUP,
+        title: 'Static Garden',
+        secondaryTypes: [],
+        status: MediaStatus.PARTIALLY_AVAILABLE,
+        lidarrAlbumId: 42,
+        trackCount: 10,
+        trackFileCount: 6,
+      })
+    );
+  });
+
+  afterEach(() => {
+    getSettings().lidarr = [];
+  });
+
+  it('searches again for an album’s missing tracks', async () => {
+    modelAnswer = JSON.stringify({
+      r: 'Looking for the missing tracks.',
+      titles: [],
+      music: [{ t: 'Static Garden', a: 'Glasswing', k: 'album' }],
+      do: 'fix',
+      fx: 'missing',
+    });
+    const res = await call('POST', '/api/v1/ai/chat', {
+      message: 'static garden by glasswing is missing songs',
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.match(res.body.reply, /Static Garden/);
+    assert.equal(res.body.fix.ok, true);
+    assert.equal(res.body.fix.link, `/music/album/${GROUP}`);
+    assert.deepEqual(
+      res.body.music.albums.map((a: { id: string }) => a.id),
+      [GROUP]
+    );
+    assert.deepEqual(commands, [
+      { name: 'AlbumSearch', options: { albumIds: [42] } },
+    ]);
+  });
+
+  it('searches for an artist’s missing albums', async () => {
+    modelAnswer = JSON.stringify({
+      r: '',
+      titles: [],
+      music: [{ t: 'Glasswing', k: 'artist' }],
+      do: 'fix',
+      fx: 'missing',
+    });
+    const res = await call('POST', '/api/v1/ai/chat', {
+      message: 'glasswing albums are missing',
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.match(res.body.reply, /every missing album of Glasswing/);
+    assert.deepEqual(commands, [
+      { name: 'ArtistSearch', options: { artistId: 31 } },
+    ]);
+  });
+
+  it('fixes nothing else for music', async () => {
+    modelAnswer = JSON.stringify({
+      r: '',
+      titles: [],
+      music: [{ t: 'Static Garden', a: 'Glasswing', k: 'album' }],
+      do: 'fix',
+      fx: 'broken',
+    });
+    const res = await call('POST', '/api/v1/ai/chat', {
+      message: 'static garden skips',
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.match(res.body.reply, /missing tracks/);
+    assert.equal(res.body.fix, undefined);
+    assert.deepEqual(commands, []);
+  });
+
+  it('leaves a music issue that is not about missing tracks alone, touching no series', async () => {
+    episodes = [1, 2, 3].map((n) => episode(n, { seriesId: 31 }));
+    releases = [
+      release({ guid: 'alt-2', title: 'Lantern.Song.S01E02.1080p-NEWGRP' }),
+    ];
+    const asked: number[] = [];
+    mock.method(FixSonarr.prototype, 'episodes', async (seriesId: number) => {
+      asked.push(seriesId);
+      return episodes;
+    });
+    actingAs = member;
+    const res = await call('POST', '/api/v1/issue', {
+      issueType: IssueType.VIDEO,
+      message: 'no sound',
+      mediaId: artist.id,
+      problemSeason: 1,
+      problemEpisode: 2,
+    });
+    assert.equal(res.status, 201, JSON.stringify(res.body));
+    await autofix.idle();
+    assert.deepEqual(asked, []);
+    assert.deepEqual(deleted, []);
+    assert.deepEqual(grabbed, []);
+    const comments = await getRepository(IssueComment).find({
+      where: { issue: { id: res.body.id } },
+    });
+    assert.ok(!comments.some((c) => c.message.startsWith('Automatic fix:')));
+
+    const result = await autofix.run({
+      kind: 'replaceSeason',
+      media: artist,
+      seasonNumber: 1,
+      user: admin,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.skipped, true);
+    assert.deepEqual(asked, []);
+  });
+
+  it('does not file a chat fix that replaces files for music', async () => {
+    const asked: number[] = [];
+    mock.method(FixSonarr.prototype, 'episodes', async (seriesId: number) => {
+      asked.push(seriesId);
+      return episodes;
+    });
+    actingAs = member;
+    const res = await call('POST', '/api/v1/ai/fix', {
+      kind: 'broken',
+      mediaId: artist.id,
+      seasonNumber: 1,
+      episodeNumber: 1,
+      message: 'it stutters',
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.match(res.body.reply, /missing tracks/);
+    assert.equal(res.body.fix, undefined);
+    await autofix.idle();
+    assert.equal(
+      await getRepository(Issue).count({
+        where: { media: { id: artist.id } },
+      }),
+      0
+    );
+    assert.deepEqual(asked, []);
+    assert.deepEqual(deleted, []);
   });
 });

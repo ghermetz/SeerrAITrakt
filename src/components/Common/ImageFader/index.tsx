@@ -1,4 +1,5 @@
 import CachedImage from '@app/components/Common/CachedImage';
+import { mountedImages } from '@app/components/Common/ImageFader/mounted';
 import type { ForwardRefRenderFunction, HTMLAttributes } from 'react';
 import React, { useEffect, useState } from 'react';
 
@@ -22,24 +23,27 @@ const ImageFader: ForwardRefRenderFunction<HTMLDivElement, ImageFaderProps> = (
   ref
 ) => {
   const [activeIndex, setIndex] = useState(0);
+  const [rotated, setRotated] = useState(false);
 
   useEffect(() => {
-    const interval = setInterval(
-      () => setIndex((ai) => (ai + 1) % backgroundImages.length),
-      rotationSpeed
-    );
+    const interval = setInterval(() => {
+      setIndex((ai) => (ai + 1) % backgroundImages.length);
+      setRotated(true);
+    }, rotationSpeed);
 
     return () => {
       clearInterval(interval);
     };
   }, [backgroundImages, rotationSpeed]);
 
+  // Both follow the theme (globals.css); the darker one fades into the page
+  // like a title page's backdrop.
   let gradient =
-    'linear-gradient(180deg, rgba(45, 55, 72, 0.47) 0%, #1A202E 100%)';
+    'linear-gradient(180deg, rgb(var(--backdrop-fade-from) / var(--backdrop-fade-start)) 0%, rgb(var(--backdrop-fade-to)) 100%)';
 
   if (isDarker) {
     gradient =
-      'linear-gradient(180deg, rgba(17, 24, 39, 0.47) 0%, rgba(17, 24, 39, 1) 100%)';
+      'linear-gradient(180deg, rgb(var(--page) / var(--title-fade)) 0%, rgb(var(--page)) 100%)';
   }
 
   let overrides = {};
@@ -50,15 +54,7 @@ const ImageFader: ForwardRefRenderFunction<HTMLDivElement, ImageFaderProps> = (
     };
   }
 
-  // Only the image showing, the one fading out and the one coming next:
-  // mounting every one made the browser download them all at once, twenty
-  // large backdrops on the sign-in page before anyone had seen the second.
-  const count = Math.max(backgroundImages.length, 1);
-  const mounted = new Set([
-    activeIndex,
-    (activeIndex + 1) % count,
-    (activeIndex - 1 + count) % count,
-  ]);
+  const mounted = mountedImages(activeIndex, backgroundImages.length, rotated);
 
   return (
     <div ref={ref}>
@@ -78,6 +74,8 @@ const ImageFader: ForwardRefRenderFunction<HTMLDivElement, ImageFaderProps> = (
               src={imageUrl}
               style={{ width: '100%', height: '100%', objectFit: 'cover' }}
               fill
+              // The first is above the fold on load.
+              priority={i === 0}
               {...overrides}
             />
             <div

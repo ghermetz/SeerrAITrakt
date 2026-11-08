@@ -7,7 +7,6 @@ import PageTitle from '@app/components/Common/PageTitle';
 import Table from '@app/components/Common/Table';
 import useLocale from '@app/hooks/useLocale';
 import useMediaQuery from '@app/hooks/useMediaQuery';
-import useSettings from '@app/hooks/useSettings';
 
 import type { ScheduleInterval } from '@app/components/Settings/SettingsJobsCache/schedule';
 import {
@@ -22,7 +21,6 @@ import { formatBytes } from '@app/utils/numberHelpers';
 import { Transition } from '@headlessui/react';
 import { PlayIcon, StopIcon, TrashIcon } from '@heroicons/react/24/outline';
 import { PencilIcon } from '@heroicons/react/24/solid';
-import { MediaServerType } from '@server/constants/server';
 import type {
   CacheItem,
   CacheResponse,
@@ -42,7 +40,7 @@ const messages: { [messageName: string]: MessageDescriptor } = defineMessages(
     jobsandcache: 'Jobs & Cache',
     jobs: 'Jobs',
     jobsDescription:
-      'Seerr AI performs certain maintenance tasks as regularly-scheduled jobs, but they can also be manually triggered below. Manually running a job will not alter its schedule.',
+      'Scheduled maintenance jobs. Running one now doesn’t change its schedule.',
     jobname: 'Job Name',
     jobtype: 'Type',
     nextexecution: 'Next Execution',
@@ -56,7 +54,7 @@ const messages: { [messageName: string]: MessageDescriptor } = defineMessages(
     command: 'Command',
     cache: 'Cache',
     cacheDescription:
-      'Seerr AI caches requests to external API endpoints to optimize performance and avoid making unnecessary API calls.',
+      'Answers from outside services, kept to save time and calls.',
     cacheflushed: '{cachename} cache flushed.',
     cacheFlushFailed: '{cachename} cache could not be flushed.',
     cachename: 'Cache Name',
@@ -67,8 +65,7 @@ const messages: { [messageName: string]: MessageDescriptor } = defineMessages(
     cachevsize: 'Value Size',
     flushcache: 'Flush Cache',
     dnsCache: 'DNS Cache',
-    dnsCacheDescription:
-      'Seerr AI caches DNS lookups to optimize performance and avoid making unnecessary API calls.',
+    dnsCacheDescription: 'DNS lookups, kept to save time and calls.',
     dnscacheflushed: '{hostname} dns cache flushed.',
     dnscachename: 'Hostname',
     dnscacheactiveaddress: 'Active Address',
@@ -77,8 +74,7 @@ const messages: { [messageName: string]: MessageDescriptor } = defineMessages(
     dnscacheage: 'Age',
     flushdnscache: 'Flush DNS Cache',
     dnsCacheGlobalStats: 'Global DNS Cache Stats',
-    dnsCacheGlobalStatsDescription:
-      'These stats are aggregated across all DNS cache entries.',
+    dnsCacheGlobalStatsDescription: 'Totals across all DNS cache entries.',
     dnsNoCacheEntries: 'No DNS lookups have been cached yet.',
     size: 'Size',
     hits: 'Hits',
@@ -93,6 +89,8 @@ const messages: { [messageName: string]: MessageDescriptor } = defineMessages(
     'plex-refresh-token': 'Plex Refresh Token',
     'jellyfin-full-scan': 'Jellyfin Full Library Scan',
     'jellyfin-recently-added-scan': 'Jellyfin Recently Added Scan',
+    'emby-full-scan': 'Emby Full Library Scan',
+    'emby-recently-added-scan': 'Emby Recently Added Scan',
     'availability-sync': 'Media Availability Sync',
     'radarr-scan': 'Radarr Scan',
     'sonarr-scan': 'Sonarr Scan',
@@ -107,8 +105,13 @@ const messages: { [messageName: string]: MessageDescriptor } = defineMessages(
     'anime-check': 'Anime Check',
     'backfill-scan': 'Backfill Scan',
     'backfill-monitor': 'Backfill Downloads',
+    'download-check': 'Download Check',
     'health-watch': 'Health Alerts',
     'plex-match-check': 'Match Check',
+    'music-sync': 'Music Sync',
+    'music-full-scan': 'Music Full Scan',
+    'playlist-sync': 'Playlist Sync',
+    'quality-check': 'Quality Profiles Check',
     'database-maintenance': 'Database Maintenance',
     editJobSchedule: 'Modify Job',
     jobScheduleEditSaved: 'Job edited successfully!',
@@ -125,7 +128,7 @@ const messages: { [messageName: string]: MessageDescriptor } = defineMessages(
       'Every {jobScheduleSeconds, plural, one {second} other {{jobScheduleSeconds} seconds}}',
     imagecache: 'Image Cache',
     imagecacheDescription:
-      'When enabled in settings, Seerr AI will proxy and cache images from pre-configured external sources. Cached images are saved into your config folder. You can find the files in <code>{appDataPath}/cache/images</code>.',
+      'When on, outside images are cached in <code>{appDataPath}/cache/images</code>.',
     imagecachecount: 'Images Cached',
     imagecachesize: 'Total Cache Size',
     imagecachetotal: 'All images',
@@ -137,6 +140,7 @@ const messages: { [messageName: string]: MessageDescriptor } = defineMessages(
     usersavatars: "Users' Avatars",
     tmdbcache: 'The Movie Database (tmdb)',
     tvdbcache: 'TheTVDB (tvdb)',
+    musiccache: 'Music covers and artist pictures',
   }
 );
 
@@ -184,8 +188,8 @@ const jobModalReducer = (
       };
 
     case 'open': {
-      // Open on the job's own schedule where it is one of the choices, so
-      // saving without a change keeps it.
+      // Open on the job's own schedule when it is a choice, so saving unchanged
+      // keeps it.
       const saved = (interval: ScheduleInterval) =>
         action.job?.interval === interval
           ? choiceFor(interval, action.job.cronSchedule)
@@ -239,21 +243,6 @@ const SettingsJobs = () => {
     scheduleSeconds: 30,
   });
   const [isSaving, setIsSaving] = useState(false);
-  const settings = useSettings();
-
-  if (settings.currentSettings.mediaServerType === MediaServerType.EMBY) {
-    messages['jellyfin-recently-added-scan'] = {
-      id: 'jellyfin-recently-added-scan',
-      defaultMessage: 'Emby Recently Added Scan',
-    };
-  }
-
-  if (settings.currentSettings.mediaServerType === MediaServerType.EMBY) {
-    messages['jellyfin-full-scan'] = {
-      id: 'jellyfin-full-scan',
-      defaultMessage: 'Emby Full Library Scan',
-    };
-  }
 
   if (!data && !error) {
     return <LoadingSpinner />;
@@ -427,6 +416,7 @@ const SettingsJobs = () => {
                 <div className="form-input-area">
                   {jobModalState.job?.interval === 'seconds' ? (
                     <select
+                      id="jobSchedule"
                       name="jobScheduleSeconds"
                       className="inline"
                       value={jobModalState.scheduleSeconds}
@@ -450,6 +440,7 @@ const SettingsJobs = () => {
                     </select>
                   ) : jobModalState.job?.interval === 'minutes' ? (
                     <select
+                      id="jobSchedule"
                       name="jobScheduleMinutes"
                       className="inline"
                       value={jobModalState.scheduleMinutes}
@@ -473,6 +464,7 @@ const SettingsJobs = () => {
                     </select>
                   ) : jobModalState.job?.interval === 'days' ? (
                     <select
+                      id="jobSchedule"
                       name="jobScheduleDays"
                       className="inline"
                       value={jobModalState.scheduleDays}
@@ -496,6 +488,7 @@ const SettingsJobs = () => {
                     </select>
                   ) : (
                     <select
+                      id="jobSchedule"
                       name="jobScheduleHours"
                       className="inline"
                       value={jobModalState.scheduleHours}
@@ -549,7 +542,7 @@ const SettingsJobs = () => {
                 {data?.map((job) => (
                   <tr key={`job-list-${job.id}`}>
                     <Table.TD>
-                      <div className="flex items-center text-sm leading-5 text-white">
+                      <div className="flex items-center text-sm leading-5 text-strong">
                         <span>
                           {intl.formatMessage(
                             messages[job.id] ?? messages.unknownJob
@@ -571,7 +564,7 @@ const SettingsJobs = () => {
                       </Badge>
                     </Table.TD>
                     <Table.TD>
-                      <div className="text-sm leading-5 text-white">
+                      <div className="text-sm leading-5 text-strong">
                         <FormattedRelativeTime
                           value={Math.floor(
                             (new Date(job.nextExecutionTime).getTime() -
@@ -626,8 +619,8 @@ const SettingsJobs = () => {
                 className="rounded-lg border border-gray-700 bg-gray-800 p-4"
               >
                 <div className="flex items-start justify-between space-x-2">
-                  <div className="flex min-w-0 items-center text-sm font-medium leading-5 text-white">
-                    <span className="truncate">
+                  <div className="flex min-w-0 items-center text-sm font-medium leading-5 text-strong">
+                    <span className="min-w-0 break-words">
                       {intl.formatMessage(
                         messages[job.id] ?? messages.unknownJob
                       )}
@@ -913,6 +906,17 @@ const SettingsJobs = () => {
               </Table.TD>
               <Table.TD>
                 {formatBytes(cacheData?.imageCache.avatar.size ?? 0)}
+              </Table.TD>
+            </tr>
+            <tr>
+              <Table.TD>{intl.formatMessage(messages.musiccache)}</Table.TD>
+              <Table.TD>
+                {intl.formatNumber(
+                  cacheData?.imageCache.music?.imageCount ?? 0
+                )}
+              </Table.TD>
+              <Table.TD>
+                {formatBytes(cacheData?.imageCache.music?.size ?? 0)}
               </Table.TD>
             </tr>
             {cacheData?.imageCacheTotal && (

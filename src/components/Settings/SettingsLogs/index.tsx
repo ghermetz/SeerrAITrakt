@@ -34,6 +34,7 @@ import { useIntl } from 'react-intl';
 import useSWR from 'swr';
 
 const messages = defineMessages('components.Settings.SettingsLogs', {
+  pagination: 'Pagination',
   logs: 'Logs',
   logsDescription:
     'You can also view these logs directly via <code>stdout</code>, or in <code>{appDataPath}/logs/seerr.log</code>.',
@@ -126,13 +127,12 @@ const SettingsLogs = () => {
     });
   };
 
-  // check if there's no data and no errors in the table
-  // so as to show a spinner inside the table and not refresh the whole component
+  // Error page only when nothing has loaded.
   if (!data && error) {
     return <ErrorPage statusCode={500} />;
   }
 
-  const hasNextPage = data?.pageInfo.pages ?? 0 > pageIndex + 1;
+  const hasNextPage = (data?.pageInfo.pages ?? 0) > pageIndex + 1;
   const hasPrevPage = pageIndex > 0;
 
   return (
@@ -267,6 +267,7 @@ const SettingsLogs = () => {
             </span>
             <input
               type="text"
+              aria-label={intl.formatMessage(globalMessages.search)}
               className="rounded-r-only"
               value={searchFilter}
               onChange={(e) => setSearchFilter(e.target.value as string)}
@@ -402,7 +403,7 @@ const SettingsLogs = () => {
             )}
 
             {data?.results.length === 0 && (
-              <tr className="relative h-24 p-2 text-white">
+              <tr className="relative h-24 p-2 text-strong">
                 <Table.TD colSpan={5} noPadding>
                   <div className="flex w-screen flex-col items-center justify-center p-6 md:w-full">
                     <span className="text-base">
@@ -427,7 +428,7 @@ const SettingsLogs = () => {
               <Table.TD colSpan={5} noPadding>
                 <nav
                   className="flex w-screen flex-col items-center space-x-4 space-y-3 px-6 py-3 sm:flex-row sm:space-y-0 md:w-full"
-                  aria-label="Pagination"
+                  aria-label={intl.formatMessage(messages.pagination)}
                 >
                   <div className="hidden lg:flex lg:flex-1">
                     <p className="text-sm">

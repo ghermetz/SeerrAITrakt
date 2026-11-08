@@ -1,9 +1,11 @@
 import {
+  AiSearchingBadge,
   JobStatusBadge,
   ProgressBar,
   SeriesStatusBadge,
   formatBytes,
   formatDuration,
+  jobStage,
 } from '@app/components/Backfill/shared';
 import type { TitleKind, TitleLookup } from '@app/components/Backfill/types';
 import Button from '@app/components/Common/Button';
@@ -36,16 +38,18 @@ export interface ForTitleTarget {
 }
 
 /**
- * What Backfill has for the title a page is about, or undefined when it
- * doesn't follow it. The page's button and its Backfill box ask together,
- * in one request; it stays live while something downloads.
+ * Backfill's record for a title, or undefined when not followed. SWR shares
+ * the request between the button and the box; polls while downloading.
  */
 export const useBackfillForTitle = (
-  tmdbId: number,
+  /** TMDB id, or MusicBrainz id for an album. */
+  id: number | string,
   target: ForTitleTarget
 ): TitleLookup | undefined => {
   const { data } = useSWR<TitleLookup[]>(
-    `/api/v1/backfill/lookup?tmdbIds=${tmdbId}&all=true`,
+    `/api/v1/backfill/lookup?${
+      target.kind === 'album' ? 'mbIds' : 'tmdbIds'
+    }=${encodeURIComponent(id)}&all=true`,
     {
       refreshInterval: (latest) =>
         latest?.some((row) =>
@@ -53,7 +57,10 @@ export const useBackfillForTitle = (
         )
           ? 3000
           : latest?.some(
-                (row) => row.jobs?.length || row.status === 'searching'
+                (row) =>
+                  row.jobs?.length ||
+                  row.status === 'searching' ||
+                  row.workingRunId
               )
             ? 8000
             : 0,
@@ -68,22 +75,26 @@ export const useBackfillForTitle = (
 };
 
 /**
- * On a series' or movie's page, for admins: where Backfill is with it, the
- * downloads it has running (each opens its own page), and the way to its
- * Backfill page. Nothing for a title it doesn't follow, or has completed
- * with nothing left running; the page's Backfill button still leads there.
+ * Admin box on a title's page: Backfill status, running downloads and a link
+ * to its Backfill page. Hidden when not followed, or done with nothing running.
  */
 const BackfillForTitle = ({
-  tmdbId,
+  id,
   target,
 }: {
-  tmdbId: number;
+  /** TMDB id, or MusicBrainz id for an album. */
+  id: number | string;
   target: ForTitleTarget;
 }) => {
   const intl = useIntl();
-  const tracked = useBackfillForTitle(tmdbId, target);
+  const tracked = useBackfillForTitle(id, target);
   const jobs = tracked?.jobs ?? [];
-  if (!tracked || (tracked.status === 'done' && !jobs.length)) return null;
+  if (
+    !tracked ||
+    (tracked.status === 'done' && !jobs.length && !tracked.workingRunId)
+  ) {
+    return null;
+  }
 
   const gap =
     tracked.kind === 'movie'
@@ -110,11 +121,16 @@ const BackfillForTitle = ({
   return (
     <section className="mb-6 overflow-hidden rounded-lg bg-gray-800 ring-1 ring-gray-700">
       <div className="flex items-center justify-between gap-3 border-b border-gray-700 px-4 py-3">
-        <h3 className="flex items-center gap-2 font-semibold text-white">
+        <h3 className="flex items-center gap-2 font-semibold text-strong">
           <DocumentMagnifyingGlassIcon className="h-5 w-5 text-gray-400" />
           {intl.formatMessage(messages.backfill)}
         </h3>
-        <SeriesStatusBadge status={tracked.status} />
+        {/* A running agent overrides Backfill's last search result. */}
+        {tracked.workingRunId ? (
+          <AiSearchingBadge runId={tracked.workingRunId} />
+        ) : (
+          <SeriesStatusBadge status={tracked.status} />
+        )}
       </div>
       <div className="space-y-3 p-4">
         <div className="text-sm text-gray-300">
@@ -125,7 +141,7 @@ const BackfillForTitle = ({
             })}`}
         </div>
         {tracked.readyCount > 0 && (
-          <div className="text-sm text-yellow-300">
+          <div className="text-sm text-yellow-300 light:text-warning-text">
             {intl.formatMessage(messages.waiting, {
               count: tracked.readyCount,
             })}
@@ -140,9 +156,8 @@ const BackfillForTitle = ({
                   className="block rounded-md px-2 py-2 hover:bg-gray-700/40"
                 >
                   <div className="flex items-start justify-between gap-2">
-                    {/* Two lines, so the episode in the release's name
-                        shows on a narrow box. */}
-                    <div className="line-clamp-2 min-w-0 break-words text-sm text-white">
+                    {/* Two lines so the episode shows when narrow. */}
+                    <div className="min-w-0 text-sm text-strong [overflow-wrap:anywhere] sm:line-clamp-2">
                       {job.title}
                     </div>
                     <span className="flex-shrink-0">
@@ -163,7 +178,7 @@ const BackfillForTitle = ({
                             size: formatBytes(job.sizeLeft),
                             speed: formatBytes(job.speed),
                           })
-                        : (job.stage ?? '')}
+                        : jobStage(intl, job)}
                     </span>
                     <span className="flex-shrink-0 tabular-nums">
                       {job.secondsLeft

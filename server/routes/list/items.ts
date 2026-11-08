@@ -1,6 +1,6 @@
 /**
- * Titles on a list, what the current user has marked, and the watched-state
- * suggestions that follow from it.
+ * List titles, the current user's markers, and the watched-state suggestions
+ * derived from them.
  */
 import TheMovieDb from '@server/api/themoviedb';
 import { MediaRequestStatus, MediaType } from '@server/constants/media';
@@ -8,15 +8,16 @@ import { getRepository } from '@server/datasource';
 import {
   MediaList,
   MediaListItem,
-  MediaListMember,
   MediaListWatchSuggestion,
 } from '@server/entity/MediaList';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import { MediaRequestWatcher } from '@server/entity/MediaRequestWatcher';
 import type { User } from '@server/entity/User';
 import { featureEnabled } from '@server/lib/features';
-import { loadAccessibleList } from '@server/lib/listAccess';
+import { accessibleListIds, loadAccessibleList } from '@server/lib/listAccess';
 import { notifyListActivity } from '@server/lib/listActivity';
+import { requestListAdd } from '@server/lib/listRequests';
+import { listTitle } from '@server/lib/listTitles';
 import { refreshWatchSuggestions } from '@server/lib/listWatchSync';
 import { getSeriesProgress } from '@server/lib/seriesProgress';
 import logger from '@server/logger';
@@ -27,26 +28,12 @@ import { In, IsNull } from 'typeorm';
 
 const listRoutes = Router();
 
+// Everything the current user has marked, in one request: cards badge
+// posters from it, and SWR dedupes this one key instead of a request per card.
 listRoutes.get('/markers', isAuthenticated(), async (req, res, next) => {
   try {
     const userId = req.user?.id as number;
-
-    const owned = await getRepository(MediaList).find({
-      select: { id: true },
-      where: { ownerId: userId },
-    });
-
-    const memberships = await getRepository(MediaListMember).find({
-      select: { listId: true },
-      where: { userId },
-    });
-
-    const listIds = [
-      ...new Set([
-        ...owned.map((list) => list.id),
-        ...memberships.map((member) => member.listId),
-      ]),
-    ];
+    const listIds = await accessibleListIds(userId);
 
     const onLists = listIds.length
       ? await getRepository(MediaListItem).find({
@@ -55,8 +42,8 @@ listRoutes.get('/markers', isAuthenticated(), async (req, res, next) => {
         })
       : [];
 
-    // Titles this user will hear about: their own live requests unless muted,
-    // plus anything they have explicitly asked to watch.
+    // Titles this user is notified about: their live requests unless muted,
+    // plus anything they explicitly watch.
     const ownRequests = await getRepository(MediaRequest).find({
       where: {
         requestedBy: { id: userId },
@@ -94,34 +81,43 @@ listRoutes.get('/markers', isAuthenticated(), async (req, res, next) => {
   }
 });
 
+/** Max titles per lookup; a collection's films fit easily. */
+const CONTAINS_LIMIT = 500;
+
+// Which of the caller's lists contain a title, or each of several
+// (tmdbIds=1,2,3: a collection's films), one entry per list and title.
 listRoutes.get('/contains', isAuthenticated(), async (req, res, next) => {
   try {
     const userId = req.user?.id as number;
-    const tmdbId = Number(req.query.tmdbId);
     const mediaType = req.query.mediaType === 'tv' ? 'tv' : 'movie';
+    // An array when the API spec has split it, else a string.
+    const raw = req.query.tmdbIds as unknown;
+    const tmdbIds =
+      raw !== undefined
+        ? (Array.isArray(raw) ? raw : String(raw).split(','))
+            .filter((id) => id !== '')
+            .map(Number)
+        : [Number(req.query.tmdbId)];
 
-    if (!Number.isFinite(tmdbId)) {
-      return next({ status: 400, message: 'A valid tmdbId is required.' });
+    if (
+      !tmdbIds.length ||
+      tmdbIds.length > CONTAINS_LIMIT ||
+      !tmdbIds.every((id) => Number.isInteger(id) && id > 0)
+    ) {
+      return next({
+        status: 400,
+        message: 'A valid tmdbId, or tmdbIds, is required.',
+      });
     }
 
-    const owned = await getRepository(MediaList).find({
-      where: { ownerId: userId },
-    });
-    const memberships = await getRepository(MediaListMember).find({
-      where: { userId },
-    });
-
-    const accessibleIds = [
-      ...owned.map((l) => l.id),
-      ...memberships.map((m) => m.listId),
-    ];
+    const accessibleIds = await accessibleListIds(userId);
 
     if (!accessibleIds.length) {
       return res.status(200).json([]);
     }
 
     const items = await getRepository(MediaListItem).find({
-      where: { listId: In(accessibleIds), tmdbId, mediaType },
+      where: { listId: In(accessibleIds), tmdbId: In(tmdbIds), mediaType },
     });
 
     const lists = await getRepository(MediaList).find({
@@ -132,6 +128,7 @@ listRoutes.get('/contains', isAuthenticated(), async (req, res, next) => {
       items.map((item) => ({
         listId: item.listId,
         listName: lists.find((list) => list.id === item.listId)?.name ?? '',
+        tmdbId: item.tmdbId,
       }))
     );
   } catch (e) {
@@ -143,14 +140,10 @@ listRoutes.get('/contains', isAuthenticated(), async (req, res, next) => {
   }
 });
 
-// Pending removal suggestions for the caller's own lists. Fetched when the
-// app loads, which is also when the watch-history check runs (throttled),
-// so the prompt is ready rather than computed while the user waits.
-
 /*
- * Where the viewer is in each series on a list, from the server's watch
- * history (Tautulli for Plex, Jellyfin or Emby themselves). Each person sees
- * their own position on a shared list.
+ * The viewer's position in each series on a list, from watch history
+ * (Tautulli for Plex, else Jellyfin or Emby). Each user sees their own
+ * position on a shared list.
  */
 listRoutes.get<{ listId: string }>(
   '/:listId/progress',
@@ -188,17 +181,17 @@ listRoutes.get<{ listId: string }>(
   }
 );
 
+// Pending removal suggestions for the caller's own lists. Fetched on app load,
+// which also starts the (throttled) watch-history check.
 listRoutes.get('/suggestions', isAuthenticated(), async (req, res, next) => {
   try {
-    // Turned off: no watch-history check, and nothing suggested.
+    // Disabled: no watch-history check, no suggestions.
     if (!featureEnabled('watchSuggestions', req.user)) {
       return res.status(200).json([]);
     }
-    // Answered from the suggestions already stored, while the (throttled)
-    // watch-history check runs behind: one person per title per list is a
-    // lot of questions for a slow history, and the app should not wait on
-    // them. What the check finds is offered on the next load. A history
-    // that is unreachable costs that check, not the stored suggestions.
+    // Answer from stored suggestions while the throttled check runs in the
+    // background: it makes many slow history queries. Its findings appear on
+    // the next load; an unreachable history fails only the check.
     refreshWatchSuggestions(req.user as User).catch((e) => {
       logger.debug('Could not refresh watch suggestions', {
         label: 'API',
@@ -238,17 +231,12 @@ listRoutes.get('/suggestions', isAuthenticated(), async (req, res, next) => {
         };
 
         try {
-          if (suggestion.item?.mediaType === 'movie') {
-            const movie = await tmdb.getMovie({ movieId: base.tmdbId });
-            return {
-              ...base,
-              title: movie.title,
-              posterPath: movie.poster_path,
-            };
-          }
-
-          const tv = await tmdb.getTvShow({ tvId: base.tmdbId });
-          return { ...base, title: tv.name, posterPath: tv.poster_path };
+          const { title, posterPath } = await listTitle(
+            tmdb,
+            base.tmdbId,
+            base.mediaType
+          );
+          return { ...base, title, posterPath };
         } catch (e) {
           logger.debug('Could not hydrate a list preview', {
             label: 'API',
@@ -288,7 +276,7 @@ listRoutes.post<{ suggestionId: string }>(
       }
 
       if (req.body.action === 'remove') {
-        // Removing the item cascades the suggestion away with it.
+        // Deleting the item cascades to the suggestion.
         await getRepository(MediaListItem).delete({ id: suggestion.itemId });
 
         return res.status(200).json({ removed: true });
@@ -309,10 +297,7 @@ listRoutes.post<{ suggestionId: string }>(
   }
 );
 
-// Turns pasted text into candidate matches for review. Deliberately does not
-// add anything: automatic title matching gets things wrong, so the user
-// confirms before any of it lands on a list.
-
+// Anyone who can see a list can curate it; membership is the owner's call.
 listRoutes.post<{ listId: string }>(
   '/:listId/item',
   isAuthenticated(),
@@ -325,6 +310,13 @@ listRoutes.post<{ listId: string }>(
 
       if (!access) {
         return next({ status: 404, message: 'List not found.' });
+      }
+      // Playlists hold songs; films and series go on watch lists.
+      if (access.list.kind === 'music') {
+        return next({
+          status: 400,
+          message: 'Films and series go on a watch list, not a playlist.',
+        });
       }
 
       const tmdbId = Number(req.body.tmdbId);
@@ -341,16 +333,13 @@ listRoutes.post<{ listId: string }>(
       });
 
       if (!existing) {
-        // Store the poster now so the overview and the roulette never depend
-        // on a live TMDB lookup to draw artwork.
+        // Store the poster now so the overview and roulette never need a live
+        // TMDB lookup for artwork.
         let posterPath: string | null = null;
 
         try {
-          const tmdbClient = new TheMovieDb();
           posterPath =
-            (mediaType === 'movie'
-              ? (await tmdbClient.getMovie({ movieId: tmdbId })).poster_path
-              : (await tmdbClient.getTvShow({ tvId: tmdbId })).poster_path) ??
+            (await listTitle(new TheMovieDb(), tmdbId, mediaType)).posterPath ??
             null;
         } catch (e) {
           // Backfilled on the next overview load.
@@ -371,9 +360,8 @@ listRoutes.post<{ listId: string }>(
           })
         );
 
-        // Touch the list so recency ordering reflects activity. Updated by
-        // id rather than saving the loaded entity, which would re-persist the
-        // relations loaded alongside it.
+        // Touch the list for recency ordering. Update by id: saving the loaded
+        // entity would re-persist its loaded relations.
         await getRepository(MediaList).update(access.list.id, {
           updatedAt: new Date(),
         });
@@ -384,6 +372,15 @@ listRoutes.post<{ listId: string }>(
           'added',
           req.user as User
         );
+
+        // A request window adding to its "Also add to" lists sends false: it
+        // has just requested what the person chose.
+        const request =
+          req.body.request === false
+            ? undefined
+            : await requestListAdd(tmdbId, mediaType, req.user as User);
+
+        return res.status(200).json({ added: true, request });
       }
 
       return res.status(200).json({ added: true });
@@ -430,14 +427,14 @@ listRoutes.post<{ listId: string }>(
 
       const wasWatched = !!item.watchedAt;
 
-      // Updated by id: saving the loaded item would write back the person
-      // in its loaded watchedBy, crediting whoever marked it before.
+      // Update by id: saving the loaded item would write back its loaded
+      // watchedBy, crediting whoever marked it before.
       await itemRepository.update(item.id, {
         watchedAt: watched ? new Date() : null,
         watchedById: watched ? (req.user?.id ?? null) : null,
       });
 
-      // Only announce the transition into watched, and only if it changed.
+      // Announce only the change into watched.
       if (watched && !wasWatched) {
         await notifyListActivity(
           access.list,

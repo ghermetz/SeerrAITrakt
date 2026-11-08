@@ -8,6 +8,7 @@ import type {
   RadarrMovieOptions,
 } from '@server/api/servarr/radarr';
 import RadarrAPI from '@server/api/servarr/radarr';
+import { getSettings } from '@server/lib/settings';
 
 function buildRadarr(): RadarrAPI {
   return new RadarrAPI({ url: 'http://localhost:7878/api/v3', apiKey: 'test' });
@@ -123,10 +124,9 @@ describe('RadarrAPI getMovieByTmdbId', () => {
 });
 
 /*
- * A request searches straight away only when Radarr says the movie is
- * available, which it works out from the movie's Minimum Availability.
- * Otherwise the movie is added and monitored, and Radarr grabs it once it
- * becomes available.
+ * A request searches at once only when Radarr says the movie is available
+ * (from its Minimum Availability); otherwise it is added monitored and Radarr
+ * grabs it later.
  */
 describe('RadarrAPI addMovie', () => {
   afterEach(() => mock.restoreAll());
@@ -172,7 +172,7 @@ describe('RadarrAPI addMovie', () => {
         addOptions: { searchForMovie: boolean };
       };
       assert.strictEqual(body.monitored, true);
-      // Radarr would search on its own when adding with this set.
+      // With this true, Radarr would search on add.
       assert.strictEqual(body.addOptions.searchForMovie, false);
       assert.deepStrictEqual(
         search.mock.calls.map((c) => c.arguments[0]),
@@ -242,5 +242,27 @@ describe('RadarrAPI addMovie', () => {
     await radarr.addMovie({ ...options, searchNow: false });
 
     assert.strictEqual(search.mock.callCount(), 0);
+  });
+});
+
+describe('the API request timeout', () => {
+  it('follows Settings → Network as it is saved, for a client made before', async () => {
+    const settings = getSettings().network;
+    const before = settings.apiRequestTimeout;
+    const radarr = buildRadarr();
+    const timeouts: (number | undefined)[] = [];
+    getAxios(radarr).defaults.adapter = async (config) => {
+      timeouts.push(config.timeout);
+      return { data: {}, status: 200, statusText: '', headers: {}, config };
+    };
+    try {
+      settings.apiRequestTimeout = 25000;
+      await getAxios(radarr).get('/system/status');
+      // A request with its own timeout keeps it.
+      await getAxios(radarr).get('/system/status', { timeout: 1234 });
+      assert.deepEqual(timeouts, [25000, 1234]);
+    } finally {
+      settings.apiRequestTimeout = before;
+    }
   });
 });

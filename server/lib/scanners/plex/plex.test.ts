@@ -18,6 +18,7 @@ import {
 import { MediaServerType } from '@server/constants/server';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import MediaLibraryItem from '@server/entity/MediaLibraryItem';
 import MediaRequest from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
 import SeasonRequest from '@server/entity/SeasonRequest';
@@ -25,6 +26,7 @@ import { User } from '@server/entity/User';
 import { plexFullScanner } from '@server/lib/scanners/plex';
 import type { Library, RadarrSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import logger from '@server/logger';
 import { setupTestDb } from '@server/test/db';
 import { runWithMockTimers } from '@server/test/runWithMockTimers';
 import assert from 'node:assert/strict';
@@ -294,8 +296,8 @@ describe('Plex Scanner', () => {
         })
       );
 
-      // sendToSonarr runs on insert and only bails when no server is configured,
-      // so leftover settings from another test would reach TMDB and fail the request.
+      // sendToSonarr runs on insert and bails only with no server configured,
+      // so leftover settings from another test would reach TMDB and fail.
       const settings = getSettings();
       settings.radarr = [];
       settings.sonarr = [];
@@ -346,6 +348,56 @@ describe('Plex Scanner', () => {
         MediaRequestStatus.APPROVED,
         'A media server scan must not cancel a request Sonarr is still working on'
       );
+    });
+  });
+
+  describe('series qualities', () => {
+    it('stores what the episodes are in, over all seasons', async () => {
+      configurePlexWithLibrary();
+      getTvShowImpl = async () =>
+        fakeTmdbShow(6300, [
+          {
+            id: 1,
+            air_date: '2024-01-01',
+            episode_count: 2,
+            name: 'Season 1',
+            overview: '',
+            season_number: 1,
+          },
+        ]);
+      getLibraryContentsImpl = async (id: string) =>
+        id === 'test-library-id'
+          ? { totalSize: 1, items: [fakePlexShowItem('show-6300')] }
+          : { totalSize: 0, items: [] };
+      getMetadataImpl = async (key: string) =>
+        key === 'show-6300'
+          ? fakePlexShowMetadata('show-6300', 6300, [
+              fakePlexSeasonMetadata(1, 'show-6300-s1'),
+            ])
+          : undefined;
+      getChildrenMetadataImpl = async () =>
+        [['1080', '4k'], ['720']].map(
+          (resolutions, index) =>
+            ({
+              ...fakePlexSeasonMetadata(1, `show-6300-e${index}`),
+              index: index + 1,
+              Media: resolutions.map(
+                (videoResolution) =>
+                  ({ videoResolution }) as PlexMetadata['Media'][number]
+              ),
+            }) as PlexMetadata
+        );
+
+      await runWithMockTimers(() => plexFullScanner.run());
+
+      const media = await getRepository(Media).findOneOrFail({
+        where: { tmdbId: 6300, mediaType: MediaType.TV },
+      });
+      assert.equal(media.status, MediaStatus.AVAILABLE);
+      assert.deepEqual(media.availableQuality, {
+        resolutions: ['4K', '1080p', '720p'],
+        ranges: [],
+      });
     });
   });
 
@@ -407,6 +459,291 @@ describe('Plex Scanner', () => {
 
       assert.strictEqual(media.status, MediaStatus.AVAILABLE);
       assert.notStrictEqual(media.status4k, MediaStatus.AVAILABLE);
+    });
+
+    it('stores each side’s resolutions for the title page', async () => {
+      getSettings().radarr = [{ id: 0, is4k: true } as RadarrSettings];
+
+      const media = await scanMovie(6203, ['1080', '720', '4k']);
+
+      assert.deepEqual(media.availableQuality, {
+        resolutions: ['1080p', '720p'],
+        ranges: [],
+      });
+      assert.deepEqual(media.availableQuality4k, {
+        resolutions: ['4K'],
+        ranges: [],
+      });
+    });
+
+    it('puts a 4K version with the rest when there is no 4K Radarr', async () => {
+      const media = await scanMovie(6204, ['4k', '1080']);
+
+      assert.deepEqual(media.availableQuality?.resolutions, ['4K', '1080p']);
+      assert.equal(media.availableQuality4k, undefined);
+    });
+  });
+
+  describe('which library holds a title', () => {
+    const films: Library = {
+      id: '11',
+      name: 'Films',
+      enabled: true,
+      type: 'movie',
+    };
+    const family: Library = {
+      id: '12',
+      name: 'Family Films',
+      enabled: true,
+      type: 'movie',
+    };
+    let contents: Record<string, PlexLibraryItem[]>;
+    const resolveImdb = Object.getOwnPropertyDescriptor(
+      plexFullScanner.tmdb,
+      'resolveImdbIdForScan'
+    );
+
+    beforeEach(() => {
+      configurePlexWithLibrary([films, family]);
+      getLibrariesImpl = async () =>
+        [films, family].map((library) => ({
+          key: library.id,
+          title: library.name,
+          type: 'movie',
+          agent: 'tv.plex.agents.movie',
+        }));
+      getLibraryContentsImpl = async (id) => ({
+        totalSize: contents[id]?.length ?? 0,
+        items: contents[id] ?? [],
+      });
+      Object.defineProperty(plexFullScanner.tmdb, 'resolveImdbIdForScan', {
+        value: async () => {
+          throw new Error('TMDB is unreachable');
+        },
+        configurable: true,
+      });
+    });
+
+    afterEach(() => {
+      if (resolveImdb) {
+        Object.defineProperty(
+          plexFullScanner.tmdb,
+          'resolveImdbIdForScan',
+          resolveImdb
+        );
+      }
+    });
+
+    const held = async () =>
+      (
+        await getRepository(MediaLibraryItem).find({
+          relations: { media: true },
+        })
+      )
+        .map(
+          (row) =>
+            `${row.media.tmdbId} ${row.server} ${row.libraryId} ${row.is4k ? '4k' : 'std'} ${row.itemId}`
+        )
+        .sort();
+
+    it('records each library a title is in, with its item there', async () => {
+      contents = {
+        '11': [fakePlexMovieItem('501', 7001, ['1080'])],
+        '12': [
+          fakePlexMovieItem('601', 7001, ['1080']),
+          fakePlexMovieItem('602', 7002, ['1080']),
+        ],
+      };
+
+      await runWithMockTimers(() => plexFullScanner.run());
+
+      assert.deepEqual(await held(), [
+        '7001 plex 11 std 501',
+        '7001 plex 12 std 601',
+        '7002 plex 12 std 602',
+      ]);
+    });
+
+    it('forgets a library that no longer holds a title after a full scan', async () => {
+      contents = {
+        '11': [fakePlexMovieItem('501', 7001, ['1080'])],
+        '12': [
+          fakePlexMovieItem('601', 7001, ['1080']),
+          fakePlexMovieItem('602', 7002, ['1080']),
+        ],
+      };
+      await runWithMockTimers(() => plexFullScanner.run());
+
+      contents['12'] = [fakePlexMovieItem('602', 7002, ['1080'])];
+      await runWithMockTimers(() => plexFullScanner.run());
+
+      assert.deepEqual(await held(), [
+        '7001 plex 11 std 501',
+        '7002 plex 12 std 602',
+      ]);
+    });
+
+    it('forgets nothing from a library whose scan had a failure', async () => {
+      contents = {
+        '11': [fakePlexMovieItem('501', 7001, ['1080'])],
+        '12': [fakePlexMovieItem('601', 7001, ['1080'])],
+      };
+      await runWithMockTimers(() => plexFullScanner.run());
+
+      contents['12'] = [
+        {
+          ...fakePlexMovieItem('603', 7003, ['1080']),
+          guid: 'imdb://tt0000003',
+        },
+      ];
+      await runWithMockTimers(() => plexFullScanner.run());
+
+      assert.deepEqual(await held(), [
+        '7001 plex 11 std 501',
+        '7001 plex 12 std 601',
+      ]);
+    });
+  });
+
+  /*
+   * Plex lists a file before its agent matches it. Such titles are skipped
+   * quietly and counted; the scan reports once, at the end, how many.
+   */
+  describe('titles Plex has not matched yet', () => {
+    type Line = {
+      level: string;
+      message: string;
+      meta: Record<string, unknown>;
+    };
+    let lines: Line[] = [];
+    let restore: (() => void)[] = [];
+    const resolveImdb = Object.getOwnPropertyDescriptor(
+      plexFullScanner.tmdb,
+      'resolveImdbIdForScan'
+    );
+
+    beforeEach(() => {
+      lines = [];
+      restore = (['error', 'warn', 'info', 'debug'] as const).map((level) => {
+        const capture = mock.method(
+          logger,
+          level,
+          (message: string, meta: Record<string, unknown> = {}) => {
+            lines.push({ level, message, meta });
+            return logger;
+          }
+        );
+        return () => capture.mock.restore();
+      });
+      configurePlexWithLibrary([movieLibrary]);
+      getLibrariesImpl = async () => [
+        {
+          key: movieLibrary.id,
+          title: 'Movies',
+          type: 'movie',
+          agent: 'tv.plex.agents.movie',
+        },
+      ];
+      Object.defineProperty(plexFullScanner.tmdb, 'resolveImdbIdForScan', {
+        value: async () => {
+          throw new Error('[TMDB] Failed to find media using external IMDb ID');
+        },
+        configurable: true,
+      });
+    });
+
+    afterEach(() => {
+      restore.forEach((undo) => undo());
+      if (resolveImdb) {
+        Object.defineProperty(
+          plexFullScanner.tmdb,
+          'resolveImdbIdForScan',
+          resolveImdb
+        );
+      }
+    });
+
+    const item = (
+      ratingKey: string,
+      title: string,
+      guid: string,
+      year?: number
+    ): PlexLibraryItem => ({
+      ratingKey,
+      title,
+      year,
+      guid,
+      addedAt: 1700000000,
+      updatedAt: 1700000000,
+      type: 'movie',
+      Media: [],
+    });
+
+    it('skips them without an error each, and says how many once', async () => {
+      getLibraryContentsImpl = async () => ({
+        totalSize: 4,
+        items: [
+          // Never matched (the "none" agent): no id at all.
+          item('901', 'Home Video', 'local://901', 2020),
+          // The new agent before matching: no Guid list yet.
+          item('902', 'Brine', 'plex://movie/5d776'),
+          // Matched, but TMDB is unreachable: a real failure.
+          item('903', 'Gone Film', 'imdb://tt0000003', 1999),
+          { ...fakePlexMovieItem('904', 6210, ['1080']), title: 'Fine' },
+        ],
+      });
+      getMetadataImpl = async (key) =>
+        key === '902'
+          ? ({ ...item('902', 'Brine', 'plex://movie/5d776') } as never)
+          : undefined;
+
+      await runWithMockTimers(() => plexFullScanner.run());
+
+      const all = lines
+        .map((l) => `${l.message} ${JSON.stringify(l.meta)}`)
+        .join('\n');
+      const errors = lines.filter((l) => l.level === 'error');
+      assert.equal(errors.length, 1, all);
+      assert.equal(errors[0].message, 'Failed to process Plex media');
+      assert.deepEqual(errors[0].meta, {
+        label: 'Plex Scan',
+        errorMessage: '[TMDB] Failed to find media using external IMDb ID',
+        item: { name: 'Gone Film', year: 1999, type: 'movie', id: '903' },
+      });
+
+      const summaries = lines.filter((l) => /matched by Plex/.test(l.message));
+      assert.equal(summaries.length, 1);
+      assert.equal(summaries[0].level, 'info');
+      assert.equal(
+        summaries[0].message,
+        "Plex: 2 films aren't matched by Plex yet, so they were skipped. They'll be picked up once Plex has matched them (in Plex: refresh the library's metadata, or use Match on a title)."
+      );
+      assert.deepEqual([...(summaries[0].meta.examples as string[])].sort(), [
+        'Brine',
+        'Home Video (2020)',
+      ]);
+      const skipped = lines.filter((l) => l.message.startsWith('Skipped '));
+      assert.ok(skipped.every((l) => l.level === 'debug'));
+      assert.deepEqual(
+        skipped
+          .map((l) => l.meta.item)
+          .sort((a, b) =>
+            String((a as { id: string }).id).localeCompare(
+              String((b as { id: string }).id)
+            )
+          ),
+        [
+          { name: 'Home Video', year: 2020, type: 'movie', id: '901' },
+          { name: 'Brine', type: 'movie', id: '902' },
+        ]
+      );
+
+      // Stored media is unchanged.
+      const media = await getRepository(Media).find();
+      assert.deepEqual(
+        media.map((m) => m.tmdbId),
+        [6210]
+      );
     });
   });
 });

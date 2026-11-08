@@ -35,7 +35,7 @@ import {
   getAppVersion,
   getCommitTag,
 } from '@server/utils/appVersion';
-import restartFlag from '@server/utils/restartFlag';
+import { releaseUpdateAvailable } from '@server/utils/releases';
 import { isPerson } from '@server/utils/typeHelpers';
 import { Router } from 'express';
 import authRoutes from './auth';
@@ -43,15 +43,19 @@ import blocklistRoutes from './blocklist';
 import calendarRoutes from './calendar';
 import collectionRoutes from './collection';
 import discoverRoutes, { createTmdbWithRegionLanguage } from './discover';
+import discoverMusicRoutes from './discoverMusic';
 import issueRoutes from './issue';
 import issueCommentRoutes from './issueComment';
 import maintainerrRoutes from './maintainerr';
 import mediaRoutes from './media';
 import movieRoutes from './movie';
+import musicRoutes from './music';
+import nowPlayingRoutes from './nowPlaying';
 import personRoutes from './person';
 import requestRoutes from './request';
 import searchRoutes from './search';
 import serviceRoutes from './service';
+import styleRoutes from './style';
 import subtitleRoutes from './subtitles';
 import tvRoutes from './tv';
 import user from './user';
@@ -65,10 +69,15 @@ router.get<unknown, StatusResponse>('/status', async (req, res) => {
   const currentVersion = getAppVersion();
   const commitTag = getCommitTag();
 
+  // Anyone may skip the check; only admins may ask for it while version
+  // checks are off.
+  const asked = req.query.checkUpdateAvailable;
   const checkUpdate =
-    req.query.checkUpdateAvailable !== undefined
-      ? req.query.checkUpdateAvailable
-      : settings.fullPublicSettings.versionCheck;
+    asked === undefined
+      ? settings.fullPublicSettings.versionCheck
+      : String(asked) === 'true' &&
+        (settings.fullPublicSettings.versionCheck ||
+          !!req.user?.hasPermission(Permission.ADMIN));
   let updateAvailable = false;
   let commitsBehind = 0;
 
@@ -86,15 +95,11 @@ router.get<unknown, StatusResponse>('/status', async (req, res) => {
         commitTag
       ));
     } else if (commitTag !== 'local') {
-      const releases = await githubApi.getSeerrReleases();
-
-      if (releases.length) {
-        const latestVersion = releases[0];
-
-        if (!latestVersion.name.includes(currentVersion)) {
-          updateAvailable = true;
-        }
-      }
+      // A stable install is only offered newer stable releases.
+      updateAvailable = releaseUpdateAvailable(
+        await githubApi.getSeerrReleases(),
+        currentVersion
+      );
     }
   }
 
@@ -102,14 +107,17 @@ router.get<unknown, StatusResponse>('/status', async (req, res) => {
     version: getAppVersion(),
     commitTag: getCommitTag(),
     ...(checkUpdate && { updateAvailable, commitsBehind }),
-    restartRequired: restartFlag.isSet(),
   });
 });
 
-router.get('/status/appdata', (_req, res) => {
+router.get('/status/appdata', (req, res) => {
+  // The path only for setup and admins.
+  const showPath =
+    !getSettings().public.initialized ||
+    !!req.user?.hasPermission(Permission.ADMIN);
   return res.status(200).json({
     appData: appDataStatus(),
-    appDataPath: appDataPath(),
+    ...(showPath && { appDataPath: appDataPath() }),
     appDataPermissions: appDataPermissions(),
   });
 });
@@ -160,6 +168,8 @@ router.get(
 );
 router.use('/settings', isAuthenticated(Permission.ADMIN), settingsRoutes);
 router.use('/search', isAuthenticated(), searchRoutes);
+// Before Discover's own routes, which it nests under.
+router.use('/discover/music', isAuthenticated(), discoverMusicRoutes);
 router.use('/discover', isAuthenticated(), discoverRoutes);
 router.use('/request', isAuthenticated(), requestRoutes);
 router.use('/watchlist', isAuthenticated(), watchlistRoutes);
@@ -176,6 +186,7 @@ router.use(
 );
 router.use('/movie', isAuthenticated(), movieRoutes);
 router.use('/tv', isAuthenticated(), tvRoutes);
+router.use('/music', isAuthenticated(), musicRoutes);
 router.use('/media', isAuthenticated(), mediaRoutes);
 router.use('/calendar', isAuthenticated(), calendarRoutes);
 router.use('/person', isAuthenticated(), personRoutes);
@@ -183,16 +194,18 @@ router.use('/collection', isAuthenticated(), collectionRoutes);
 router.use('/service', isAuthenticated(), serviceRoutes);
 router.use('/issue', isAuthenticated(), issueRoutes);
 router.use('/issueComment', isAuthenticated(), issueCommentRoutes);
+router.use('/now-playing', isAuthenticated(), nowPlayingRoutes);
 router.use('/auth', authRoutes);
-// Signed-in only at the group, as every other group is. Each list route also
-// checks for itself, but a future one that forgot would otherwise be public.
+router.use('/style', styleRoutes);
+// Signed-in only at the group, like every other group. Each list route also
+// checks, but a future one that forgot would otherwise be public.
 router.use('/list', isAuthenticated(), listRoutes);
 router.use('/maintainerr', isAuthenticated(), maintainerrRoutes);
 router.use('/subtitles', isAuthenticated(), subtitleRoutes);
 router.use('/ai', isAuthenticated(), aiRoutes);
 router.use('/backfill', isAuthenticated(Permission.ADMIN), backfillRoutes);
 router.use('/agent', isAuthenticated(Permission.ADMIN), agentRoutes);
-// What Backfill is doing about the titles someone asked for, for them.
+// Backfill progress on the titles someone requested, for them.
 router.use('/backfill-status', isAuthenticated(), backfillStatusRoutes);
 // Mounted for any signed-in user: each rule-management route requires admin
 // itself, and the advanced-request preview has its own permission check.
@@ -236,45 +249,53 @@ router.get('/languages', isAuthenticated(), async (req, res, next) => {
   }
 });
 
-router.get<{ id: string }>('/studio/:id', async (req, res, next) => {
-  const tmdb = new TheMovieDb();
+router.get<{ id: string }>(
+  '/studio/:id',
+  isAuthenticated(),
+  async (req, res, next) => {
+    const tmdb = new TheMovieDb();
 
-  try {
-    const studio = await tmdb.getStudio(Number(req.params.id));
+    try {
+      const studio = await tmdb.getStudio(Number(req.params.id));
 
-    return res.status(200).json(mapProductionCompany(studio));
-  } catch (e) {
-    logger.debug('Something went wrong retrieving studio', {
-      label: 'API',
-      errorMessage: e.message,
-      studioId: req.params.id,
-    });
-    return next({
-      status: 500,
-      message: 'Unable to retrieve studio.',
-    });
+      return res.status(200).json(mapProductionCompany(studio));
+    } catch (e) {
+      logger.debug('Something went wrong retrieving studio', {
+        label: 'API',
+        errorMessage: e.message,
+        studioId: req.params.id,
+      });
+      return next({
+        status: 500,
+        message: 'Unable to retrieve studio.',
+      });
+    }
   }
-});
+);
 
-router.get<{ id: string }>('/network/:id', async (req, res, next) => {
-  const tmdb = new TheMovieDb();
+router.get<{ id: string }>(
+  '/network/:id',
+  isAuthenticated(),
+  async (req, res, next) => {
+    const tmdb = new TheMovieDb();
 
-  try {
-    const network = await tmdb.getNetwork(Number(req.params.id));
+    try {
+      const network = await tmdb.getNetwork(Number(req.params.id));
 
-    return res.status(200).json(mapNetwork(network));
-  } catch (e) {
-    logger.debug('Something went wrong retrieving network', {
-      label: 'API',
-      errorMessage: e.message,
-      networkId: req.params.id,
-    });
-    return next({
-      status: 500,
-      message: 'Unable to retrieve network.',
-    });
+      return res.status(200).json(mapNetwork(network));
+    } catch (e) {
+      logger.debug('Something went wrong retrieving network', {
+        label: 'API',
+        errorMessage: e.message,
+        networkId: req.params.id,
+      });
+      return next({
+        status: 500,
+        message: 'Unable to retrieve network.',
+      });
+    }
   }
-});
+);
 
 router.get('/genres/movie', isAuthenticated(), async (req, res, next) => {
   const tmdb = new TheMovieDb();
@@ -351,7 +372,7 @@ router.get('/backdrops', async (req, res, next) => {
   }
 });
 
-router.get('/keyword/:keywordId', async (req, res, next) => {
+router.get('/keyword/:keywordId', isAuthenticated(), async (req, res, next) => {
   const tmdb = createTmdbWithRegionLanguage();
 
   try {
@@ -372,46 +393,54 @@ router.get('/keyword/:keywordId', async (req, res, next) => {
   }
 });
 
-router.get('/watchproviders/regions', async (req, res, next) => {
-  const tmdb = createTmdbWithRegionLanguage();
+router.get(
+  '/watchproviders/regions',
+  isAuthenticated(),
+  async (req, res, next) => {
+    const tmdb = createTmdbWithRegionLanguage();
 
-  try {
-    const result = await tmdb.getAvailableWatchProviderRegions({});
-    return res.status(200).json(result);
-  } catch (e) {
-    logger.debug('Something went wrong retrieving watch provider regions', {
-      label: 'API',
-      errorMessage: e.message,
-    });
-    return next({
-      status: 500,
-      message: 'Unable to retrieve watch provider regions.',
-    });
+    try {
+      const result = await tmdb.getAvailableWatchProviderRegions({});
+      return res.status(200).json(result);
+    } catch (e) {
+      logger.debug('Something went wrong retrieving watch provider regions', {
+        label: 'API',
+        errorMessage: e.message,
+      });
+      return next({
+        status: 500,
+        message: 'Unable to retrieve watch provider regions.',
+      });
+    }
   }
-});
+);
 
-router.get('/watchproviders/movies', async (req, res, next) => {
-  const tmdb = createTmdbWithRegionLanguage();
+router.get(
+  '/watchproviders/movies',
+  isAuthenticated(),
+  async (req, res, next) => {
+    const tmdb = createTmdbWithRegionLanguage();
 
-  try {
-    const result = await tmdb.getMovieWatchProviders({
-      watchRegion: req.query.watchRegion as string,
-    });
+    try {
+      const result = await tmdb.getMovieWatchProviders({
+        watchRegion: req.query.watchRegion as string,
+      });
 
-    return res.status(200).json(mapWatchProviderDetails(result));
-  } catch (e) {
-    logger.debug('Something went wrong retrieving movie watch providers', {
-      label: 'API',
-      errorMessage: e.message,
-    });
-    return next({
-      status: 500,
-      message: 'Unable to retrieve movie watch providers.',
-    });
+      return res.status(200).json(mapWatchProviderDetails(result));
+    } catch (e) {
+      logger.debug('Something went wrong retrieving movie watch providers', {
+        label: 'API',
+        errorMessage: e.message,
+      });
+      return next({
+        status: 500,
+        message: 'Unable to retrieve movie watch providers.',
+      });
+    }
   }
-});
+);
 
-router.get('/watchproviders/tv', async (req, res, next) => {
+router.get('/watchproviders/tv', isAuthenticated(), async (req, res, next) => {
   const tmdb = createTmdbWithRegionLanguage();
 
   try {

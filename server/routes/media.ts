@@ -1,8 +1,12 @@
 import TautulliAPI from '@server/api/tautulli';
-import { MediaStatus, MediaType } from '@server/constants/media';
+import {
+  MediaStatus,
+  MediaType,
+  VIDEO_MEDIA_TYPES,
+  isVideo,
+} from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
-import MediaEvent from '@server/entity/MediaEvent';
 import Season from '@server/entity/Season';
 import { User } from '@server/entity/User';
 import type {
@@ -16,24 +20,33 @@ import type {
 import { getAnimePlacement, setAnimeSetting } from '@server/lib/animePlacement';
 import { NoArrServerError, removeFromArr } from '@server/lib/arrRemoval';
 import { featureEnabled } from '@server/lib/features';
+import {
+  leaveOutUnreachable,
+  limitToLibraries,
+  viewerReach,
+} from '@server/lib/libraryVisibility';
 import { recordMediaDeletion } from '@server/lib/mediaDeletions';
-import { MediaEventType, recordMediaEvent } from '@server/lib/mediaHistory';
+import {
+  MediaEventType,
+  mediaHistory,
+  recordMediaEvent,
+} from '@server/lib/mediaHistory';
+import { isConnected } from '@server/lib/mediaServers';
 import { Permission } from '@server/lib/permissions';
 import { defaultRegion, estimateTitle } from '@server/lib/requestEta';
 import {
-  NothingMissingError,
   NotInServiceError,
+  NothingMissingError,
   searchMissing,
 } from '@server/lib/searchMissing';
 import { getSettings } from '@server/lib/settings';
-import { getWatchedBy } from '@server/lib/watchedBy';
 import { watchSource } from '@server/lib/watchHistory';
+import { getWatchedBy } from '@server/lib/watchedBy';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
 import { pageOf } from '@server/utils/pagination';
 import { Router } from 'express';
-import type { FindOneOptions } from 'typeorm';
-import { EntityNotFoundError, In, IsNull, Not } from 'typeorm';
+import { EntityNotFoundError } from 'typeorm';
 
 const mediaRoutes = Router();
 
@@ -42,60 +55,76 @@ mediaRoutes.get('/', async (req, res, next) => {
 
   const { pageSize, skip } = pageOf(req.query, 20);
 
-  let statusFilter = undefined;
+  let statuses: MediaStatus[] | undefined;
 
   switch (req.query.filter) {
     case 'available':
-      statusFilter = MediaStatus.AVAILABLE;
+      statuses = [MediaStatus.AVAILABLE];
       break;
     case 'partial':
-      statusFilter = MediaStatus.PARTIALLY_AVAILABLE;
+      statuses = [MediaStatus.PARTIALLY_AVAILABLE];
       break;
     case 'allavailable':
-      statusFilter = In([
-        MediaStatus.AVAILABLE,
-        MediaStatus.PARTIALLY_AVAILABLE,
-      ]);
+      statuses = [MediaStatus.AVAILABLE, MediaStatus.PARTIALLY_AVAILABLE];
       break;
     case 'processing':
-      statusFilter = MediaStatus.PROCESSING;
+      statuses = [MediaStatus.PROCESSING];
       break;
     case 'pending':
-      statusFilter = MediaStatus.PENDING;
+      statuses = [MediaStatus.PENDING];
       break;
   }
 
-  let sortFilter: FindOneOptions<Media>['order'] = {
-    id: 'DESC',
-  };
-
-  switch (req.query.sort) {
-    case 'modified':
-      sortFilter = {
-        updatedAt: 'DESC',
-      };
-      break;
-    case 'mediaAdded':
-      sortFilter = {
-        mediaAddedAt: 'DESC',
-      };
-  }
-
-  let whereClause: FindOneOptions<Media>['where'];
-  if (statusFilter || req.query.sort === 'mediaAdded') {
-    whereClause = {};
-    if (statusFilter) whereClause.status = statusFilter;
-    if (req.query.sort === 'mediaAdded')
-      whereClause.mediaAddedAt = Not(IsNull());
-  }
+  // Films and series unless another type is requested: the consumer (Recently
+  // Added) shows each as a film or series.
+  const mediaType = Object.values(MediaType).find(
+    (type) => type === req.query.mediaType
+  );
 
   try {
-    const [media, mediaCount] = await mediaRepository.findAndCount({
-      order: sortFilter,
-      where: whereClause,
-      take: pageSize,
-      skip,
-    });
+    const query = mediaRepository
+      .createQueryBuilder('media')
+      .leftJoinAndSelect('media.seasons', 'season')
+      .where('media.mediaType IN (:...mediaTypes)', {
+        mediaTypes: mediaType ? [mediaType] : VIDEO_MEDIA_TYPES,
+      });
+    if (statuses) {
+      query.andWhere('media.status IN (:...statuses)', { statuses });
+    }
+
+    switch (req.query.sort) {
+      case 'modified':
+        query.orderBy('media.updatedAt', 'DESC');
+        break;
+      case 'mediaAdded':
+        query
+          .andWhere('media.mediaAddedAt IS NOT NULL')
+          .orderBy('media.mediaAddedAt', 'DESC');
+        break;
+      default:
+        query.orderBy('media.id', 'DESC');
+    }
+
+    // Available titles the viewer's libraries don't hold are left out, so
+    // pages stay full; the rest are shown as their libraries allow.
+    const reach = await viewerReach(req.user);
+    if (
+      reach &&
+      statuses?.some(
+        (status) =>
+          status === MediaStatus.AVAILABLE ||
+          status === MediaStatus.PARTIALLY_AVAILABLE
+      )
+    ) {
+      leaveOutUnreachable(query, reach);
+    }
+
+    const [media, mediaCount] = await query
+      .take(pageSize)
+      .skip(skip)
+      .getManyAndCount();
+    await limitToLibraries(media, req.user);
+
     return res.status(200).json({
       pageInfo: {
         pages: Math.ceil(mediaCount / pageSize),
@@ -111,11 +140,9 @@ mediaRoutes.get('/', async (req, res, next) => {
 });
 
 /**
- * Asks Radarr or Sonarr to search now for what a title is missing — for a
- * series, only monitored episodes that have aired without a file.
- *
- * Registered before '/:id/:status', which would otherwise take
- * "search-missing" as a status.
+ * Ask Radarr or Sonarr to search now for what a title is missing (for a series,
+ * only monitored aired episodes without a file). Registered before
+ * '/:id/:status', which would take "search-missing" as a status.
  */
 mediaRoutes.post<{ id: string }, unknown, { is4k?: boolean }>(
   '/:id/search-missing',
@@ -131,11 +158,20 @@ mediaRoutes.post<{ id: string }, unknown, { is4k?: boolean }>(
         return next({ status: 404, message: 'Media not found.' });
       }
 
+      // With music off, artists can't be searched either.
+      if (
+        media.mediaType === MediaType.MUSIC &&
+        !featureEnabled('music', req.user)
+      ) {
+        return next({ status: 404, message: 'Media not found.' });
+      }
+
       const is4k = !!req.body?.is4k;
       const started = await searchMissing(media, is4k);
 
       await recordMediaEvent({
         tmdbId: media.tmdbId,
+        foreignId: media.foreignId,
         mediaType: media.mediaType,
         type: MediaEventType.SEARCHED,
         is4k,
@@ -143,9 +179,13 @@ mediaRoutes.post<{ id: string }, unknown, { is4k?: boolean }>(
         detail:
           media.mediaType === MediaType.MOVIE
             ? started.service
-            : `${started.searched} missing ${
-                started.searched === 1 ? 'episode' : 'episodes'
-              }, in ${started.service}`,
+            : media.mediaType === MediaType.MUSIC
+              ? `${started.searched} missing ${
+                  started.searched === 1 ? 'album' : 'albums'
+                }, in ${started.service}`
+              : `${started.searched} missing ${
+                  started.searched === 1 ? 'episode' : 'episodes'
+                }, in ${started.service}`,
       });
 
       return res.status(200).json(started);
@@ -155,7 +195,7 @@ mediaRoutes.post<{ id: string }, unknown, { is4k?: boolean }>(
       }
       return next({
         status: 502,
-        message: `Radarr or Sonarr did not accept the search: ${e.message}`,
+        message: `Radarr, Sonarr or Lidarr did not accept the search: ${e.message}`,
       });
     }
   }
@@ -182,6 +222,18 @@ mediaRoutes.post<
       return next({ status: 404, message: 'Media does not exist.' });
     }
 
+    // Only removing it from the blocklist changes a blocklisted title.
+    if (
+      media.status === MediaStatus.BLOCKLISTED ||
+      media.status4k === MediaStatus.BLOCKLISTED
+    ) {
+      return next({
+        status: 409,
+        message:
+          'This title is blocklisted. Remove it from the blocklist first.',
+      });
+    }
+
     const is4k = String(req.body.is4k) === 'true';
 
     switch (req.params.status) {
@@ -197,7 +249,6 @@ mediaRoutes.post<
             );
 
             if (!season) {
-              // Create the season if it doesn't exist
               season = seasonRepository.create({
                 seasonNumber: expectedSeason?.seasonNumber,
               });
@@ -244,9 +295,12 @@ mediaRoutes.delete(
         where: { id: Number(req.params.id) },
       });
 
-      // Recorded before the row goes, so watchlist sync can still tell a
-      // stale watchlist entry from one added after this deletion.
-      await recordMediaDeletion(media.tmdbId, media.mediaType);
+      // Recorded before deleting the row so watchlist sync can tell a stale
+      // entry from one added afterwards. Not for artists: deletions are keyed
+      // by TMDB id, which is 0 for every artist.
+      if (isVideo(media.mediaType)) {
+        await recordMediaDeletion(media.tmdbId, media.mediaType);
+      }
 
       if (media.status === MediaStatus.BLOCKLISTED) {
         media.resetServiceData();
@@ -271,8 +325,8 @@ mediaRoutes.delete(
 );
 
 /**
- * A title's history, newest first, for the manage panel. Looked up by title
- * rather than media id, so it outlives the media row.
+ * Newest-first history of a title for the manage panel. Keyed by title, not
+ * media id, so it outlives the media row.
  */
 mediaRoutes.get(
   '/history/:mediaType/:tmdbId',
@@ -286,39 +340,11 @@ mediaRoutes.get(
     }
 
     try {
-      const events = await getRepository(MediaEvent).find({
-        where: { tmdbId: Number(req.params.tmdbId), mediaType },
-        order: { occurredAt: 'DESC', id: 'DESC' },
-        take: 100,
-      });
-
-      const userIds = [
-        ...new Set(events.map((e) => e.userId).filter((id) => id != null)),
-      ] as number[];
-      const users = userIds.length
-        ? await getRepository(User).find({ where: { id: In(userIds) } })
-        : [];
-      const byId = new Map(users.map((user) => [user.id, user]));
-
-      return res.status(200).json(
-        events.map((event) => {
-          const user = event.userId != null ? byId.get(event.userId) : null;
-          return {
-            id: event.id,
-            type: event.type,
-            is4k: event.is4k,
-            detail: event.detail ?? null,
-            occurredAt: event.occurredAt,
-            user: user
-              ? {
-                  id: user.id,
-                  displayName: user.displayName,
-                  avatar: user.avatar,
-                }
-              : null,
-          };
-        })
-      );
+      return res
+        .status(200)
+        .json(
+          await mediaHistory({ tmdbId: Number(req.params.tmdbId), mediaType })
+        );
     } catch (e) {
       return next({ status: 500, message: e.message });
     }
@@ -355,13 +381,16 @@ mediaRoutes.delete(
         throw e;
       }
 
-      if (media.mediaType === MediaType.TV) {
-        for (const season of media.seasons) {
-          season[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
+      const statusKey = is4k ? 'status4k' : 'status';
+      // A blocklisted title stays blocklisted.
+      if (media[statusKey] !== MediaStatus.BLOCKLISTED) {
+        if (media.mediaType === MediaType.TV) {
+          for (const season of media.seasons) {
+            season[statusKey] = MediaStatus.DELETED;
+          }
         }
+        media[statusKey] = MediaStatus.DELETED;
       }
-
-      media[is4k ? 'status4k' : 'status'] = MediaStatus.DELETED;
       media.resetServiceData(is4k);
       await mediaRepository.save(media);
       await recordMediaDeletion(media.tmdbId, media.mediaType);
@@ -382,13 +411,12 @@ mediaRoutes.delete(
 );
 
 /**
- * Roughly when a title should arrive, for one being processed with no
- * request behind it — added in Radarr or Sonarr directly, say. Seerr shows it
- * as "Requested" all the same; with a request, the request's own estimate is
- * used instead.
+ * Arrival estimate for a title being processed with no request (e.g. added
+ * directly in Radarr or Sonarr), which Seerr still shows as "Requested".
+ * Requested titles use the request's estimate instead.
  */
 mediaRoutes.get<{ id: string }>('/:id/eta', async (req, res, next) => {
-  // Switched off for everyone or by this person: nothing to estimate.
+  // Off globally or for this person: nothing to estimate.
   if (!featureEnabled('arrivalEstimates', req.user)) {
     return res.status(200).json({ stage: 'unknown' });
   }
@@ -402,7 +430,7 @@ mediaRoutes.get<{ id: string }>('/:id/eta', async (req, res, next) => {
     return res.status(200).json(
       await estimateTitle(
         media,
-        // The validator may already have made it a boolean.
+        // The validator may have made it a boolean already.
         String(req.query.is4k) === 'true',
         req.user?.settings?.discoverRegion || defaultRegion()
       )
@@ -413,16 +441,16 @@ mediaRoutes.get<{ id: string }>('/:id/eta', async (req, res, next) => {
 });
 
 /**
- * Who has watched a title, and when last, from the server's watch history
- * (Tautulli for Plex, Jellyfin or Emby themselves) — for the title page.
- * Admins only, as the watch data behind the manage panel is.
+ * Who watched a title and when last, from the server's watch history (Tautulli
+ * for Plex, Jellyfin or Emby directly), for the title page. Admins only, like
+ * the manage panel's watch data.
  */
 mediaRoutes.get<{ id: string }>(
   '/:id/watched-by',
   isAuthenticated(Permission.ADMIN),
   async (req, res, next) => {
     try {
-      // Turned off: nobody is asked who watched anything.
+      // Feature off: don't query watch history.
       if (!featureEnabled('whoWatched', req.user)) {
         return res.status(200).json({ configured: false, people: [] });
       }
@@ -448,8 +476,8 @@ mediaRoutes.get<{ id: string }>(
 );
 
 /**
- * A title's anime setting and where it sits in Sonarr or Radarr against it,
- * for the manage panel (lib/animePlacement).
+ * A title's anime setting and its Sonarr or Radarr placement against it, for
+ * the manage panel (lib/animePlacement).
  */
 mediaRoutes.get<{ id: string }, AnimePlacement>(
   '/:id/anime',
@@ -474,8 +502,8 @@ mediaRoutes.get<{ id: string }, AnimePlacement>(
 );
 
 /**
- * Sets a title anime (true), not anime (false) or back to automatic (null),
- * and moves it in Sonarr or Radarr to match.
+ * Set a title anime (true), not anime (false) or automatic (null), and move it
+ * in Sonarr or Radarr to match.
  */
 mediaRoutes.put<
   { id: string },
@@ -516,7 +544,13 @@ mediaRoutes.get<{ id: string }, MediaWatchDataResponse>(
   async (req, res, next) => {
     const settings = getSettings().tautulli;
 
-    if (!settings.hostname || !settings.port || !settings.apiKey) {
+    // Tautulli is Plex's watch history: only read while Plex is connected.
+    if (
+      !isConnected('plex') ||
+      !settings.hostname ||
+      !settings.port ||
+      !settings.apiKey
+    ) {
       return next({
         status: 404,
         message: 'Tautulli API not configured.',

@@ -1,0 +1,298 @@
+import Spinner from '@app/assets/spinner.svg';
+import Button from '@app/components/Common/Button';
+import CachedImage from '@app/components/Common/CachedImage';
+import Tooltip from '@app/components/Common/Tooltip';
+import DeclineReason from '@app/components/DeclineReason';
+import DeclineRequestModal from '@app/components/DeclineRequestModal';
+import MusicImage from '@app/components/Music/MusicImage';
+import {
+  AlbumsField,
+  MusicRequestBadge,
+  SongsField,
+  musicRequestArtist,
+  musicRequestFallback,
+  musicRequestHref,
+  musicRequestImage,
+  musicRequestName,
+  musicRequestTitle,
+  useMusicRequest,
+} from '@app/components/Music/MusicRequest/shared';
+import OverQuotaBadge from '@app/components/OverQuotaBadge';
+import RequestModal from '@app/components/RequestModal';
+import RequestServerIssue from '@app/components/RequestServerIssue';
+import useNearScreen, { NearScreen, bothRefs } from '@app/hooks/useNearScreen';
+import { Permission, useUser } from '@app/hooks/useUser';
+import globalMessages from '@app/i18n/globalMessages';
+import defineMessages from '@app/utils/defineMessages';
+import {
+  ArrowPathIcon,
+  CheckIcon,
+  PencilIcon,
+  XMarkIcon,
+} from '@heroicons/react/24/solid';
+import { MediaRequestStatus } from '@server/constants/media';
+import type { MediaRequest } from '@server/entity/MediaRequest';
+import type { NonFunctionProperties } from '@server/interfaces/api/common';
+import Link from 'next/link';
+import { useMemo, useState } from 'react';
+import { useInView } from 'react-intersection-observer';
+import { useIntl } from 'react-intl';
+
+const messages = defineMessages('components.Music.MusicRequestCard', {
+  approverequest: 'Approve Request',
+  declinerequest: 'Decline Request',
+  editrequest: 'Edit Request',
+  cancelrequest: 'Cancel Request',
+});
+
+/** A music request card for request rows (Recent Requests, profiles). */
+const MusicRequestCard = ({
+  request,
+}: {
+  request: NonFunctionProperties<MediaRequest>;
+}) => {
+  const intl = useIntl();
+  const { user, hasPermission } = useUser();
+  // In view: refresh the request. Near the screen: preload its picture.
+  const { ref: viewRef, inView } = useInView();
+  const { ref: nearRef, nearness } = useNearScreen();
+  const ref = useMemo(() => bothRefs(viewRef, nearRef), [viewRef, nearRef]);
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [showDeclineModal, setShowDeclineModal] = useState(false);
+  const {
+    requestData,
+    revalidate,
+    approve,
+    retry,
+    remove,
+    isApproving,
+    isRetrying,
+  } = useMusicRequest(request, inView);
+
+  const title = musicRequestTitle(requestData, intl);
+  const href = musicRequestHref(requestData);
+  const pending = requestData.status === MediaRequestStatus.PENDING;
+  const manages = hasPermission(Permission.MANAGE_REQUESTS);
+  const isOwner = requestData.requestedBy?.id === user?.id;
+
+  return (
+    <>
+      {requestData.media?.foreignId && (
+        <RequestModal
+          type="music"
+          show={showEditModal}
+          artistMbid={requestData.media.foreignId}
+          editRequest={requestData}
+          onCancel={() => setShowEditModal(false)}
+          onComplete={() => {
+            revalidate();
+            setShowEditModal(false);
+          }}
+        />
+      )}
+      <DeclineRequestModal
+        show={showDeclineModal}
+        requests={[requestData]}
+        subTitle={title}
+        onCancel={() => setShowDeclineModal(false)}
+        onComplete={() => {
+          setShowDeclineModal(false);
+          revalidate();
+        }}
+      />
+      {/* As tall as a film's card (2:3 poster). */}
+      <div
+        className="relative flex min-h-[9.5rem] w-72 overflow-hidden rounded-xl bg-surface p-4 text-muted shadow ring-1 ring-subtle sm:min-h-[12.5rem] sm:w-96"
+        data-testid="request-card"
+        ref={ref}
+      >
+        {/* Faded cover behind, like a film's backdrop. */}
+        {musicRequestImage(requestData) && (
+          <div className="absolute inset-0 z-0" aria-hidden>
+            <div className="absolute inset-0 scale-110 blur-md">
+              <NearScreen.Provider value={nearness}>
+                <MusicImage
+                  src={musicRequestImage(requestData)}
+                  fallback="none"
+                  sizes="384px"
+                />
+              </NearScreen.Provider>
+            </div>
+            <div
+              className="absolute inset-0"
+              style={{
+                backgroundImage:
+                  'linear-gradient(135deg, rgb(var(--page) / var(--title-fade)) 0%, rgb(var(--page)) 75%)',
+              }}
+            />
+          </div>
+        )}
+        <div
+          className="relative z-10 flex min-w-0 flex-1 flex-col pr-4"
+          data-testid="request-card-title"
+        >
+          {/* Artist shown on phones too: the name alone says little. */}
+          <div className="truncate text-xs font-medium text-strong">
+            {musicRequestArtist(requestData, intl)}
+          </div>
+          {/* Long names wrap to a second line. */}
+          <Link
+            href={href}
+            title={title}
+            className="line-clamp-2 whitespace-normal break-words text-base font-bold leading-tight text-strong hover:underline sm:text-lg sm:leading-snug"
+          >
+            {musicRequestName(requestData, intl)}
+          </Link>
+          {hasPermission(
+            [Permission.MANAGE_REQUESTS, Permission.REQUEST_VIEW],
+            { type: 'or' }
+          ) &&
+            requestData.requestedBy && (
+              <div className="card-field truncate">
+                <Link
+                  href={`/users/${requestData.requestedBy.id}`}
+                  className="group flex items-center"
+                >
+                  <span className="avatar-sm">
+                    <CachedImage
+                      type="avatar"
+                      src={requestData.requestedBy.avatar}
+                      alt=""
+                      className="avatar-sm object-cover"
+                      width={20}
+                      height={20}
+                    />
+                  </span>
+                  <span className="truncate font-semibold group-hover:text-strong group-hover:underline">
+                    {requestData.requestedBy.displayName}
+                  </span>
+                </Link>
+              </div>
+            )}
+          <AlbumsField
+            request={requestData}
+            className="my-0.5 hidden items-center gap-2 text-sm sm:my-1 sm:flex"
+          />
+          <SongsField
+            request={requestData}
+            className="my-0.5 hidden items-center gap-2 text-sm sm:my-1 sm:flex"
+          />
+          <div className="mt-2 flex items-center text-sm sm:mt-1">
+            <span className="mr-2 hidden font-bold sm:block">
+              {intl.formatMessage(globalMessages.status)}
+            </span>
+            <MusicRequestBadge request={requestData} />
+            <OverQuotaBadge request={requestData} className="ml-2 flex-none" />
+          </div>
+          {requestData.status === MediaRequestStatus.DECLINED &&
+            requestData.declineReason && (
+              <DeclineReason
+                reason={requestData.declineReason}
+                className="mt-1"
+              />
+            )}
+          <RequestServerIssue request={requestData} compact className="mt-1" />
+          <div className="flex flex-1 items-end space-x-2">
+            {requestData.status === MediaRequestStatus.FAILED && manages && (
+              <>
+                <Tooltip content={intl.formatMessage(globalMessages.retry)}>
+                  <Button
+                    buttonType="primary"
+                    buttonSize="sm"
+                    disabled={isRetrying}
+                    onClick={() => retry()}
+                  >
+                    <ArrowPathIcon
+                      className={isRetrying ? 'animate-spin' : ''}
+                      style={{
+                        marginRight: '0',
+                        animationDirection: 'reverse',
+                      }}
+                    />
+                  </Button>
+                </Tooltip>
+                {/* Change Lidarr, profile or folder before retrying. */}
+                <Tooltip content={intl.formatMessage(messages.editrequest)}>
+                  <Button
+                    buttonType="default"
+                    buttonSize="sm"
+                    disabled={isRetrying}
+                    onClick={() => setShowEditModal(true)}
+                  >
+                    <PencilIcon />
+                  </Button>
+                </Tooltip>
+              </>
+            )}
+            {pending && manages && (
+              <>
+                <Tooltip content={intl.formatMessage(messages.approverequest)}>
+                  <Button
+                    buttonType="success"
+                    buttonSize="sm"
+                    onClick={() => approve()}
+                    disabled={isApproving}
+                  >
+                    {isApproving ? <Spinner /> : <CheckIcon />}
+                  </Button>
+                </Tooltip>
+                <Tooltip content={intl.formatMessage(messages.declinerequest)}>
+                  <Button
+                    buttonType="danger"
+                    buttonSize="sm"
+                    onClick={() => setShowDeclineModal(true)}
+                    disabled={isApproving}
+                  >
+                    <XMarkIcon />
+                  </Button>
+                </Tooltip>
+              </>
+            )}
+            {pending && (manages || isOwner) && (
+              <Tooltip content={intl.formatMessage(messages.editrequest)}>
+                <Button
+                  buttonType="primary"
+                  buttonSize="sm"
+                  onClick={() => setShowEditModal(true)}
+                  disabled={isApproving}
+                >
+                  <PencilIcon />
+                </Button>
+              </Tooltip>
+            )}
+            {pending && !manages && isOwner && (
+              <Tooltip content={intl.formatMessage(messages.cancelrequest)}>
+                <Button
+                  buttonType="danger"
+                  buttonSize="sm"
+                  onClick={() => remove()}
+                >
+                  <XMarkIcon />
+                </Button>
+              </Tooltip>
+            )}
+          </div>
+        </div>
+        <Link
+          href={href}
+          className="relative z-10 w-20 flex-shrink-0 scale-100 transform-gpu self-center overflow-hidden rounded-md shadow-sm transition duration-300 hover:scale-105 hover:shadow-md sm:w-28"
+          // Duplicates the title link.
+          tabIndex={-1}
+          aria-hidden
+        >
+          <div className="relative w-full" style={{ paddingBottom: '100%' }}>
+            <NearScreen.Provider value={nearness}>
+              <MusicImage
+                src={musicRequestImage(requestData)}
+                fallback={musicRequestFallback(requestData)}
+                sizes="7rem"
+              />
+            </NearScreen.Provider>
+          </div>
+        </Link>
+      </div>
+    </>
+  );
+};
+
+export default MusicRequestCard;

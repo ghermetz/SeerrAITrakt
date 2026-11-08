@@ -1,5 +1,6 @@
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
+import SaveBar from '@app/components/Common/SaveBar';
 import NotificationTypeSelector from '@app/components/NotificationTypeSelector';
 import useToasts from '@app/hooks/useToasts';
 import { useUser } from '@app/hooks/useUser';
@@ -23,8 +24,7 @@ const messages = defineMessages(
     telegramChatIdTipLong:
       '<TelegramBotLink>Start a chat</TelegramBotLink>, add <GetIdBotLink>@get_id_bot</GetIdBotLink>, and issue the <code>/my_id</code> command',
     telegramMessageThreadId: 'Thread/Topic ID',
-    telegramMessageThreadIdTip:
-      "If your group-chat has topics enabled, you can specify a thread/topic's ID here",
+    telegramMessageThreadIdTip: 'For a group chat with topics: the topic’s ID',
     sendSilently: 'Send Silently',
     sendSilentlyDescription: 'Send notifications with no sound',
     validationTelegramChatId: 'You must provide a valid chat ID',
@@ -220,7 +220,7 @@ const UserTelegramSettings = () => {
                   : undefined
               }
             />
-            <div className="actions">
+            <SaveBar>
               <div className="flex justify-end">
                 <span className="ml-3 inline-flex rounded-md shadow-sm">
                   <Button
@@ -237,7 +237,7 @@ const UserTelegramSettings = () => {
                   </Button>
                 </span>
               </div>
-            </div>
+            </SaveBar>
           </Form>
         );
       }}

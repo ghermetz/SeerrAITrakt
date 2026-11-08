@@ -15,11 +15,15 @@ const messages = defineMessages('components.Backfill.StartSearchModal', {
   pickSeries: 'Series or movie',
   filter: 'Find a series in Sonarr or a movie in Radarr…',
   noMatches: 'Nothing in Sonarr or Radarr matches.',
+  pickTitle: 'Series, movie or album',
+  filterMusic: 'Find a series, movie, album or artist…',
+  noMatchesMusic: 'Nothing in Sonarr, Radarr or Lidarr matches.',
   series: 'Series',
   movie: 'Movie',
+  album: 'Album',
   searchNames: 'Search names',
   searchNamesTip:
-    'Prowlarr is searched under the title and aliases Sonarr or Radarr has. Add the names release groups use, such as a romanised or original title.',
+    'Extra names to search, such as the romanised or original title release groups use.',
   addName: 'Add a name',
   add: 'Add',
   remove: 'Remove {name}',
@@ -27,7 +31,7 @@ const messages = defineMessages('components.Backfill.StartSearchModal', {
   starting: 'Starting…',
   failed: 'The search could not be started.',
   takesAWhile:
-    'Searching every indexer and opening the most likely packs takes a few minutes. Its page shows what was found.',
+    'This takes a few minutes. The title’s page shows what was found.',
 });
 
 export interface LibraryTitle {
@@ -40,14 +44,16 @@ export interface LibraryTitle {
 interface LibraryOption extends LibraryTitle {
   serverName: string;
   year: number;
+  /** Album artist. */
+  artist?: string;
 }
 
 interface StartSearchModalProps {
   show: boolean;
   onClose: () => void;
-  /** A title Backfill already follows. */
+  /** Id of a title Backfill already follows. */
   seriesId?: number;
-  /** A series or movie to start following (from a title page). */
+  /** A title to start following, from its page. */
   target?: LibraryTitle;
   /** Names Sonarr already knows, shown for reference. */
   knownNames?: string[];
@@ -74,10 +80,20 @@ const StartSearchModal = ({
   const { data: options } = useSWR<LibraryOption[]>(
     show && needsPick ? '/api/v1/backfill/library' : null
   );
+  // List albums only while Backfill handles music.
+  const music = useMemo(
+    () => (options ?? []).some((o) => o.kind === 'album'),
+    [options]
+  );
   const shown = useMemo(() => {
     const f = filter.trim().toLowerCase();
     return (options ?? [])
-      .filter((o) => !f || o.title.toLowerCase().includes(f))
+      .filter(
+        (o) =>
+          !f ||
+          o.title.toLowerCase().includes(f) ||
+          !!o.artist?.toLowerCase().includes(f)
+      )
       .slice(0, 50);
   }, [options, filter]);
 
@@ -150,13 +166,17 @@ const StartSearchModal = ({
                 htmlFor="backfill-series-filter"
                 className="text-label mb-1 block"
               >
-                {intl.formatMessage(messages.pickSeries)}
+                {intl.formatMessage(
+                  music ? messages.pickTitle : messages.pickSeries
+                )}
               </label>
               <input
                 id="backfill-series-filter"
                 type="text"
                 className="w-full"
-                placeholder={intl.formatMessage(messages.filter)}
+                placeholder={intl.formatMessage(
+                  music ? messages.filterMusic : messages.filter
+                )}
                 value={filter}
                 onChange={(e) => setFilter(e.target.value)}
               />
@@ -166,21 +186,32 @@ const StartSearchModal = ({
                     <button
                       type="button"
                       onClick={() => setPicked(o)}
-                      className={`flex w-full items-baseline justify-between px-3 py-2 text-left text-sm hover:bg-gray-700 ${
+                      className={`flex w-full items-baseline justify-between gap-3 px-3 py-2 text-left text-sm hover:bg-gray-700 ${
                         picked?.kind === o.kind &&
                         picked.arrId === o.arrId &&
                         picked.serverId === o.serverId
-                          ? 'bg-indigo-600/30 text-white'
+                          ? 'bg-indigo-600/30 text-strong'
                           : 'text-gray-200'
                       }`}
                     >
-                      <span>
+                      <span className="min-w-0 whitespace-normal break-words">
                         {o.title}{' '}
-                        <span className="text-gray-400">({o.year})</span>
+                        {o.year > 0 && (
+                          <span className="text-gray-400">({o.year})</span>
+                        )}
+                        {o.artist && (
+                          <span className="block break-words text-xs text-gray-400">
+                            {o.artist}
+                          </span>
+                        )}
                       </span>
-                      <span className="text-xs text-gray-500">
+                      <span className="flex-shrink-0 text-xs text-gray-500">
                         {intl.formatMessage(
-                          o.kind === 'movie' ? messages.movie : messages.series
+                          o.kind === 'movie'
+                            ? messages.movie
+                            : o.kind === 'album'
+                              ? messages.album
+                              : messages.series
                         )}{' '}
                         · {o.serverName}
                       </span>
@@ -189,7 +220,9 @@ const StartSearchModal = ({
                 ))}
                 {options && !shown.length && (
                   <li className="px-3 py-2 text-sm text-gray-400">
-                    {intl.formatMessage(messages.noMatches)}
+                    {intl.formatMessage(
+                      music ? messages.noMatchesMusic : messages.noMatches
+                    )}
                   </li>
                 )}
               </ul>
@@ -218,7 +251,7 @@ const StartSearchModal = ({
               {terms.map((term) => (
                 <span
                   key={term}
-                  className="inline-flex items-center gap-1 rounded-full bg-indigo-600/30 px-3 py-0.5 text-sm text-indigo-100"
+                  className="inline-flex items-center gap-1 rounded-full bg-indigo-600/30 px-3 py-0.5 text-sm text-indigo-100 light:text-accent-text"
                 >
                   {term}
                   <button
@@ -250,7 +283,7 @@ const StartSearchModal = ({
               />
               <button
                 type="button"
-                className="rounded-md bg-gray-700 px-3 text-sm text-white hover:bg-gray-600"
+                className="rounded-md bg-gray-700 px-3 text-sm text-strong hover:bg-gray-600"
                 onClick={addTerm}
               >
                 {intl.formatMessage(messages.add)}

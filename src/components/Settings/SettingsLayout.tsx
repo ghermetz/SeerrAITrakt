@@ -1,19 +1,19 @@
 import PageTitle from '@app/components/Common/PageTitle';
 import type { SettingsRoute } from '@app/components/Common/SettingsTabs';
 import SettingsTabs from '@app/components/Common/SettingsTabs';
-import useSettings from '@app/hooks/useSettings';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
-import { MediaServerType } from '@server/constants/server';
 import { useIntl } from 'react-intl';
 
 const messages = defineMessages('components.Settings', {
   menuGeneralSettings: 'General',
+  menuAppearance: 'Appearance',
   menuUsers: 'Users',
   menuFeatures: 'Features',
-  menuPlexSettings: 'Plex',
-  menuJellyfinSettings: '{mediaServerName}',
+  menuMusic: 'Music',
+  menuMediaServers: 'Media Servers',
   menuServices: 'Services',
+  menuQuality: 'Quality',
   menuNetwork: 'Network',
   menuNotifications: 'Notifications',
   menuLogs: 'Logs',
@@ -32,12 +32,16 @@ type SettingsLayoutProps = {
 
 const SettingsLayout = ({ children }: SettingsLayoutProps) => {
   const intl = useIntl();
-  const settings = useSettings();
   const settingsRoutes: SettingsRoute[] = [
     {
       text: intl.formatMessage(messages.menuGeneralSettings),
       route: '/settings/main',
       regex: /^\/settings(\/main)?$/,
+    },
+    {
+      text: intl.formatMessage(messages.menuAppearance),
+      route: '/settings/appearance',
+      regex: /^\/settings\/appearance/,
     },
     {
       text: intl.formatMessage(messages.menuUsers),
@@ -49,21 +53,28 @@ const SettingsLayout = ({ children }: SettingsLayoutProps) => {
       route: '/settings/features',
       regex: /^\/settings\/features/,
     },
-    settings.currentSettings.mediaServerType === MediaServerType.PLEX
-      ? {
-          text: intl.formatMessage(messages.menuPlexSettings),
-          route: '/settings/plex',
-          regex: /^\/settings\/plex/,
-        }
-      : {
-          text: getAvailableMediaServerName(),
-          route: '/settings/jellyfin',
-          regex: /^\/settings\/jellyfin/,
-        },
+    // Shown before Lidarr is added too: it says where music starts.
+    {
+      text: intl.formatMessage(messages.menuMusic),
+      route: '/settings/music',
+      regex: /^\/settings\/music/,
+    },
+    // Each server's own settings (/settings/plex, /settings/jellyfin,
+    // /settings/emby) are reached from here, with Edit.
+    {
+      text: intl.formatMessage(messages.menuMediaServers),
+      route: '/settings/media-servers',
+      regex: /^\/settings\/(media-servers|plex|jellyfin|emby)/,
+    },
     {
       text: intl.formatMessage(messages.menuServices),
       route: '/settings/services',
       regex: /^\/settings\/services/,
+    },
+    {
+      text: intl.formatMessage(messages.menuQuality),
+      route: '/settings/quality',
+      regex: /^\/settings\/quality/,
     },
     {
       text: intl.formatMessage(messages.menuNetwork),
@@ -123,19 +134,11 @@ const SettingsLayout = ({ children }: SettingsLayoutProps) => {
       <div className="mt-6">
         <SettingsTabs settingsRoutes={settingsRoutes} />
       </div>
-      <div className="mt-10 text-white">{children}</div>
+      <div className="mt-10 text-strong" data-seerr="settings">
+        {children}
+      </div>
     </>
   );
-  function getAvailableMediaServerName() {
-    return intl.formatMessage(messages.menuJellyfinSettings, {
-      mediaServerName:
-        settings.currentSettings.mediaServerType === MediaServerType.JELLYFIN
-          ? 'Jellyfin'
-          : settings.currentSettings.mediaServerType === MediaServerType.EMBY
-            ? 'Emby'
-            : undefined,
-    });
-  }
 };
 
 export default SettingsLayout;

@@ -32,11 +32,10 @@ const messages = defineMessages('components.ManageSlideOver.AnimeSetting', {
   belongsIn: 'Moves to {folder}',
   belongsOn: 'Goes on {profile}',
   belongsTyped: 'Typed {seriesType}',
-  notInArr:
-    'Not in {arr} yet. The Anime tick in its request dialog starts from what is set here.',
+  notInArr: 'Not in {arr} yet. This sets the Anime tick when it’s requested.',
   serverError: '{server} could not be read: {error}',
   saveHint:
-    'Saving puts it where the setting says in {arr}: the anime or regular root folder (files are moved, which takes a while for a big title), quality profile and, for a series, series type. Anime or not chosen on its requests that says otherwise is replaced.',
+    'Saving moves it in {arr} to match, replacing what its requests chose. Big titles take a while to move.',
   save: 'Save',
   saveAndMove: 'Save and Move',
   saving: 'Saving…',
@@ -63,9 +62,9 @@ const errorOf = (e: unknown) =>
       : String(e);
 
 /**
- * Whether a title is anime, set by hand when detection gets it wrong, and
- * where it sits in Sonarr or Radarr against that (lib/animePlacement).
- * Admins only; read only while the manage panel is open.
+ * Manual anime override for when detection is wrong, and the resulting
+ * Sonarr/Radarr placement (lib/animePlacement). Admins only; fetched only
+ * while the manage panel is open.
  */
 const AnimeSetting = ({
   mediaId,
@@ -95,7 +94,7 @@ const AnimeSetting = ({
   }, [data]);
 
   const changed = !!data && choice !== choiceOf(data.animeSetting);
-  // What saving the chosen setting would change on a server.
+  // Changes saving the current choice would make on a server.
   const changesFor = (server: AnimePlacementServer) => {
     const anime = choice === 'auto' ? server.automatic : choice === 'anime';
     return anime ? server.ifAnime : server.ifNotAnime;
@@ -180,7 +179,7 @@ const AnimeSetting = ({
         {intl.formatMessage(messages.anime)}
       </h3>
       {error ? (
-        <p className="text-sm text-red-400">
+        <p className="text-sm text-red-400 light:text-danger-text">
           {intl.formatMessage(messages.loadError, { error: errorOf(error) })}
         </p>
       ) : !data ? (
@@ -231,7 +230,7 @@ const AnimeSetting = ({
                         {server.is4k && <Badge badgeType="warning">4K</Badge>}
                       </div>
                       {server.error ? (
-                        <p className="text-red-400">
+                        <p className="text-red-400 light:text-danger-text">
                           {intl.formatMessage(messages.serverError, {
                             server: server.serverName,
                             error: server.error,
@@ -256,14 +255,14 @@ const AnimeSetting = ({
                               {badges.map((badge) => (
                                 <span
                                   key={badge}
-                                  className="rounded bg-yellow-500/20 px-2 py-0.5 text-yellow-200"
+                                  className="rounded bg-yellow-500/20 px-2 py-0.5 text-yellow-200 light:text-warning-text"
                                 >
                                   {badge}
                                 </span>
                               ))}
                             </div>
                           ) : (
-                            <p className="text-xs text-green-400">
+                            <p className="text-xs text-success-text">
                               {intl.formatMessage(messages.inPlace)}
                             </p>
                           )}

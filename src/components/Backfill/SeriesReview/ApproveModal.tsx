@@ -19,21 +19,22 @@ const messages = defineMessages('components.Backfill.ApproveModal', {
   recommended: 'Recommended',
   missing: 'Missing episodes only',
   missingMovie: 'The missing movie',
+  missingTracks: 'Missing tracks only',
   missingDetail: '{files} files · {size} · nothing on disk is touched',
   onlyFiles:
-    'Only these files are downloaded; the torrent client skips the rest of the pack. Once {app} has imported them, the download is removed, with no seeding.',
+    'Only these files are downloaded. After {app} imports them, the torrent is removed without seeding.',
   usenetWhole:
-    'The Usenet client downloads the whole NZB; only these files are imported. The job is removed from it afterwards.',
+    'The whole NZB is downloaded, but only these files are imported.',
   deleteWarning:
-    '{count} {count, plural, one {file} other {files}} on disk will be permanently deleted as their replacements import ({app}’s recycle bin is off).',
+    '{count} {count, plural, one {file is} other {files are}} deleted for good as replacements import ({app}’s recycle bin is off).',
   typeToConfirm: 'Type {series} to confirm',
   includeAi:
     'Include the {count} {count, plural, one {file} other {files}} the AI placed',
   includeAiTip:
-    'Their names did not say which episode they are; the AI matched them, and Sonarr agreed with the episode. Check them under Show files first.',
+    'Their names didn’t say which episode; the AI placed them. Check under Show files first.',
   failed: 'The pack could not be approved.',
   unavailable:
-    'This pack is no longer waiting for approval: it was approved, skipped or dropped since this opened. Close this and choose again.',
+    'This pack is no longer waiting for approval. Close this and choose again.',
 });
 
 const ApproveModal = ({
@@ -49,7 +50,7 @@ const ApproveModal = ({
   kind: TitleKind;
   seriesTitle: string;
   candidate: CandidateView;
-  /** The pack can no longer be approved, so OK is turned off. */
+  /** The pack can no longer be approved; disables OK. */
   unavailable?: boolean;
   onClose: () => void;
   onApproved: (jobId: number) => void;
@@ -139,9 +140,9 @@ const ApproveModal = ({
         onChange={() => setMode(value)}
       />
       <span>
-        <span className="font-semibold text-white">{label}</span>
+        <span className="font-semibold text-strong">{label}</span>
         {recommended && (
-          <span className="ml-2 rounded-full bg-green-500/20 px-2 py-0.5 text-xs text-green-300">
+          <span className="ml-2 rounded-full bg-green-500/20 px-2 py-0.5 text-xs text-green-300 light:text-success-text">
             {intl.formatMessage(messages.recommended)}
           </span>
         )}
@@ -201,7 +202,11 @@ const ApproveModal = ({
               option(
                 'missing',
                 intl.formatMessage(
-                  kind === 'movie' ? messages.missingMovie : messages.missing
+                  kind === 'movie'
+                    ? messages.missingMovie
+                    : kind === 'album'
+                      ? messages.missingTracks
+                      : messages.missing
                 ),
                 intl.formatMessage(messages.missingDetail, {
                   files: pick.missing.length,
@@ -225,7 +230,7 @@ const ApproveModal = ({
                 onChange={(e) => setIncludeAi(e.target.checked)}
               />
               <span>
-                <span className="font-semibold text-white">
+                <span className="font-semibold text-strong">
                   {intl.formatMessage(messages.includeAi, { count: aiInMode })}
                 </span>
                 <span className="block text-sm text-gray-400">
@@ -252,7 +257,7 @@ const ApproveModal = ({
             >
               <label
                 htmlFor="backfill-confirm"
-                className="mb-1 mt-2 block text-sm text-red-100"
+                className="mb-1 mt-2 block text-sm text-red-100 light:text-danger-text"
               >
                 {intl.formatMessage(messages.typeToConfirm, {
                   series: seriesTitle,

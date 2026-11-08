@@ -1,14 +1,20 @@
 import Button from '@app/components/Common/Button';
 import LoadingSpinner from '@app/components/Common/LoadingSpinner';
 import PageTitle from '@app/components/Common/PageTitle';
+import SaveBar from '@app/components/Common/SaveBar';
 import Tooltip from '@app/components/Common/Tooltip';
 import SettingsBadge from '@app/components/Settings/SettingsBadge';
+import {
+  firstNonAddress,
+  proxyListFromText,
+  proxyListToText,
+} from '@app/components/Settings/SettingsNetwork/proxyList';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
 import { ArrowDownOnSquareIcon } from '@heroicons/react/24/outline';
 import type { NetworkSettings } from '@server/lib/settings';
-import axios from 'axios';
+import axios, { isAxiosError } from 'axios';
 import { Field, Form, Formik } from 'formik';
 import { useIntl } from 'react-intl';
 import useSWR, { mutate } from 'swr';
@@ -21,16 +27,25 @@ const messages = defineMessages('components.Settings.SettingsNetwork', {
   networksettings: 'Network Settings',
   networksettingsDescription:
     'Configure network settings for your Seerr AI instance.',
+  networksettingsLive: 'Changes apply as soon as you save.',
   csrfProtection: 'Enable CSRF Protection',
-  csrfProtectionTip: 'Set external API access to read-only (requires HTTPS)',
-  csrfProtectionHoverTip:
-    'Do NOT enable this setting unless you understand what you are doing!',
+  csrfProtectionTip:
+    'Stops other sites making changes through a signed-in browser.',
+  csrfProtectionHoverTip: 'API key requests aren’t affected.',
   trustProxy: 'Enable Proxy Support',
-  trustProxyTip:
-    'Allow Seerr AI to correctly register client IP addresses behind a proxy',
+  trustProxyLocalTip:
+    'Trust a reverse proxy on this machine, your local network or Tailscale for people’s addresses.',
+  trustCloudflare: 'Trust Cloudflare',
+  trustCloudflareTip:
+    'Turn on if Cloudflare’s proxy (orange cloud) is in front of your reverse proxy.',
+  trustedProxies: 'Also Trust These Proxies',
+  trustedProxiesTip:
+    'Other proxies in front of Seerr AI, such as one on a rented server, or a local proxy behind another. The local one connecting to Seerr AI is always trusted.',
+  validationTrustedProxy:
+    '{entry} is not an address or range, such as 203.0.113.5 or 203.0.113.0/24.',
   proxyEnabled: 'HTTP(S) Proxy',
   proxyEnabledTip:
-    'Send ALL outgoing HTTP/HTTPS requests through a proxy server (host/port). Does NOT enable HTTPS, SSL, or certificate configuration.',
+    'Send all outgoing requests through a proxy. This doesn’t set up HTTPS.',
   proxyHostname: 'Proxy Hostname',
   proxyPort: 'Proxy Port',
   proxySsl: 'Use SSL For Proxy',
@@ -44,21 +59,19 @@ const messages = defineMessages('components.Settings.SettingsNetwork', {
   validationDnsCacheMaxTtl: 'You must provide a valid maximum TTL',
   validationProxyPort: 'You must provide a valid port',
   networkDisclaimer:
-    'Network parameters from your container/system should be used instead of these settings. See the {docs} for more information.',
+    'Prefer your container or system’s network settings over these. See the {docs}.',
   docs: 'documentation',
   forceIpv4First: 'Force IPv4 Resolution First',
   forceIpv4FirstTip:
     'Force Seerr AI to resolve IPv4 addresses first instead of IPv6',
   dnsCache: 'DNS Cache',
-  dnsCacheTip:
-    'Enable caching of DNS lookups to optimize performance and avoid making unnecessary API calls',
-  dnsCacheHoverTip:
-    'Do NOT enable this if you are experiencing issues with DNS lookups',
+  dnsCacheTip: 'Cache DNS lookups to save time and calls',
+  dnsCacheHoverTip: 'Leave off if you have DNS lookup problems',
   dnsCacheForceMinTtl: 'DNS Cache Minimum TTL',
   dnsCacheForceMaxTtl: 'DNS Cache Maximum TTL',
   apiRequestTimeout: 'API Request Timeout',
   apiRequestTimeoutTip:
-    'Maximum time (in seconds) to wait for responses from external services like Radarr/Sonarr. Set to 0 for no timeout.',
+    'Seconds to wait for services like Radarr and Sonarr. 0 for no limit.',
   validationApiRequestTimeout: 'You must provide a valid timeout value',
 });
 
@@ -101,6 +114,20 @@ const SettingsNetwork = () => {
           .required(intl.formatMessage(messages.validationProxyPort)),
       otherwise: (schema) => schema.nullable(),
     }),
+    // Checked only while the field is shown, with Enable Proxy Support on.
+    trustedProxies: Yup.string().when('trustProxy', {
+      is: true,
+      then: (schema) =>
+        schema.test(
+          'addresses',
+          ({ value }) =>
+            intl.formatMessage(messages.validationTrustedProxy, {
+              entry: firstNonAddress(value),
+            }),
+          (value) => firstNonAddress(value) === undefined
+        ),
+      otherwise: (schema) => schema.nullable(),
+    }),
     apiRequestTimeout: Yup.number()
       .typeError(intl.formatMessage(messages.validationApiRequestTimeout))
       .required(intl.formatMessage(messages.validationApiRequestTimeout))
@@ -124,7 +151,8 @@ const SettingsNetwork = () => {
           {intl.formatMessage(messages.networksettings)}
         </h3>
         <p className="description">
-          {intl.formatMessage(messages.networksettingsDescription)}
+          {intl.formatMessage(messages.networksettingsDescription)}{' '}
+          {intl.formatMessage(messages.networksettingsLive)}
         </p>
       </div>
       <div className="section">
@@ -136,6 +164,8 @@ const SettingsNetwork = () => {
             dnsCacheForceMinTtl: data?.dnsCache.forceMinTtl,
             dnsCacheForceMaxTtl: data?.dnsCache.forceMaxTtl,
             trustProxy: data?.trustProxy,
+            trustCloudflare: data?.trustCloudflare,
+            trustedProxies: proxyListToText(data?.trustedProxies),
             proxyEnabled: data?.proxy?.enabled,
             proxyHostname: data?.proxy?.hostname,
             proxyPort: data?.proxy?.port,
@@ -151,12 +181,19 @@ const SettingsNetwork = () => {
           }}
           enableReinitialize
           validationSchema={NetworkSettingsSchema}
-          onSubmit={async (values) => {
+          onSubmit={async (values, { setFieldError }) => {
             try {
               await axios.post('/api/v1/settings/network', {
                 csrfProtection: values.csrfProtection,
                 forceIpv4First: values.forceIpv4First,
                 trustProxy: values.trustProxy,
+                // Only while shown: hidden, they stay as saved and can't block saving.
+                ...(values.trustProxy
+                  ? {
+                      trustCloudflare: values.trustCloudflare,
+                      trustedProxies: proxyListFromText(values.trustedProxies),
+                    }
+                  : {}),
                 dnsCache: {
                   enabled: values.dnsCacheEnabled,
                   forceMinTtl: Number(values.dnsCacheForceMinTtl),
@@ -181,7 +218,20 @@ const SettingsNetwork = () => {
                 autoDismiss: true,
                 appearance: 'success',
               });
-            } catch {
+            } catch (e) {
+              // The server names a non-address entry in Also Trust These Proxies.
+              const invalidProxy = isAxiosError(e)
+                ? (e.response?.data as { invalidProxy?: string } | undefined)
+                    ?.invalidProxy
+                : undefined;
+              if (invalidProxy !== undefined) {
+                setFieldError(
+                  'trustedProxies',
+                  intl.formatMessage(messages.validationTrustedProxy, {
+                    entry: invalidProxy,
+                  })
+                );
+              }
               addToast(intl.formatMessage(messages.toastSettingsFailure), {
                 autoDismiss: true,
                 appearance: 'error',
@@ -206,9 +256,8 @@ const SettingsNetwork = () => {
                     <span className="mr-2">
                       {intl.formatMessage(messages.trustProxy)}
                     </span>
-                    <SettingsBadge badgeType="restartRequired" />
                     <span className="label-tip">
-                      {intl.formatMessage(messages.trustProxyTip)}
+                      {intl.formatMessage(messages.trustProxyLocalTip)}
                     </span>
                   </label>
                   <div className="form-input-area">
@@ -222,13 +271,67 @@ const SettingsNetwork = () => {
                     />
                   </div>
                 </div>
+                {values.trustProxy && (
+                  <div className="ml-4 mr-2">
+                    <div className="form-row">
+                      <label
+                        htmlFor="trustCloudflare"
+                        className="checkbox-label"
+                      >
+                        <span className="mr-2">
+                          {intl.formatMessage(messages.trustCloudflare)}
+                        </span>
+                        <span className="label-tip">
+                          {intl.formatMessage(messages.trustCloudflareTip)}
+                        </span>
+                      </label>
+                      <div className="form-input-area">
+                        <Field
+                          type="checkbox"
+                          id="trustCloudflare"
+                          name="trustCloudflare"
+                          onChange={() => {
+                            setFieldValue(
+                              'trustCloudflare',
+                              !values.trustCloudflare
+                            );
+                          }}
+                        />
+                      </div>
+                    </div>
+                    <div className="form-row">
+                      <label htmlFor="trustedProxies" className="text-label">
+                        <span className="mr-2">
+                          {intl.formatMessage(messages.trustedProxies)}
+                        </span>
+                        <span className="label-tip">
+                          {intl.formatMessage(messages.trustedProxiesTip)}
+                        </span>
+                      </label>
+                      <div className="form-input-area">
+                        <div className="form-input-field">
+                          <Field
+                            id="trustedProxies"
+                            name="trustedProxies"
+                            type="text"
+                            placeholder="203.0.113.5, 198.51.100.0/24"
+                          />
+                        </div>
+                        {errors.trustedProxies &&
+                          touched.trustedProxies &&
+                          typeof errors.trustedProxies === 'string' && (
+                            <div className="error">{errors.trustedProxies}</div>
+                          )}
+                      </div>
+                    </div>
+                  </div>
+                )}
                 <div className="form-row">
                   <label htmlFor="csrfProtection" className="checkbox-label">
                     <span className="mr-2">
                       {intl.formatMessage(messages.csrfProtection)}
                     </span>
                     <SettingsBadge badgeType="advanced" className="mr-2" />
-                    <SettingsBadge badgeType="restartRequired" />
                     <span className="label-tip">
                       {intl.formatMessage(messages.csrfProtectionTip)}
                     </span>
@@ -259,7 +362,6 @@ const SettingsNetwork = () => {
                       {intl.formatMessage(messages.forceIpv4First)}
                     </span>
                     <SettingsBadge badgeType="advanced" className="mr-2" />
-                    <SettingsBadge badgeType="restartRequired" />
                     <SettingsBadge badgeType="experimental" />
                     <span className="label-tip">
                       {intl.formatMessage(messages.forceIpv4FirstTip)}
@@ -282,7 +384,6 @@ const SettingsNetwork = () => {
                       {intl.formatMessage(messages.dnsCache)}
                     </span>
                     <SettingsBadge badgeType="advanced" className="mr-2" />
-                    <SettingsBadge badgeType="restartRequired" />
                     <SettingsBadge badgeType="experimental" className="mr-2" />
                     <span className="label-tip">
                       {intl.formatMessage(messages.dnsCacheTip)}
@@ -365,7 +466,6 @@ const SettingsNetwork = () => {
                     <span className="mr-2">
                       {intl.formatMessage(messages.apiRequestTimeout)}
                     </span>
-                    <SettingsBadge badgeType="restartRequired" />
                     <span className="label-tip">
                       {intl.formatMessage(messages.apiRequestTimeoutTip)}
                     </span>
@@ -391,7 +491,6 @@ const SettingsNetwork = () => {
                       {intl.formatMessage(messages.proxyEnabled)}
                     </span>
                     <SettingsBadge badgeType="advanced" className="mr-2" />
-                    <SettingsBadge badgeType="restartRequired" />
                     <span className="label-tip">
                       {intl.formatMessage(messages.proxyEnabledTip)}
                     </span>
@@ -564,7 +663,7 @@ const SettingsNetwork = () => {
                     </div>
                   </>
                 )}
-                <div className="actions">
+                <SaveBar>
                   <div className="flex justify-end">
                     <span className="ml-3 inline-flex rounded-md shadow-sm">
                       <Button
@@ -581,7 +680,7 @@ const SettingsNetwork = () => {
                       </Button>
                     </span>
                   </div>
-                </div>
+                </SaveBar>
               </Form>
             );
           }}

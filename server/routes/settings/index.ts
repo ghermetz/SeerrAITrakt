@@ -1,9 +1,11 @@
-import type { JellyfinLibrary } from '@server/api/jellyfin';
-import JellyfinAPI from '@server/api/jellyfin';
 import PlexAPI from '@server/api/plexapi';
 import PlexTvAPI from '@server/api/plextv';
+import type { PersonalApiKeyAccess } from '@server/constants/apiKeys';
+import { PERSONAL_API_KEY_ACCESS } from '@server/constants/apiKeys';
 import { ApiErrorCode } from '@server/constants/error';
 import { MIN_IMAGE_CACHE_MAX_MB } from '@server/constants/images';
+import { MediaType } from '@server/constants/media';
+import { cleanThemeDefaults } from '@server/constants/theme';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
@@ -14,7 +16,7 @@ import type {
   LogsResultsResponse,
   SettingsAboutResponse,
 } from '@server/interfaces/api/settingsInterfaces';
-import { scheduledJobs } from '@server/job/schedule';
+import { refreshMusicJobs, scheduledJobs } from '@server/job/schedule';
 import animeCheck from '@server/lib/animeCheck';
 import type { AvailableCacheIds } from '@server/lib/cache';
 import cacheManager from '@server/lib/cache';
@@ -26,40 +28,66 @@ import {
   searchableStuckTitles,
 } from '@server/lib/health';
 import ImageProxy, { imageConversionAvailable } from '@server/lib/imageproxy';
-import { linkedJellyfinUsers } from '@server/lib/jellyfinUsers';
+import matchWatch from '@server/lib/matchWatch';
 import { MediaEventType, recordMediaEvent } from '@server/lib/mediaHistory';
+import { applyMediaServerLogin } from '@server/lib/mediaServerAdmin';
+import {
+  MEDIA_ID,
+  MEDIA_SERVER_KINDS,
+  serverName,
+} from '@server/lib/mediaServers';
+import type { MusicImageSource } from '@server/lib/music/imageSources';
+import { MUSIC_IMAGE_ORIGINS } from '@server/lib/music/imageSources';
+import { applyNetworkSettings } from '@server/lib/networkSettings';
 import { Permission } from '@server/lib/permissions';
+import type { FixBy } from '@server/lib/plexFixMatch';
+import {
+  canFix,
+  fixMatch,
+  fixingOn,
+  recentFixes,
+  undoFix,
+} from '@server/lib/plexFixMatch';
+import type { MediaServerName } from '@server/lib/plexMatchCheck';
 import plexMatchCheck from '@server/lib/plexMatchCheck';
-import { jellyfinFullScanner } from '@server/lib/scanners/jellyfin';
 import { plexFullScanner } from '@server/lib/scanners/plex';
 import { searchAllMissing } from '@server/lib/searchMissing';
-import type { JobId, Library, MainSettings } from '@server/lib/settings';
+import { cleanSeasons, seasonSettings } from '@server/lib/seasons';
+import type { JobId, MainSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
+import { requireMusicSettings } from '@server/middleware/music';
 import { perUserRateLimit } from '@server/middleware/perUserRateLimit';
 import discoverSettingRoutes from '@server/routes/settings/discover';
-import { ApiError } from '@server/types/error';
 import { appDataPath } from '@server/utils/appDataVolume';
 import { getAppVersion } from '@server/utils/appVersion';
 import { dnsCache } from '@server/utils/dnsCache';
-import { getHostname } from '@server/utils/getHostname';
-import { normalizeJellyfinGuid } from '@server/utils/jellyfin';
+import { isProxyAddress } from '@server/utils/trustedProxies';
 import type { DnsEntries, DnsStats } from 'dns-caching';
 import { Router } from 'express';
 import fs from 'fs';
 import { escapeRegExp, merge, omit, set, sortBy } from 'lodash';
 import { rescheduleJob } from 'node-schedule';
 import path from 'path';
+import { In } from 'typeorm';
 import { URL } from 'url';
 import { z } from 'zod';
 import aiSettingsRoutes from './ai';
 import backfillSettingsRoutes from './backfill';
 import bazarrSettingsRoutes from './bazarr';
+import serverCssRoutes from './customCss';
 import downloadClientRoutes from './downloadClients';
+import jellyfinSettingsRoutes from './jellyfin';
+import libraryAccessRoutes from './libraryAccess';
+import lidarrRoutes from './lidarr';
 import maintainerrSettingsRoutes from './maintainerr';
+import mediaServerRoutes from './mediaServers';
 import metadataRoutes from './metadata';
+import musicSettingsRoutes from './music';
 import notificationRoutes from './notifications';
+import oidcSettingsRoutes from './oidc';
+import qualityRoutes from './quality';
 import radarrRoutes from './radarr';
 import sonarrRoutes from './sonarr';
 import tautulliSettingsRoutes from './tautulli';
@@ -74,11 +102,20 @@ settingsRoutes.use('/trakt', traktSettingsRoutes);
 settingsRoutes.use('/bazarr', bazarrSettingsRoutes);
 settingsRoutes.use('/tautulli', tautulliSettingsRoutes);
 settingsRoutes.use('/backfill', backfillSettingsRoutes);
+settingsRoutes.use('/quality', qualityRoutes);
 settingsRoutes.use('/download-clients', downloadClientRoutes);
 settingsRoutes.use('/ai', aiSettingsRoutes);
 settingsRoutes.use('/sonarr', sonarrRoutes);
+settingsRoutes.use('/lidarr', lidarrRoutes);
+settingsRoutes.use('/music', musicSettingsRoutes);
 settingsRoutes.use('/discover', discoverSettingRoutes);
 settingsRoutes.use('/metadatas', metadataRoutes);
+settingsRoutes.use('/jellyfin', jellyfinSettingsRoutes('jellyfin'));
+settingsRoutes.use('/emby', jellyfinSettingsRoutes('emby'));
+settingsRoutes.use('/media-servers', mediaServerRoutes);
+settingsRoutes.use('/library-access', libraryAccessRoutes);
+settingsRoutes.use('/oidc', oidcSettingsRoutes);
+settingsRoutes.use('/appearance/css', serverCssRoutes);
 
 const libraryUpdateSchema = z.object({
   enabled: z.boolean(),
@@ -122,8 +159,33 @@ settingsRoutes.post('/main', async (req, res, next) => {
   }
   const limitBefore = ImageProxy.sizeLimit();
 
-  settings.main = merge(settings.main, req.body);
+  const keysAsked = (req.body as { personalApiKeys?: unknown }).personalApiKeys;
+  if (
+    keysAsked !== undefined &&
+    !PERSONAL_API_KEY_ACCESS.includes(keysAsked as PersonalApiKeyAccess)
+  ) {
+    return next({
+      status: 400,
+      message: `Personal API keys must be one of: ${PERSONAL_API_KEY_ACCESS.join(', ')}.`,
+    });
+  }
+  const keysBefore = settings.main.personalApiKeys ?? 'off';
+
+  // The primary media server is changed only under Settings → Media Servers.
+  const update = omit(req.body, 'mediaServerType');
+  settings.main = merge(settings.main, update);
+  // This one sign-in switch applies to each connected server's own.
+  applyMediaServerLogin(update.mediaServerLogin);
   await settings.save();
+
+  if (keysAsked !== undefined && keysAsked !== keysBefore) {
+    logger.info('Who may make personal API keys changed', {
+      label: 'API Key',
+      from: keysBefore,
+      to: keysAsked,
+      changedBy: req.user?.id,
+    });
+  }
 
   // A lower limit takes effect now, not at the next cleanup.
   if (ImageProxy.sizeLimit() < limitBefore) {
@@ -134,8 +196,8 @@ settingsRoutes.post('/main', async (req, res, next) => {
 });
 
 /*
- * The fork's optional features: which are turned off for everyone. Set as a
- * whole list, since /main merges and a merge cannot remove a list entry.
+ * The fork's optional features turned off for everyone. Set as a whole list:
+ * /main merges, and a merge can't remove a list entry.
  */
 settingsRoutes.get('/features', (_req, res) => {
   return res
@@ -153,7 +215,125 @@ settingsRoutes.post('/features', async (req, res, next) => {
   const settings = getSettings();
   settings.main.disabledFeatures = disabled;
   await settings.save();
+  // Music jobs stop while music is off for everyone.
+  refreshMusicJobs();
   return res.status(200).json({ disabled });
+});
+
+/**
+ * iCloud link to the admin-shared "Fix this show" shortcut, offered on every
+ * Siri page. Empty for none.
+ */
+const SHORTCUT_LINK =
+  /^https:\/\/(?:www\.)?icloud\.com\/shortcuts\/[0-9a-f]{32}\/?$/i;
+
+settingsRoutes.get('/siri', (_req, res) => {
+  return res
+    .status(200)
+    .json({ shortcutUrl: getSettings().main.siriShortcutUrl ?? '' });
+});
+
+settingsRoutes.post('/siri', async (req, res, next) => {
+  const asked = (req.body as { shortcutUrl?: unknown }).shortcutUrl;
+  const shortcutUrl = typeof asked === 'string' ? asked.trim() : undefined;
+  if (
+    shortcutUrl === undefined ||
+    (shortcutUrl && !SHORTCUT_LINK.test(shortcutUrl))
+  ) {
+    return next({
+      status: 400,
+      message:
+        'Paste the link iCloud gives when you share the shortcut: https://www.icloud.com/shortcuts/…',
+    });
+  }
+  const settings = getSettings();
+  settings.main.siriShortcutUrl = shortcutUrl;
+  await settings.save();
+  return res.status(200).json({ shortcutUrl });
+});
+
+/*
+ * What counts as anime: countries whose anime counts only when in Japanese
+ * (utils/isAnime). Set as a whole list, like the features.
+ */
+settingsRoutes.get('/anime', (_req, res) => {
+  return res.status(200).json({
+    excludedCountries: getSettings().main.animeExcludedCountries ?? [],
+  });
+});
+
+settingsRoutes.post('/anime', async (req, res, next) => {
+  const asked = (req.body as { excludedCountries?: unknown }).excludedCountries;
+  if (
+    !Array.isArray(asked) ||
+    asked.some((code) => typeof code !== 'string' || !/^[a-z]{2}$/i.test(code))
+  ) {
+    return next({
+      status: 400,
+      message: 'A list of two-letter country codes is required.',
+    });
+  }
+  const excludedCountries = [
+    ...new Set(asked.map((code: string) => code.toUpperCase())),
+  ].sort();
+  const settings = getSettings();
+  settings.main.animeExcludedCountries = excludedCountries;
+  await settings.save();
+  return res.status(200).json({ excludedCountries });
+});
+
+/*
+ * Server default look (Settings → Appearance) for anyone without their own,
+ * and the sign-in page. Users can still choose their own in their profile.
+ */
+settingsRoutes.get('/appearance', (_req, res) => {
+  return res
+    .status(200)
+    .json({ default: getSettings().fullPublicSettings.themeDefault });
+});
+
+settingsRoutes.post('/appearance', async (req, res, next) => {
+  const body = req.body as Record<string, unknown>;
+  const asked = cleanThemeDefaults(body.default);
+  if (!asked || Object.keys(body).some((key) => key !== 'default')) {
+    return next({
+      status: 400,
+      message: 'A mode, accent and dark background are required.',
+    });
+  }
+  const settings = getSettings();
+  settings.appearance.default = asked;
+  await settings.save();
+  return res.status(200).json({ default: asked });
+});
+
+/*
+ * The server's seasonal themes and their dates (Settings → Appearance).
+ * Users can still turn them off for themselves.
+ */
+settingsRoutes.get('/appearance/seasons', (_req, res) => {
+  return res
+    .status(200)
+    .json({ seasons: seasonSettings(getSettings().appearance.seasons) });
+});
+
+settingsRoutes.post('/appearance/seasons', async (req, res, next) => {
+  const body = req.body as Record<string, unknown>;
+  const settings = getSettings();
+  const seasons = cleanSeasons(
+    body.seasons,
+    seasonSettings(settings.appearance.seasons)
+  );
+  if (!seasons || Object.keys(body).some((key) => key !== 'seasons')) {
+    return next({
+      status: 400,
+      message:
+        'Each season needs to be on or off, with a first and last day such as 10-24.',
+    });
+  }
+  settings.appearance.seasons = seasons;
+  await settings.save();
+  return res.status(200).json({ seasons });
 });
 
 settingsRoutes.get('/network', (req, res) => {
@@ -164,9 +344,37 @@ settingsRoutes.get('/network', (req, res) => {
 
 settingsRoutes.post('/network', async (req, res) => {
   const settings = getSettings();
+  const { trustedProxies: asked, ...rest } = req.body as {
+    trustedProxies?: string[];
+  };
 
-  settings.network = merge(settings.network, req.body);
+  // Trust These Proxies: kept as entered, each checked as Express will parse
+  // it at startup, so a typo can't stop startup or silently trust nothing.
+  const trustedProxies = asked
+    ?.map((entry) => entry.trim())
+    .filter((entry) => entry !== '');
+  const invalidProxy = trustedProxies?.find((entry) => !isProxyAddress(entry));
+  if (invalidProxy !== undefined) {
+    return res.status(400).json({
+      message: `"${invalidProxy}" is not an address or range, such as 203.0.113.5 or 203.0.113.0/24.`,
+      invalidProxy,
+    });
+  }
+
+  const previous = structuredClone(settings.network);
+  settings.network = merge(settings.network, rest);
+  // Set, not merged: a merge keeps entries past the end of a shorter list.
+  if (trustedProxies) {
+    settings.network.trustedProxies = trustedProxies;
+  }
   await settings.save();
+  // In effect from the next request; the proxy check runs in the background.
+  applyNetworkSettings(settings.network, previous).catch((e) =>
+    logger.error('Could not apply the network settings', {
+      label: 'Settings',
+      errorMessage: e instanceof Error ? e.message : String(e),
+    })
+  );
 
   return res.status(200).json(settings.network);
 });
@@ -198,7 +406,9 @@ settingsRoutes.post('/plex', async (req, res, next) => {
       where: { id: 1 },
     });
 
-    Object.assign(settings.plex, req.body);
+    // `connected` and `signIn` are changed only under Settings → Media
+    // Servers.
+    Object.assign(settings.plex, omit(req.body, 'connected', 'signIn'));
 
     const plexClient = new PlexAPI({ plexToken: admin.plexToken });
 
@@ -208,7 +418,14 @@ settingsRoutes.post('/plex', async (req, res, next) => {
       throw new Error('Server not found');
     }
 
-    settings.plex.machineId = result.MediaContainer.machineIdentifier;
+    // Plex numbers every server's libraries 1, 2, 3…, so another server's
+    // toggles and last scans would land on this one's libraries.
+    const machineId = result.MediaContainer.machineIdentifier;
+    if (settings.plex.machineId && settings.plex.machineId !== machineId) {
+      settings.plex.libraries = [];
+      settings.plex.musicLibraries = [];
+    }
+    settings.plex.machineId = machineId;
     settings.plex.name = result.MediaContainer.friendlyName;
 
     await settings.save();
@@ -254,7 +471,7 @@ settingsRoutes.get('/plex/devices/servers', async (req, res, next) => {
               plexDirectConnection.address = url.hostname;
               plexDirectConnections.push(plexDirectConnection);
 
-              // Connect to IP addresses over HTTP
+              // The IP connection uses HTTP; the plex.direct copy keeps HTTPS.
               connection.protocol = 'http';
             }
           });
@@ -332,6 +549,33 @@ settingsRoutes.put('/plex/library/:libraryId', async (req, res, next) => {
   return res.status(200).json(library);
 });
 
+// Plex music libraries found by the sync below; only while music is on for
+// everyone.
+settingsRoutes.get('/plex/music-library', requireMusicSettings, (_req, res) => {
+  return res.status(200).json(getSettings().plex.musicLibraries ?? []);
+});
+
+settingsRoutes.put(
+  '/plex/music-library/:libraryId',
+  requireMusicSettings,
+  async (req, res, next) => {
+    const settings = getSettings();
+    const bodyResult = libraryUpdateSchema.safeParse(req.body);
+    if (!bodyResult.success) {
+      return next({ status: 400, message: 'Invalid request body.' });
+    }
+    const library = (settings.plex.musicLibraries ?? []).find(
+      (l) => l.id === req.params.libraryId
+    );
+    if (!library) {
+      return next({ status: 404, message: 'Library does not exist.' });
+    }
+    library.enabled = bodyResult.data.enabled;
+    await settings.save();
+    return res.status(200).json(library);
+  }
+);
+
 settingsRoutes.post('/plex/library/sync', async (_req, res, next) => {
   const settings = getSettings();
 
@@ -367,207 +611,6 @@ settingsRoutes.post('/plex/sync', (req, res) => {
   return res.status(200).json(plexFullScanner.status());
 });
 
-settingsRoutes.get('/jellyfin', (_req, res) => {
-  const settings = getSettings();
-
-  res.status(200).json(settings.jellyfin);
-});
-
-settingsRoutes.post('/jellyfin', async (req, res, next) => {
-  const userRepository = getRepository(User);
-  const settings = getSettings();
-
-  try {
-    const admin = await userRepository.findOneOrFail({
-      where: { id: 1 },
-      select: ['id', 'jellyfinUserId', 'jellyfinDeviceId'],
-      order: { id: 'ASC' },
-    });
-
-    const tempJellyfinSettings = { ...settings.jellyfin, ...req.body };
-
-    const jellyfinClient = new JellyfinAPI(
-      getHostname(tempJellyfinSettings),
-      tempJellyfinSettings.apiKey,
-      admin.jellyfinDeviceId ?? ''
-    );
-
-    const result = await jellyfinClient.getSystemInfo();
-
-    if (!result?.Id) {
-      throw new ApiError(result?.status, ApiErrorCode.InvalidUrl);
-    }
-
-    Object.assign(settings.jellyfin, req.body);
-    settings.jellyfin.serverId = result.Id;
-    settings.jellyfin.name = result.ServerName;
-    await settings.save();
-  } catch (e) {
-    if (e instanceof ApiError) {
-      logger.error('Something went wrong testing Jellyfin connection', {
-        label: 'API',
-        status: e.statusCode,
-        errorMessage: ApiErrorCode.InvalidUrl,
-      });
-
-      return next({
-        status: e.statusCode,
-        message: ApiErrorCode.InvalidUrl,
-      });
-    } else {
-      logger.error('Something went wrong', {
-        label: 'API',
-        errorMessage: e.message,
-      });
-
-      return next({
-        status: e.statusCode ?? 500,
-        message: ApiErrorCode.Unknown,
-      });
-    }
-  }
-
-  return res.status(200).json(settings.jellyfin);
-});
-
-settingsRoutes.get('/jellyfin/library', (_req, res) => {
-  const settings = getSettings();
-
-  return res.status(200).json(settings.jellyfin.libraries);
-});
-
-settingsRoutes.put('/jellyfin/library/:libraryId', async (req, res, next) => {
-  const settings = getSettings();
-
-  const bodyResult = libraryUpdateSchema.safeParse(req.body);
-
-  if (!bodyResult.success) {
-    return next({ status: 400, message: 'Invalid request body.' });
-  }
-
-  const library = settings.jellyfin.libraries.find(
-    (l) => l.id === req.params.libraryId
-  );
-
-  if (!library) {
-    return next({ status: 404, message: 'Library does not exist.' });
-  }
-
-  library.enabled = bodyResult.data.enabled;
-  await settings.save();
-
-  return res.status(200).json(library);
-});
-
-settingsRoutes.post('/jellyfin/library/sync', async (_req, res, next) => {
-  const settings = getSettings();
-
-  const userRepository = getRepository(User);
-  const admin = await userRepository.findOneOrFail({
-    select: ['id', 'jellyfinDeviceId', 'jellyfinUserId'],
-    where: { id: 1 },
-    order: { id: 'ASC' },
-  });
-  const jellyfinClient = new JellyfinAPI(
-    getHostname(),
-    settings.jellyfin.apiKey,
-    admin.jellyfinDeviceId ?? ''
-  );
-
-  jellyfinClient.setUserId(admin.jellyfinUserId ?? '');
-
-  let libraries: JellyfinLibrary[];
-
-  try {
-    libraries = await jellyfinClient.getLibraries();
-
-    if (libraries.length === 0) {
-      // Check if no libraries are found due to the fallback to user views
-      // This only affects LDAP users
-      const account = await jellyfinClient.getUser();
-
-      // Automatic Library grouping is not supported when user views are used to get library
-      if (account.Configuration.GroupedFolders?.length > 0) {
-        return next({
-          status: 501,
-          message: ApiErrorCode.SyncErrorGroupedFolders,
-        });
-      }
-
-      return next({ status: 404, message: ApiErrorCode.SyncErrorNoLibraries });
-    }
-  } catch (e) {
-    return next({
-      status: e.statusCode ?? 500,
-      message: e.errorCode ?? ApiErrorCode.Unknown,
-    });
-  }
-
-  const newLibraries: Library[] = libraries.map((library) => {
-    const existing = settings.jellyfin.libraries.find(
-      (l) => l.id === library.key
-    );
-
-    return {
-      id: library.key,
-      name: library.title,
-      enabled: existing?.enabled ?? false,
-      type: library.type,
-      lastScan: existing?.lastScan,
-    };
-  });
-
-  settings.jellyfin.libraries = newLibraries;
-  await settings.save();
-
-  return res.status(200).json(settings.jellyfin.libraries);
-});
-
-settingsRoutes.get('/jellyfin/users', async (req, res) => {
-  const settings = getSettings();
-
-  const userRepository = getRepository(User);
-  const admin = await userRepository.findOneOrFail({
-    select: ['id', 'jellyfinDeviceId', 'jellyfinUserId'],
-    where: { id: 1 },
-    order: { id: 'ASC' },
-  });
-  const jellyfinClient = new JellyfinAPI(
-    getHostname(),
-    settings.jellyfin.apiKey,
-    admin.jellyfinDeviceId ?? ''
-  );
-
-  jellyfinClient.setUserId(admin.jellyfinUserId ?? '');
-  const resp = await jellyfinClient.getUsers();
-
-  // People already imported are left out, as on Import Plex Users: they
-  // are refreshed on every import instead.
-  const linked = await linkedJellyfinUsers(resp.users.map((user) => user.Id));
-  const users = resp.users
-    .filter((user) => !linked.has(normalizeJellyfinGuid(user.Id) ?? ''))
-    .map((user) => ({
-      username: user.Name,
-      id: user.Id,
-      thumb: `/avatarproxy/${user.Id}`,
-      email: user.Name,
-    }));
-
-  return res.status(200).json(sortBy(users, 'username'));
-});
-
-settingsRoutes.get('/jellyfin/sync', (_req, res) => {
-  return res.status(200).json(jellyfinFullScanner.status());
-});
-
-settingsRoutes.post('/jellyfin/sync', (req, res) => {
-  if (req.body.cancel) {
-    jellyfinFullScanner.cancel();
-  } else if (req.body.start) {
-    jellyfinFullScanner.run();
-  }
-  return res.status(200).json(jellyfinFullScanner.status());
-});
 settingsRoutes.get('/health', async (_req, res, next) => {
   try {
     return res.status(200).json(await runHealthChecks());
@@ -576,7 +619,7 @@ settingsRoutes.get('/health', async (_req, res, next) => {
   }
 });
 
-/** What Seerr's own container is using, with the last day behind it. */
+/** Seerr's container resource usage, with the last day's history. */
 settingsRoutes.get('/health/resources', async (_req, res, next) => {
   try {
     return res.status(200).json(await resourceMonitor.history());
@@ -585,7 +628,7 @@ settingsRoutes.get('/health/resources', async (_req, res, next) => {
   }
 });
 
-/** One page of one check's list, for paging through it on the health page. */
+/** One page of one health check's list. */
 settingsRoutes.get<{ id: string }>(
   '/health/checks/:id',
   async (req, res, next) => {
@@ -605,9 +648,93 @@ settingsRoutes.get<{ id: string }>(
 );
 
 /**
- * Searches Radarr and Sonarr for everything the health page lists as
- * stuck and searchable. Films go to each Radarr in one command; a series
- * whose whole aired season is missing gets a season search.
+ * Fixes one wrong Plex match listed on the Health page, by key: looks it up
+ * in Plex by the Radarr or Sonarr id, matches it, and reads it back.
+ */
+settingsRoutes.post<never, unknown, { key?: unknown }>(
+  '/health/fix-match',
+  async (req, res, next) => {
+    if (!fixingOn()) {
+      return next({
+        status: 403,
+        message: 'Fixing matches is turned off (Health → Match Check).',
+      });
+    }
+    const key = typeof req.body?.key === 'string' ? req.body.key : '';
+    const problem = key ? await matchWatch.findProblem(key) : undefined;
+    if (!problem) {
+      return next({ status: 404, message: 'That match is not listed now.' });
+    }
+    if (!canFix(problem)) {
+      return next({ status: 400, message: 'Seerr AI can’t fix this one.' });
+    }
+    try {
+      const outcome = await fixMatch(problem, req.user?.id ?? 'auto');
+      if (outcome.state === 'fixed' || outcome.state === 'right') {
+        await matchWatch.markFixed(problem);
+      }
+      return res.status(200).json(outcome);
+    } catch (e) {
+      logger.warn('Could not fix a match in Plex', {
+        label: 'Match Check',
+        errorMessage: e instanceof Error ? e.message : String(e),
+      });
+      return next({
+        status: 502,
+        message: `Plex didn’t take it: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    }
+  }
+);
+
+/** Recent match fixes, manual or automatic, newest first. */
+settingsRoutes.get('/health/match-fixes', async (_req, res) => {
+  const fixes = await recentFixes();
+  const ids = [
+    ...new Set(
+      fixes.flatMap((f) =>
+        [f.by, f.undoneBy].filter((by): by is number => typeof by === 'number')
+      )
+    ),
+  ];
+  const users = ids.length
+    ? await getRepository(User).find({ where: { id: In(ids) } })
+    : [];
+  const name = (by?: FixBy) =>
+    by === undefined
+      ? undefined
+      : by === 'auto'
+        ? null
+        : (users.find((u) => u.id === by)?.displayName ?? null);
+  return res.status(200).json({
+    fixes: fixes.map((f) => ({
+      ...f,
+      byName: name(f.by),
+      undoneByName: name(f.undoneBy),
+    })),
+  });
+});
+
+/** Reverts a fix to Plex's previous match. */
+settingsRoutes.post<{ id: string }>(
+  '/health/match-fixes/:id/undo',
+  async (req, res, next) => {
+    try {
+      const fix = await undoFix(req.params.id, req.user?.id ?? 'auto');
+      return res.status(200).json(fix);
+    } catch (e) {
+      return next({
+        status: 400,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+);
+
+/**
+ * Searches Radarr and Sonarr for everything the health page lists as stuck
+ * and searchable. Films go to each Radarr in one command; a series missing a
+ * whole aired season gets a season search.
  */
 settingsRoutes.post('/health/search-all-missing', async (req, res, next) => {
   try {
@@ -643,8 +770,8 @@ settingsRoutes.post('/health/search-all-missing', async (req, res, next) => {
 });
 
 /**
- * Removes requests no longer linked to a title — listed on the health page.
- * They cannot be sent, shown or fulfilled. Only rows with no title are
+ * Deletes requests no longer linked to a title (listed on the health page);
+ * they can't be sent, shown or fulfilled. Only rows with no title are
  * touched; their seasons, episode picks and watchers go with them.
  */
 settingsRoutes.delete('/health/unlinked-requests', async (req, res, next) => {
@@ -825,7 +952,7 @@ settingsRoutes.get(
 
           if (req.query.search) {
             if (
-              // label and data are sometimes undefined
+              // label and data can be undefined
               !searchRegexp.test(logMessage.label ?? '') &&
               !searchRegexp.test(logMessage.message) &&
               !deepValueStrings(logMessage.data ?? {}).some((val) =>
@@ -863,12 +990,12 @@ settingsRoutes.get(
   }
 );
 
-/** The last Match Check: folders the media server matched to another title. */
+/** Last Match Check: folders the media server matched to another title. */
 settingsRoutes.get('/plex-match-check', async (_req, res) => {
   return res.status(200).json(await plexMatchCheck.lastReport());
 });
 
-/** What the last Match Check found for one title, if anything. */
+/** Last Match Check findings for one title, if any. */
 settingsRoutes.get<
   never,
   unknown,
@@ -880,18 +1007,56 @@ settingsRoutes.get<
     key?: string;
   }
 >('/plex-match-check/title', async (req, res) => {
-  const problem = await plexMatchCheck.problemFor(
+  const tmdbId = req.query.tmdbId ? Number(req.query.tmdbId) : undefined;
+  // Every server's id for the title, so a wrong match is found whichever
+  // server's id the page passed.
+  const media = tmdbId
+    ? await getRepository(Media).findOne({
+        where: {
+          tmdbId,
+          mediaType:
+            req.query.mediaType === 'tv' ? MediaType.TV : MediaType.MOVIE,
+        },
+      })
+    : null;
+  const keys = media
+    ? MEDIA_SERVER_KINDS.flatMap((kind) =>
+        MEDIA_ID[kind].flatMap((column) => {
+          const key = media[column];
+          return key
+            ? [{ mediaServer: serverName(kind) as MediaServerName, key }]
+            : [];
+        })
+      )
+    : [];
+  // The passed key doesn't say which server it is from, so it is used (as a
+  // Plex rating key) only when Seerr doesn't have the title.
+  const problems = await plexMatchCheck.problemFor(
     req.query.mediaType === 'tv' ? 'series' : 'movie',
     {
-      tmdbId: req.query.tmdbId ? Number(req.query.tmdbId) : undefined,
+      tmdbId,
       tvdbId: req.query.tvdbId ? Number(req.query.tvdbId) : undefined,
-      key: req.query.key,
+      key: media ? undefined : req.query.key,
+      keys,
     }
   );
-  return res.status(200).json({ problem: problem ?? null });
+  // Newer findings from the new-request check replace older ones: one
+  // problem per server, newest first.
+  if (media) {
+    const recent = await matchWatch.openProblems(media.id);
+    const servers = new Set(recent.map((p) => p.mediaServer ?? 'Plex'));
+    problems.splice(
+      0,
+      problems.length,
+      ...recent,
+      ...problems.filter((p) => !servers.has(p.mediaServer ?? 'Plex'))
+    );
+  }
+  // `problem` is the first, for pages that show only one.
+  return res.status(200).json({ problem: problems[0] ?? null, problems });
 });
 
-/** The last Anime Check: series and movies that disagree with Seerr. */
+/** Last Anime Check report: series and movies that disagree with Seerr. */
 settingsRoutes.get('/anime-check', async (_req, res) => {
   return res.status(200).json(await animeCheck.lastReport());
 });
@@ -1001,14 +1166,26 @@ settingsRoutes.get('/cache', async (_req, res) => {
     stats: cache.getStats(),
   }));
 
-  const [tmdbImageCache, tvdbImageCache, avatarImageCache, total, conversion] =
-    await Promise.all([
-      ImageProxy.getImageStats('tmdb'),
-      ImageProxy.getImageStats('tvdb'),
-      ImageProxy.getImageStats('avatar'),
-      ImageProxy.getTotalSize(),
-      imageConversionAvailable(),
-    ]);
+  const [
+    tmdbImageCache,
+    tvdbImageCache,
+    avatarImageCache,
+    musicImageCaches,
+    total,
+    conversion,
+  ] = await Promise.all([
+    ImageProxy.getImageStats('tmdb'),
+    ImageProxy.getImageStats('tvdb'),
+    ImageProxy.getImageStats('avatar'),
+    // Music covers and artist images from their three hosts, combined.
+    Promise.all(
+      (Object.keys(MUSIC_IMAGE_ORIGINS) as MusicImageSource[]).map((source) =>
+        ImageProxy.getImageStats(source)
+      )
+    ),
+    ImageProxy.getTotalSize(),
+    imageConversionAvailable(),
+  ]);
 
   const stats: DnsStats | undefined = dnsCache?.getStats();
   const entries: DnsEntries | undefined = dnsCache?.getCacheEntries();
@@ -1019,6 +1196,13 @@ settingsRoutes.get('/cache', async (_req, res) => {
       tmdb: tmdbImageCache,
       tvdb: tvdbImageCache,
       avatar: avatarImageCache,
+      music: musicImageCaches.reduce(
+        (sum, cache) => ({
+          size: sum.size + cache.size,
+          imageCount: sum.imageCount + cache.imageCount,
+        }),
+        { size: 0, imageCount: 0 }
+      ),
     },
     imageCacheTotal: {
       size: total,
