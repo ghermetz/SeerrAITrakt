@@ -20,7 +20,7 @@ Référence actuelle : **SeerrAI 2.4.2** (amont `ai-v2.4.2`, commit `2495460`).
 | Reverse proxy | Zoraxy → `jellyseer.lelinuxien.fr` (port 5055) |
 | IA | **100 % locale** : provider `openai` → `http://llama-gen:8080/v1` (llama.cpp), modèle `qwen3-4b` — config dans `settings.json`, aucune variable d'environnement |
 | Orchestration | Stack **Komodo** `seerr` — auto-update sur le registre local |
-| CI/CD | **Build Komodo** depuis ce dépôt git + procédure planifiée de synchro amont |
+| CI/CD | **Procédure Komodo planifiée** `seerr-sync-upstream` : synchro git amont → Build depuis ce dépôt → push registre → redéploiement si changement |
 
 ## Améliorations apportées (patch Trakt)
 
@@ -60,25 +60,41 @@ liés à la version amont. Le `Containerfile` **échoue lui-même** si l'amont a
 
 ## Pipeline de mise à jour (Komodo, depuis le git)
 
-C'est le mode nominal : **le dépôt git est la source de vérité**.
+C'est le mode nominal : **le dépôt git est la source de vérité**. Procédure Komodo
+`seerr-sync-upstream` (planifiée quotidiennement à 05:00, `failure_alert` activé) :
 
-1. **Procédure Komodo planifiée** (`seerr-sync-upstream`) :
-   - Action `seerr-sync-fork` : sur le serveur, `git fetch upstream` du dépôt local
-     `/home/ghermetz/SeerrAITrakt`, synchro de `main` avec `upstream/main` si nouvelle
-     release, mise à jour des `.orig.js` **uniquement si les fichiers IA n'ont pas dérivé**,
-     push vers `origin` (token GitHub en variable Komodo)
-   - puis **Build Komodo** `seerr-ai-trakt` : clone ce dépôt, construit l'image
-     (l'anti-dérive du Containerfile double la vérification de l'Action) et pousse sur le
-     registre local
-2. La stack `seerr` (auto-update sur le registre) **redéploie automatiquement**
-   au nouveau digest.
+1. **Action `seerr-sync-fork`** (script TS Komodo, terminal serveur) :
+   `git fetch upstream` sur `/home/ghermetz/SeerrAITrakt` (en `sudo -u ghermetz`),
+   `merge-base --is-ancestor upstream/main main` → si l'amont a avancé :
+   `git merge upstream/main --no-edit` + `git push origin main`
+   (credentials : store git de `ghermetz`, `~/.git-credentials`, 600).
+2. **Build Komodo `seerr-ai-trakt`** (builder `Local`) : clone ce dépôt GitHub,
+   construit `patch-trakt/Containerfile` — l'**anti-dérive** (`cmp` des `.orig.js`
+   contre le dist amont) fait **échouer le build** si upstream a modifié les fichiers IA —
+   puis charge l'image en local (`--load`, tags `latest` + version + commit).
+3. **Action `seerr-push-registry`** : `podman tag` + `podman push` vers
+   `192.168.1.35:5555/seerr-ai-trakt:latest`. Le push passe par **podman** (CA du
+   registre approuvée dans `/etc/containers/certs.d/192.168.1.35:5555/`) — le builder
+   buildx ne peut pas pousser lui-même (conteneur buildkit sans cette CA, push TLS en
+   échec `x509`).
+4. **`DeployStackIfChanged`** sur la stack `seerr` : redéploie si le digest du registre
+   diffère de ce qui tourne ; sinon le poll horaire Komodo (`auto_update`) s'en charge.
 
-**Réadapter le patch** quand l'anti-dérive échoue :
+### Notes d'infrastructure (pour mémoire)
+- Periphery (`periphery.service`) a besoin de `Environment=HOME=/root` : sans `$HOME`,
+  le CLI docker ne lit pas `~/.docker/buildx` et construit avec un builder transient
+  (c'est de toute façon le comportement observé : `docker build` = buildx → driver
+  `docker-container` → conteneur `buildx_buildkit_default` obligatoire, le socket
+  podman n'expose pas l'API buildkit).
+- Le séquencement de la procédure est fiable : chaque stage attend la fin de son
+  exécution (build ~3 s plein cache, push ~1 s blobs identiques).
+
+**Réadapter le patch** quand l'anti-dérive échoue (build Komodo en échec + alerte) :
 1. Extraire les nouveaux fichiers de l'image amont :
    `podman run --rm --entrypoint cat ghcr.io/corruptmods/seerr-ai:latest /app/dist/lib/ai/context.js > context.orig.js` (idem `features`)
 2. Reporter les blocs `[patch trakt]` (diff `context.orig.js` ↔ `context.js` du commit
    précédent) sur les nouveaux fichiers, `node --check` pour valider
-3. Commit + push → la procédure Komodo fait le reste
+3. Commit + push → relancer la procédure `seerr-sync-upstream`
 
 ## Pipeline de secours (rebuild.sh côté serveur)
 
