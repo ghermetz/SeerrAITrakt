@@ -6,6 +6,7 @@
 # Le contrôle anti-dérive ci-dessous échoue si l'image amont a changé ces fichiers : le patch
 # doit alors être réadapté avant de produire une image (diff context.orig.js context.js...).
 FROM ghcr.io/corruptmods/seerr-ai:latest
+LABEL org.opencontainers.image.description="SeerrAI Trakt patch — pipeline Komodo git"
 COPY context.orig.js features.orig.js /tmp/
 # Anti-dérive : les fichiers IA de l'image amont doivent être identiques aux références.
 RUN cmp -s /tmp/context.orig.js /app/dist/lib/ai/context.js \
