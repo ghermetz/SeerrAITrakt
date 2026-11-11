@@ -62,9 +62,11 @@ What Seerr AI adds:
 - **Request Failed**: one of your own requests failed. Admins choose this apart from **Request Processing Failed**, which is about everyone else's.
 - **Playlist Updates**: songs from a playlist you imported couldn't be got, or the playlist can no longer be read from its service.
 - **Leaving Soon**: something you requested is about to be deleted by Maintainerr, with how many days are left. You're told once for each date; a title kept and set to go later is told again.
+- **Followed Series**: a series you follow with **Get New Seasons** had a new season announced (and requested for you), started a season, or ended, after which you no longer follow it. On wherever you had **Request Available**.
 - **Web Push** has every kind. Until you choose, it sends what it always has: availability, failures and what's only yours. Approvals, declines and issues are yours to turn on.
 - On **Discord**, kinds the admin turned off for everyone are shown greyed, so you can see what's missing.
 - **Declined with a reason**: the reason is in the notification.
+- **Approve and Decline from the notification**: on web push, on ntfy and Telegram when an admin turns the buttons on ([ntfy](../using-seerr/notifications/ntfy.md#approve-and-decline-buttons-optional), [Telegram](../using-seerr/notifications/telegram.md#approve-and-decline-buttons-optional)), and in Discord when an admin sets up the [Discord Bot](../using-seerr/notifications/discord-bot.md). For Discord, add your Discord user ID under **Discord** here; the page says when it lets you approve.
 - Admins also get **Backfill**, **Health** and **Wrong Match**.
 
 Admins set up the services themselves in Settings → Notifications; see [Notifications](../using-seerr/notifications/).
@@ -90,3 +92,7 @@ Once an admin has set up Trakt, anyone allowed to auto-request can enter their T
 If Plex stops accepting your sign-in, your Plex watchlist stops syncing. You get a notification and a banner; signing out and back in with Plex fixes it.
 
 Admins can give everyone the Plex server is shared with an account automatically (**Settings → Users → Auto-Import Plex Users**, hourly). Someone an admin deletes isn't imported again.
+
+**Settings → Users → Remove Users Who Lose Access** (off to start) works the other way: every hour it deletes the account, with its requests, of anyone no longer shared on the Plex server or deleted from Jellyfin or Emby. Someone has to be missing on two checks in a row, so it takes about an hour; if a server can't be read, or every one of its users looks gone at once, nobody is removed. The owner and admins are never removed, and someone removed this way is imported again if the Plex server is shared with them again.
+
+When an admin deletes a user (**Users → Delete**), the dialog can also take them off their media server: **Also remove them as a friend on Plex** ends the Plex friendship, which stops sharing all of the owner's Plex servers with them, and **Also disable their Jellyfin account** (or Emby) disables the account there, keeping it and its watch history. This is done first; if the server refuses, the user isn't deleted. Plex Home members and Jellyfin or Emby administrators are left alone, with a message saying so. Only admins see this option.

@@ -46,9 +46,20 @@ const messages = defineMessages('components.Settings.SettingsUsers', {
   autoImportPlexUsers: 'Auto-Import Plex Users',
   autoImportPlexUsersTip:
     'Hourly, give everyone you share your Plex server with an account, with the default permissions below',
+  removeUsersWithoutAccess: 'Remove Users Who Lose Access',
+  removeUsersWithoutAccessTip:
+    'Hourly, delete the account and requests of anyone no longer shared on your Plex server or deleted from Jellyfin or Emby. They must be missing on two checks in a row; admins are never removed.',
   movieRequestLimitLabel: 'Global Movie Request Limit',
   tvRequestLimitLabel: 'Global Series Request Limit',
   musicRequestLimitLabel: 'Global Album Request Limit',
+  removedTitleRequests: 'Requests for Removed Titles',
+  removedTitleRequestsTip:
+    'For titles removed from the library before. Admins and request managers aren’t affected.',
+  'removedTitleRequests-off': 'Allowed as usual',
+  'removedTitleRequests-approve': 'Wait for an admin',
+  'removedTitleRequests-refuse': 'Refused',
+  removedTitleTimes: 'After Being Removed',
+  removedTitleTimesValue: '{count, plural, one {Once} other {# times}}',
   overQuotaRequests: 'Send Requests Over the Limit to Admins',
   overQuotaRequestsTip:
     'Someone over their limit can still request. It waits for an admin, is never approved automatically and is marked as over the limit',
@@ -174,6 +185,7 @@ const SettingsUsers = () => {
             mediaServerLogin: data?.mediaServerLogin,
             newPlexLogin: data?.newPlexLogin,
             autoImportPlexUsers: data?.autoImportPlexUsers ?? false,
+            removeUsersWithoutAccess: data?.removeUsersWithoutAccess ?? false,
             personalApiKeys: data?.personalApiKeys ?? 'off',
             movieQuotaLimit: data?.defaultQuotas.movie.quotaLimit ?? 0,
             movieQuotaDays: data?.defaultQuotas.movie.quotaDays ?? 7,
@@ -182,6 +194,8 @@ const SettingsUsers = () => {
             musicQuotaLimit: data?.defaultQuotas.music?.quotaLimit ?? 0,
             musicQuotaDays: data?.defaultQuotas.music?.quotaDays ?? 7,
             overQuotaRequests: data?.overQuotaRequests ?? false,
+            removedTitleRequests: data?.removedTitleRequests ?? 'off',
+            removedTitleTimes: data?.removedTitleTimes ?? 1,
             defaultPermissions: data?.defaultPermissions ?? 0,
             defaultWatchlistSyncMovies:
               data?.defaultWatchlistSyncMovies ?? false,
@@ -196,6 +210,7 @@ const SettingsUsers = () => {
                 mediaServerLogin: values.mediaServerLogin,
                 newPlexLogin: values.newPlexLogin,
                 autoImportPlexUsers: values.autoImportPlexUsers,
+                removeUsersWithoutAccess: values.removeUsersWithoutAccess,
                 personalApiKeys: values.personalApiKeys,
                 defaultQuotas: {
                   movie: {
@@ -212,6 +227,8 @@ const SettingsUsers = () => {
                   },
                 },
                 overQuotaRequests: values.overQuotaRequests,
+                removedTitleRequests: values.removedTitleRequests,
+                removedTitleTimes: Number(values.removedTitleTimes),
                 defaultPermissions: values.defaultPermissions,
                 defaultWatchlistSyncMovies: values.defaultWatchlistSyncMovies,
                 defaultWatchlistSyncTv: values.defaultWatchlistSyncTv,
@@ -363,6 +380,30 @@ const SettingsUsers = () => {
                   </div>
                 )}
                 <div className="form-row">
+                  <label
+                    htmlFor="removeUsersWithoutAccess"
+                    className="checkbox-label"
+                  >
+                    {intl.formatMessage(messages.removeUsersWithoutAccess)}
+                    <span className="label-tip">
+                      {intl.formatMessage(messages.removeUsersWithoutAccessTip)}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    <Field
+                      type="checkbox"
+                      id="removeUsersWithoutAccess"
+                      name="removeUsersWithoutAccess"
+                      onChange={() => {
+                        setFieldValue(
+                          'removeUsersWithoutAccess',
+                          !values.removeUsersWithoutAccess
+                        );
+                      }}
+                    />
+                  </div>
+                </div>
+                <div className="form-row">
                   <label htmlFor="personalApiKeys" className="checkbox-label">
                     {intl.formatMessage(messages.personalApiKeys)}
                     <span className="label-tip">
@@ -479,6 +520,56 @@ const SettingsUsers = () => {
                     />
                   </div>
                 </div>
+                <div className="form-row">
+                  <label htmlFor="removedTitleRequests" className="text-label">
+                    {intl.formatMessage(messages.removedTitleRequests)}
+                    <span className="label-tip">
+                      {intl.formatMessage(messages.removedTitleRequestsTip)}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    <div className="form-input-field">
+                      <Field
+                        as="select"
+                        id="removedTitleRequests"
+                        name="removedTitleRequests"
+                      >
+                        {(['off', 'approve', 'refuse'] as const).map((rule) => (
+                          <option key={rule} value={rule}>
+                            {intl.formatMessage(
+                              messages[`removedTitleRequests-${rule}`]
+                            )}
+                          </option>
+                        ))}
+                      </Field>
+                    </div>
+                  </div>
+                </div>
+                {values.removedTitleRequests !== 'off' && (
+                  <div className="form-row">
+                    <label htmlFor="removedTitleTimes" className="text-label">
+                      {intl.formatMessage(messages.removedTitleTimes)}
+                    </label>
+                    <div className="form-input-area">
+                      <div className="form-input-field">
+                        <Field
+                          as="select"
+                          id="removedTitleTimes"
+                          name="removedTitleTimes"
+                        >
+                          {[1, 2, 3, 4, 5].map((count) => (
+                            <option key={count} value={count}>
+                              {intl.formatMessage(
+                                messages.removedTitleTimesValue,
+                                { count }
+                              )}
+                            </option>
+                          ))}
+                        </Field>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 <div
                   role="group"
                   aria-labelledby="watchlist-sync-label"

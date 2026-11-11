@@ -3,6 +3,7 @@ import type { AiFeature } from '@server/constants/features';
 import { DEFAULT_IMAGE_CACHE_MAX_MB } from '@server/constants/images';
 import type { OidcClaimRule } from '@server/constants/oidc';
 import { oidcApplicationUrl, requiredClaimsFrom } from '@server/constants/oidc';
+import type { PushoverPriority } from '@server/constants/pushover';
 import type { ProfileFolder } from '@server/constants/requestDefaults';
 import type { MediaServerKind } from '@server/constants/server';
 import {
@@ -22,6 +23,7 @@ import {
   ADJUSTMENT_DEFAULTS,
   QUALITY_DEFAULTS,
 } from '@server/lib/quality/types';
+import type { RemovedTitleRequests } from '@server/lib/removedTitles';
 import type { SeasonCalendar, SeasonsSettings } from '@server/lib/seasons';
 import { seasonCalendar, seasonSettings } from '@server/lib/seasons';
 import {
@@ -196,8 +198,16 @@ export interface DownloadClientSettings {
  */
 export type DownloadCheckMode = 'off' | 'report' | 'on';
 
+/**
+ * Where Backfill searches: Prowlarr under every name a title goes by, the
+ * title's own Sonarr, Radarr or Lidarr by its ids, or both.
+ */
+export type BackfillSearchWith = 'prowlarr' | 'arrs' | 'both';
+
 export interface BackfillSettings {
   enabled: boolean;
+  /** Where to search; installs from before it get one by migration 0019. */
+  searchWith: BackfillSearchWith;
   prowlarr: {
     hostname: string;
     port: number;
@@ -311,6 +321,8 @@ export interface BackfillSettings {
 
 export const BACKFILL_DEFAULTS: BackfillSettings = {
   enabled: false,
+  // A new install has no Prowlarr yet.
+  searchWith: 'arrs',
   prowlarr: {
     hostname: '',
     port: 9696,
@@ -718,6 +730,18 @@ export interface MainSettings {
   animeExcludedCountries: string[];
   /** Create accounts for everyone the owner shares the Plex server with. */
   autoImportPlexUsers: boolean;
+  /**
+   * Delete the accounts of people the media server no longer has (no longer
+   * shared on Plex, deleted from Jellyfin or Emby), hourly.
+   */
+  removeUsersWithoutAccess: boolean;
+  /**
+   * New requests for titles removed from the library before, from anyone but
+   * admins and request managers: as usual, waiting for an admin, or refused.
+   */
+  removedTitleRequests?: RemovedTitleRequests;
+  /** Removals before removedTitleRequests applies. */
+  removedTitleTimes?: number;
   hideAvailable: boolean;
   hideBlocklisted: boolean;
   hideRequested: boolean;
@@ -892,6 +916,22 @@ export interface NotificationAgentDiscord extends NotificationAgentConfig {
   };
 }
 
+/**
+ * Seerr AI's own Discord bot, which posts requests waiting for approval with
+ * Approve and Decline buttons and hears the presses over the Gateway
+ * (lib/notifications/discordBot). Separate from the webhook agent above.
+ */
+export interface NotificationAgentDiscordBot extends NotificationAgentConfig {
+  options: {
+    /** Never sent to the browser. */
+    botToken: string;
+    /** The bot's application, read from Discord when the token is checked. */
+    applicationId: string;
+    guildId: string;
+    channelId: string;
+  };
+}
+
 export interface NotificationAgentSlack extends NotificationAgentConfig {
   options: {
     webhookUrl: string;
@@ -925,6 +965,11 @@ export interface NotificationAgentTelegram extends NotificationAgentConfig {
     chatId: string;
     messageThreadId: string;
     sendSilently: boolean;
+    /**
+     * Approve and Decline buttons on requests waiting for approval, read by
+     * polling the bot (lib/notifications/telegramButtons).
+     */
+    approvalButtons?: boolean;
   };
 }
 
@@ -940,6 +985,11 @@ export interface NotificationAgentPushover extends NotificationAgentConfig {
     accessToken: string;
     userToken: string;
     sound: string;
+    /**
+     * 'problems' (the default): high for declined and failed requests and new
+     * issues, normal otherwise. The rest apply to every notification.
+     */
+    priority?: PushoverPriority;
   };
 }
 
@@ -979,6 +1029,13 @@ export interface NotificationAgentNtfy extends NotificationAgentConfig {
     token?: string;
     priority?: number;
     locale: AvailableLocale;
+    /**
+     * Approve and Decline buttons on requests waiting for approval. The phone
+     * calls the Application URL with a one-time token (lib/requestActionTokens).
+     */
+    approvalButtons?: boolean;
+    /** Whose approval the buttons give; the owner (1) when unset. */
+    approveAsUserId?: number;
   };
 }
 
@@ -997,6 +1054,7 @@ export enum NotificationAgentKey {
 
 interface NotificationAgents {
   discord: NotificationAgentDiscord;
+  discordBot: NotificationAgentDiscordBot;
   email: NotificationAgentEmail;
   gotify: NotificationAgentGotify;
   ntfy: NotificationAgentNtfy;
@@ -1029,6 +1087,7 @@ export type JobId =
   | 'episode-sync'
   | 'future-seasons'
   | 'plex-user-import'
+  | 'user-access-check'
   | 'jellyfin-recently-added-scan'
   | 'jellyfin-full-scan'
   | 'emby-recently-added-scan'
@@ -1129,6 +1188,9 @@ class Settings {
         disabledFeatures: [],
         animeExcludedCountries: [],
         autoImportPlexUsers: false,
+        removeUsersWithoutAccess: false,
+        removedTitleRequests: 'off',
+        removedTitleTimes: 1,
         hideAvailable: false,
         hideBlocklisted: false,
         hideRequested: false,
@@ -1236,6 +1298,16 @@ class Settings {
               enableMentions: true,
               locale: 'en',
               useUserLocale: true,
+            },
+          },
+          discordBot: {
+            enabled: false,
+            embedPoster: true,
+            options: {
+              botToken: '',
+              applicationId: '',
+              guildId: '',
+              channelId: '',
             },
           },
           slack: {
@@ -1358,6 +1430,10 @@ class Settings {
         // No-op unless Auto-Import Plex Users is on.
         'plex-user-import': {
           schedule: '0 25 */1 * * *',
+        },
+        // No-op unless Remove Users Who Lose Access is on.
+        'user-access-check': {
+          schedule: '0 35 */1 * * *',
         },
         'jellyfin-recently-added-scan': {
           schedule: '0 */5 * * * *',

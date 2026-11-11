@@ -2,6 +2,43 @@
 
 Newest first. The [guide](./docs/seerr-ai/README.md) explains each feature.
 
+## 2.4.3 (10 November 2026)
+
+Plex Lists in Seerr AI, approving requests from Discord, ntfy and Telegram, Backfill without Prowlarr, new seasons as soon as they're announced, removing people who lose access, trailers in the page, and fixes from upstream Seerr.
+
+### New
+
+- **Plex Lists** on the Lists page, for people signed in with Plex: your own lists from Plex's **My Lists**, numbered when ranked. Start a new one (private to begin with), copy one into a Seerr AI list, or tick **Request titles added to this list on Plex** so what you add to it later is requested for you. **Add to List** on any title now includes your Plex lists too, and adding there puts the title on the list on Plex.
+- Backfill can search through Sonarr, Radarr and Lidarr instead of Prowlarr, or both (Settings → Backfill → **Search with**), so it works without Prowlarr. Prowlarr searches under every name a title goes by and finds more for stuck titles; the *arrs search with their own ids. Setups with Prowlarr keep using it.
+- Approve or decline requests from Discord with Seerr AI's own bot (Settings → Notifications → **Discord Bot**, off to start). It posts each request waiting for approval to a channel you pick, with Approve and Decline buttons; Decline asks for an optional reason. It needs no open port, and the page walks you through creating the bot, inviting it, picking the channel and linking approvers.
+- Approve or decline straight from ntfy (Settings → Notifications → ntfy → **Approve and Decline Buttons**; needs the Application URL) and from Telegram (Settings → Notifications → Telegram → **Approve and Decline Buttons**; no port to open).
+- Following a series now requests each new season as soon as it's announced and Sonarr has it, so the first episode is grabbed on air day; the premiere is still the fallback.
+- **Remove Users Who Lose Access** (Settings → Users, off to start): every hour, deletes the Seerr AI account and requests of anyone no longer shared on your Plex server or deleted from Jellyfin or Emby. It waits for two checks in a row, removes nobody if a server can't be read or every user looks gone, and never removes admins.
+- Deleting a user can now take them off their media server too (admins only): **Also remove them as a friend on Plex**, or **Also disable their Jellyfin account** (or Emby). If the server refuses, the user isn't deleted.
+- Trailers play in a player on the title page instead of opening YouTube.
+- **Also Known As** on movie and series pages: the other names a title goes by, with their countries.
+- **Requests for Removed Titles** (Settings → Users, off to start): requests for titles removed from the library before can wait for an admin or be refused, after one or more removals.
+- A **Priority** setting for Pushover: keep problems loud, or send everything at normal, low or high priority.
+- **Followed Series** notifications: a followed series' new season was announced and requested for you, a season starts, or the series ended or was cancelled, which ends the follow. It starts on wherever you had Request Available on.
+
+### Changed
+
+- The Docker image no longer carries npm, npx, corepack or yarn, which Seerr AI never uses, and runs Node directly instead of through npm.
+- Nightly **Database Maintenance** also clears the Discord bot's records of requests that were dealt with over a day ago.
+- When Backfill gives up on a torrent that nobody sharing it has a complete copy of, it now says so in those words, and that it will try a different release.
+
+### Fixed
+
+- A finished series with a season TMDB never dated no longer stays followed forever.
+- A season requested before Sonarr lists it is no longer declined as abandoned; it's monitored and searched once Sonarr lists it.
+- Marking a requested title available (after downloading it another way) no longer sends the request to Radarr or Sonarr to download again.
+- **Process Blocklisted Tags** no longer deletes and recreates its titles on every run, which brought them back into Recently Added, and leaves titles already in your library alone.
+- Request managers can mark a title available from its Manage panel, as the API already allowed.
+- Jellyfin specials that air within a season no longer count as that season's episodes.
+- Seerr AI checks GitHub for updates every six hours, not every five minutes.
+- Closing a title's Manage panel no longer reloads the page.
+- Fresh installs on SQLite builds that don't accept double-quoted strings no longer stop on three old migrations.
+
 ## 2.4.2 (6 November 2026)
 
 Requests over the limit that wait for an admin, default quality profiles, a view limited to what each person's libraries hold, requests from lists, quality badges on title pages, Network settings that apply without a restart, and tighter sign-in and account checks.

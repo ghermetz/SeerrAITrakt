@@ -17,13 +17,13 @@ Once something on a settings page is changed, **Save** floats at the bottom of t
 | **Settings → Appearance → Let people add their own CSS** | Shows **Personal CSS** in everyone's Appearance settings; theirs only changes their own screens. | Off |
 | **Settings → Media Servers** | Connect, edit and remove Plex, Jellyfin and Emby, choose the primary one, and whether people may sign in with each. See [Plex, Jellyfin and Emby together](./media-servers.md). | The server chosen at setup, as primary |
 | **Settings → Network** | **Enable Proxy Support** trusts proxies on this machine, your network and Tailscale; **Trust Cloudflare** and **Also Trust These Proxies** add public ones. See [Network](../using-seerr/settings/network.md#enable-proxy-support). | Off; off; none |
-| **Settings → Users** | **Auto-Import Plex Users**: an account for everyone the Plex server is shared with, hourly. Only adds; existing accounts are left as they are, and someone deleted isn't brought back. **Watchlist sync for new people**: new accounts start with their Plex or Trakt watchlist requested, for movies, series or both; existing people keep their own choice, and anyone can change theirs in their profile. | Off; off |
+| **Settings → Users** | **Auto-Import Plex Users**: an account for everyone the Plex server is shared with, hourly. Only adds; existing accounts are left as they are, and someone deleted isn't brought back. **Requests for Removed Titles**: requests for a title removed from the library before wait for an admin or are refused, after the number of removals chosen; never for admins or request managers. **Remove Users Who Lose Access**: hourly, deletes the accounts and requests of people no longer shared on Plex or deleted from Jellyfin or Emby, once missing on two checks in a row; never the owner or admins. See [Your account](./account.md). **Watchlist sync for new people**: new accounts start with their Plex or Trakt watchlist requested, for movies, series or both; existing people keep their own choice, and anyone can change theirs in their profile. | Off; off (once removed); off; off |
 | **Settings → Users → Let People Make Their Own API Keys** | Personal API keys for apps and scripts, each acting as the person who made it with exactly their permissions. **Who Can Make Them**: admins and people who can manage users, or everyone. Turning it off stops every personal key until it's turned back on. See [API](#api). | Off; admins and user managers once on |
 | **Settings → Users → Single Sign-On** | Providers people can sign in with (Authentik, Authelia, Keycloak, Pocket ID, Google…): name, issuer URL, client ID and secret (never sent back to the browser), button logo, scopes, **Enabled**, **Let New People Sign Up**, **Who Can Sign In** (rules on the provider's claims, such as a group), **Test**, and the redirect URL to give the provider. Needs the Application URL. See [Single sign-on](./single-sign-on.md). | None; scopes `openid profile email`; enabled; sign-up off; no rules (anyone with an account at the provider) |
 | **Settings → Features** | Turns optional features off for everyone. See [Feature switches](#feature-switches). | All on |
 | **Settings → Features → Siri Shortcut** | The iCloud link to the "Fix this show" shortcut, offered on everyone's Siri page. See [Reporting with Siri](./siri.md#making-the-shortcut-admins). | Empty |
 | **Settings → Services → Download Clients** | SABnzbd, NZBGet, qBittorrent, Transmission, Deluge and rTorrent, read for live progress, and for Backfill to send what it finds to. Keys and passwords are never sent back to the browser. | None |
-| **Settings → Services → Prowlarr** | Searched directly by Backfill and for songs taken from albums; neither runs without it. Added and edited from its tile, like the other services; tested before it is saved. Delete disconnects it, unless Backfill is on. Its API key is never sent back to the browser. | None |
+| **Settings → Services → Prowlarr** | Searched directly for songs taken from albums, which don't run without it, and by Backfill when **Search with** includes Prowlarr. Added and edited from its tile, like the other services; tested before it is saved. Delete disconnects it, unless Backfill is on and searches with it. Its API key is never sent back to the browser. | None |
 | **Settings → Services → Soulseek** | slskd's address, API key (ReadWrite role) and downloads folder as Lidarr sees it, for songs taken from albums that no indexer has. Added and edited from its tile; saved once slskd answers and Lidarr sees the folder. Its API key is never sent back to the browser. Shown once music is set up. | None |
 | **Settings → Services → Bazarr** | Subtitles and transcription. | Port 6767 |
 | **Settings → Services → Tautulli** | Watch history from Plex, for Suggested for You, "up next" on lists, Who Watched, Pick for the Room and Catch Me Up. Plex only; Jellyfin and Emby need nothing. Its API key is never sent back to the browser. | Port 8181 |
@@ -40,7 +40,8 @@ Once something on a settings page is changed, **Save** floats at the bottom of t
 | **Settings → Services** | **Anime Check** report and **Run Check**. | |
 | **Settings → Quality** | Quality profiles Seerr AI creates in Radarr and Sonarr, per server: presets from Seerr AI or TRaSH Guides, adjustments, band step; **Fill gaps with Seerr AI** and **Apply updates automatically** for TRaSH Guides. Nothing is sent to a server until it is managed and applied. See [Quality profiles](./quality.md). | Every server Not managed; Fill gaps on; Apply updates automatically off; usenet at equal quality, torrents wait 2 hours when chosen, band step 100 |
 | **Settings → AI** | Provider, key, model, per-feature models (Advanced), **Daily Limit per Person**, credit. See [AI](./ai.md). | Off; 20 answers a day |
-| **Settings → Backfill** | Download clients, category, when a title is stuck, approval, the admin agent; limits under Advanced. See [Backfill](./backfill-and-agent.md). **Download Check** (Off, Report only or On) is saved on its own and needs nothing else here; see [Download Check](./download-check.md). | Off; see below |
+| **Settings → Backfill** | Where to search (Prowlarr, Sonarr, Radarr and Lidarr, or both), download clients, category, when a title is stuck, approval, the admin agent; limits under Advanced. See [Backfill](./backfill-and-agent.md). **Download Check** (Off, Report only or On) is saved on its own and needs nothing else here; see [Download Check](./download-check.md). | Off; see below |
+| **Settings → Notifications → Pushover → Priority** | **High for problems, normal otherwise** (declined and failed requests and new issues ring even in quiet hours), or **Normal**, **Low** (silent) or **High** for every notification. | High for problems |
 | **Settings → Notifications** | New types: **Plex Reauth** (always sent), **Backfill**, **Health** and **Wrong Match** (admins), and **List Activity** (each person's own settings, never a channel's). | Web push on; Wrong Match on wherever Health was |
 | **Settings → Health** | Checks, Search all, resources, and under Titles → Folders matched to another title: **Check new requests as they're imported**, **Fix matches from here** (Plex) and **Fix automatically**. See [Keeping it healthy](./health.md). | On; on; off |
 | **Settings → How It Works** | The admin overview. | |
@@ -50,6 +51,7 @@ Once something on a settings page is changed, **Save** floats at the bottom of t
 | Setting | Default |
 |---|---|
 | Enabled | Off |
+| Search with | Sonarr, Radarr and Lidarr on a new server; servers from before it keep Prowlarr if it was set up |
 | Download Check | Off |
 | Movies too | On |
 | Stuck after (since Sonarr's or Radarr's last search) | 24 hours |
@@ -96,8 +98,9 @@ Seerr AI adds these to **Settings → Jobs & Cache**, where each can be reschedu
 |---|---|---|
 | Notification Reconcile | every 2 minutes | Sends notifications that were missed, once each. |
 | Episode Sync | every 5 minutes | Reads which episodes Sonarr has, for per-episode availability. |
-| Future Season Requests | every 6 hours | Requests new seasons for series people follow. |
+| Future Season Requests | every 6 hours | Requests new seasons for series people follow, once announced (and known to Sonarr) or at the latest as they premiere, and tells the followers. |
 | Plex User Import | hourly | With Auto-Import Plex Users on. Plex only. |
+| User Access Check | hourly, at :35 | With Remove Users Who Lose Access on. Plex, Jellyfin and Emby. |
 | Backfill Scan | every 6 hours | Finds stuck titles and searches a few. Only with Backfill on. |
 | Backfill Downloads | every minute | Moves approved Backfill downloads along: picks files, imports, cleans up. |
 | Download Check | every 30 seconds | Checks what Sonarr and Radarr grabbed, and imports that got stuck. Only with Download Check on or on Report only. |
@@ -120,7 +123,7 @@ Every feature below is on unless an admin turns it off for everyone (**Settings 
 | `releaseCalendar` | The Calendar page |
 | `arrivalEstimates` | "When it should arrive" on requests and title pages |
 | `whoWatched` | Who has watched a title, on its page (admins) |
-| `newSeasons` | Getting new seasons as they premiere (off pauses the follows) |
+| `newSeasons` | Getting new seasons as they're announced (off pauses the follows and their notifications) |
 | `watchSuggestions` | "Finished watching?" on lists |
 | `listRequests` | Requesting a title when you add it to a list (people who can request) |
 | `passkeyPrompt` | The banner offering to add a passkey (passkeys still work) |

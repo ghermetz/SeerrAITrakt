@@ -17,6 +17,7 @@ import blockedImports from '@server/lib/music/blockedImports';
 import songFetcher from '@server/lib/music/songFetch';
 import notificationReconciler from '@server/lib/notificationReconciler';
 import playlists from '@server/lib/playlists';
+import { plexListSync } from '@server/lib/plexLists';
 import plexMatchCheck from '@server/lib/plexMatchCheck';
 import plexUserImport from '@server/lib/plexUserImport';
 import {
@@ -31,6 +32,7 @@ import { radarrScanner } from '@server/lib/scanners/radarr';
 import { sonarrScanner } from '@server/lib/scanners/sonarr';
 import type { JobId } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import userAccessCheck from '@server/lib/userAccessCheck';
 import watchlistSync from '@server/lib/watchlistsync';
 import logger from '@server/logger';
 import schedule from 'node-schedule';
@@ -341,7 +343,7 @@ export const startJobs = (): void => {
   refreshMusicJobs();
 
   // Watchlist sync: Plex watchlists, and public Trakt watchlists on any media
-  // server. The id is kept so saved schedules carry over. Edited in minutes
+  // server, then Plex lists with auto-request on. The id is kept so saved schedules carry over. Edited in minutes
   // since it runs every few.
   scheduledJobs.push({
     id: 'plex-watchlist-sync',
@@ -355,10 +357,11 @@ export const startJobs = (): void => {
         logger.info('Starting scheduled job: Watchlist Sync', {
           label: 'Jobs',
         });
-        return watchlistSync.syncWatchlist();
+        // Plex lists with auto-request on, after the watchlists.
+        return watchlistSync.syncWatchlist().then(() => plexListSync.run());
       })
     ),
-    running: () => watchlistSync.running,
+    running: () => watchlistSync.running || plexListSync.running,
   });
 
   scheduledJobs.push({
@@ -700,6 +703,20 @@ export const startJobs = (): void => {
   }
 
   // Alerts admins when a connected service newly has a problem listed on the
+  // Removes people the media server no longer has, when that's on.
+  scheduledJobs.push({
+    id: 'user-access-check',
+    name: 'User Access Check',
+    type: 'process',
+    interval: 'hours',
+    cronSchedule: jobs['user-access-check'].schedule,
+    job: schedule.scheduleJob(
+      jobs['user-access-check'].schedule,
+      runJob('User Access Check', () => userAccessCheck.run())
+    ),
+    running: () => userAccessCheck.running,
+  });
+
   // Health page.
   scheduledJobs.push({
     id: 'health-watch',
