@@ -2,6 +2,31 @@
 
 Newest first. The [guide](./docs/seerr-ai/README.md) explains each feature.
 
+## 2.4.4 (15 November 2026)
+
+Faster page loads, adding one song to a playlist from apps such as Pluet, and the November Node.js security release.
+
+### New
+
+- Apps such as Pluet can add one song at a time to a playlist. Its MusicBrainz ids, when the media server has them, find the exact recording; otherwise it's matched by title, artist, album and length. It's requested in the owner's name like the playlist's other songs, and stays on a linked playlist.
+
+### Faster
+
+- Movie, series and collection pages open straight away when you tap a card, and their details are downloaded once instead of twice.
+- Pages start with fewer requests, with nothing asked for twice.
+- The sidebar no longer re-checks the request and issue counts each time you scroll or change page.
+- Each request to the server does less database work.
+- Text shows in Inter from the start, rather than switching font as the page loads.
+
+### Fixed
+
+- **Request Season** no longer sits against the season's header.
+
+### Security
+
+- Node.js 22.23.5, the November 2026 security release ([release notes](https://nodejs.org/en/blog/release/v22.23.5)).
+- With image caching off, the image proxy stores nothing at all.
+
 ## 2.4.3 (10 November 2026)
 
 Plex Lists in Seerr AI, approving requests from Discord, ntfy and Telegram, Backfill without Prowlarr, new seasons as soon as they're announced, removing people who lose access, trailers in the page, and fixes from upstream Seerr.

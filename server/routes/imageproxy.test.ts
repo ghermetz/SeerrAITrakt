@@ -1,4 +1,5 @@
 import { musicImageProxy, tmdbImageProxy } from '@server/lib/imageproxy';
+import { getSettings } from '@server/lib/settings';
 import imageproxy, { useSessionForImages } from '@server/routes/imageproxy';
 import axios from 'axios';
 import cookieParser from 'cookie-parser';
@@ -38,6 +39,7 @@ const cookieFor = (sid: string) => {
 const SIGNED_IN = { cookie: cookieFor('signed-in') };
 
 before(async () => {
+  getSettings().main.cacheImages = true;
   realJpeg = await sharp({
     create: { width: 1920, height: 800, channels: 3, background: '#3a6ea5' },
   })
@@ -200,6 +202,18 @@ describe('GET /imageproxy/tmdb/...', () => {
     assert.equal(res.headers.get('cache-control'), 'public, max-age=600');
   });
 
+  it('stores nothing while image caching is off', async () => {
+    getSettings().main.cacheImages = false;
+    upstream = [];
+    try {
+      const res = await get(poster('off'), SIGNED_IN);
+      assert.equal(res.status, 404);
+      assert.deepEqual(upstream, []);
+    } finally {
+      getSettings().main.cacheImages = true;
+    }
+  });
+
   it('refuses anything that is not an image path', async () => {
     upstream = [];
     for (const path of [
@@ -339,7 +353,9 @@ describe('GET /imageproxy/tmdb/...', () => {
 
 describe('music’s pictures', () => {
   const ALBUM = '7e41c0d8-5b29-3f6c-b8a4-91d6e2f07a35';
-  const ARTIST = '3c9e5f21-8d47-4b6a-a1e3-5f7d2c90b844';
+  // Not the music tests' artist: the image cache is shared between test
+  // files, and their picture of it would be this file's stand-in.
+  const ARTIST = '5d1a8e47-2c96-4f3b-b7e0-8a4c6f2d9e13';
   /** Albums only these tests request, so each starts uncached. */
   const COVER = `${unique.replace(/\D/g, '').padStart(8, '0').slice(-8)}-5b29-3f6c-b8a4-91d6e2f07a35`;
   const MISSING = `${COVER.slice(0, 8)}-0000-3926-a536-22c65f834433`;
